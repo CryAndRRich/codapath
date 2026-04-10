@@ -1,0 +1,77 @@
+dataset: "pathmnist"
+sampler_name: "codapath"
+random_seed: 42
+device: "cuda" 
+
+hyperparameters:
+  alpha: 0.5
+  num_epochs: 25
+  rank_lora: 8
+  learning_rate: 0.0001
+
+prompt_templates:
+  - "Photomicrograph showing {}."
+  - "Histopathology of {}."
+  - "H&E stained microscopic image of {}."
+  - "Pathological tissue section demonstrating {}."
+  - "Cellular morphology characteristic of {}."
+
+cumulative_budget: [50, 100, 150, 200, 250, 300]
+
+datasets:
+  pathmnist:
+    path: "data/pathmnist_224.npz"
+    num_classes: 9
+    max_budget: 300
+    descriptions:
+      adipose: "adipose tissue consisting of mature adipocytes and fat cells"
+      background: "empty background space without any tissue structures or cells"
+      debris: "necrotic debris, cellular fragments, and hemorrhagic exudate"
+      lymphocytes: "dense infiltration of lymphocytes and immune cells"
+      mucus: "acellular mucin and mucus material"
+      smooth_muscle: "smooth muscle tissue with elongated muscle fibers"
+      normal_colon_mucosa: "benign, healthy normal colon mucosa and colonic glands"
+      cancer_associated_stroma: "cancer-associated stroma and connective tissue fibroblasts"
+      colorectal_adenocarcinoma: "colorectal adenocarcinoma epithelial cells forming malignant glands"
+
+  histoset:
+    path: "data/HistoSet-5x14/HistoSet-5x14"
+    num_classes: 14
+    max_budget: 300
+    descriptions:
+      breast_benign: "benign breast tissue, showing non-cancerous fibroadenoma or adenosis"
+      breast_malignant: "malignant breast carcinoma, invasive ductal or lobular cancer cells"
+      colon_aca: "colon adenocarcinoma, characterized by irregular malignant glandular structures"
+      colon_n: "benign, healthy colonic tissue with normal mucosal glands"
+      lung_aca: "lung adenocarcinoma, consisting of malignant glandular epithelial cells"
+      lung_n: "benign, healthy and normal lung tissue without malignancy"
+      lung_scc: "lung squamous cell carcinoma, showing malignant squamous epithelial cells"
+      oral_normal_oral_cavity: "normal oral cavity squamous epithelium without atypia"
+      oral_oscc: "oral squamous cell carcinoma, showing invasive malignant squamous cells with keratin pearls"
+      ovarian_clear_cell: "ovarian clear cell carcinoma with clear cytoplasm"
+      ovarian_endometri: "ovarian endometrioid carcinoma resembling endometrial glands"
+      ovarian_mucinous: "ovarian mucinous carcinoma with mucin-producing cells"
+      ovarian_non_cancerous: "benign, non-cancerous ovarian tissue stroma and follicles"
+      ovarian_serous: "ovarian serous carcinoma with papillary architecture"
+
+  skintissue:
+    path: "data/SkinTissue/SkinTissue/tiles"
+    num_classes: 16
+    max_budget: 300
+    descriptions:
+      tumor_skin_epithelial_bcc: "basal cell carcinoma, displaying nests of atypical basaloid cells with characteristic peripheral palisading and stromal retraction artifact"
+      tumor_skin_epithelial_sqcc: "squamous cell carcinoma, featuring invasive islands of atypical squamous epithelial cells, pleomorphic nuclei, and keratin pearls"
+      tumor_skin_melanoma_melanoma: "malignant melanoma, characterized by invasive and highly atypical melanocytes, severe nuclear pleomorphism, and variable melanin pigmentation"
+      tumor_skin_naevus_naevus: "benign melanocytic nevus, showing well-circumscribed nests of uniform, benign nevus cells without significant atypia"
+      nontumor_skin_epidermis_epidermis: "normal epidermis, characterized by a stratified squamous epithelium with distinct basal, spinous, and granular layers, topped by stratum corneum"
+      nontumor_skin_dermis_dermis: "normal dermal connective tissue, consisting of dense interwoven collagen bundles and scattered fibroblasts"
+      nontumor_skin_subcutis_subcutis: "normal subcutis or hypodermis, consisting of mature adipose tissue and fat cells divided by fibrous septa"
+      nontumor_skin_hairfollicle_hairfollicle: "benign hair follicles, displaying epithelial root sheaths, hair shafts, and surrounding fibrous connective tissue"
+      nontumor_skin_sebaceousglands_sebaceousglands: "normal sebaceous glands, composed of lobules with pale, foamy, lipid-filled sebocytes"
+      nontumor_skin_sweatglands_sweatglands: "normal sweat glands, showing coiled tubular structures lined by simple or stratified cuboidal epithelial cells"
+      nontumor_skin_vessel_vessel: "benign blood vessels, featuring endothelial cell linings, smooth muscle walls, and luminal spaces often containing erythrocytes"
+      nontumor_skin_nerves_nerves: "benign peripheral nerve bundles, consisting of wavy nerve fibers and elongated Schwann cell nuclei"
+      nontumor_skin_muscle_skeletal: "normal skeletal muscle, featuring bundles of striated, multinucleated muscle fibers"
+      nontumor_skin_chondraltissue_chondraltissue: "benign chondral tissue, featuring chondrocytes residing within lacunae and surrounding cartilaginous extracellular matrix"
+      nontumor_skin_elastosis_elastosis: "solar elastosis, showing basophilic degeneration and accumulation of thick, clumped abnormal elastic fibers in the dermis due to sun damage"
+      nontumor_skin_necrosis_necrosis: "necrotic tissue, characterized by eosinophilic cellular debris, loss of nuclear detail (karyolysis), and structureless dead tissue"
