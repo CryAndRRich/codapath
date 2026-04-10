@@ -214,7 +214,7 @@ def train_model(model: nn.Module,
     clear_memory()
 
     queries_idx = get_sampler(
-        sampler_name=sampler_name,
+        name=sampler_name,
         image_embeddings=embeddings_concat, 
         text_embeddings=text_embeddings, 
         max_budget=max(cumulative_budget), 
