@@ -15,7 +15,6 @@ from peft import LoraConfig, get_peft_model
 
 from load_data import ActiveLearningDataset
 from set_up import clear_memory
-from evaluate import evaluate_model, visualize_tsne
 from sampling import get_sampler
 from contrastive import train_contrastive
 
@@ -153,6 +152,8 @@ def extract_text_embeddings(class_descriptions: Dict[str, str],
     clear_memory()
 
     return text_embeddings
+
+from evaluate import evaluate_model, visualize_tsne
 
 def save_model(model: nn.Module, save_path: str) -> None:
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
