@@ -13,11 +13,11 @@ import open_clip
 from transformers import CLIPVisionModel, AutoTokenizer, AutoModel, CLIPTokenizer, CLIPTextModel
 from peft import LoraConfig, get_peft_model
 
-from .load_data import ActiveLearningDataset
-from .set_up import clear_memory
-from .evaluate import evaluate_model, visualize_tsne
-from .sampling import get_sampler
-from .contrastive import train_contrastive
+from load_data import ActiveLearningDataset
+from set_up import clear_memory
+from evaluate import evaluate_model, visualize_tsne
+from sampling import get_sampler
+from contrastive import train_contrastive
 
 class CODAModel(nn.Module):
     def __init__(self, 

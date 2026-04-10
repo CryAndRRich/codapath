@@ -7,9 +7,9 @@ import numpy as np
 import torch
 import seaborn as sns
 
-from .set_up import set_seed, clear_memory
-from .load_data import get_data_loaders
-from .model import CODAModel, extract_text_embeddings, train_model
+from set_up import set_seed, clear_memory
+from load_data import get_data_loaders
+from model import CODAModel, extract_text_embeddings, train_model
 
 def main(data_path: str,
          sampler_name: str,
@@ -84,7 +84,7 @@ def main(data_path: str,
 
 if __name__ == "__main__":
     pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--config", type=str, default="config.yaml")
+    pre_parser.add_argument("--config", type=str, default="config/config.yaml")
     pre_args, remaining_argv = pre_parser.parse_known_args()
 
     if not os.path.exists(pre_args.config):

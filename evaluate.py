@@ -12,8 +12,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from .set_up import clear_memory
-from .model import extract_image_embeddings
+from set_up import clear_memory
+from model import extract_image_embeddings
 
 def evaluate_model(model: nn.Module, 
                    test_loader: DataLoader, 

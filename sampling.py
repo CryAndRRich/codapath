@@ -8,7 +8,7 @@ from scipy.spatial.distance import jensenshannon
 import torch
 import torch.nn.functional as F
 
-from .set_up import clear_memory
+from set_up import clear_memory
 
 __sampler__ = {}
 

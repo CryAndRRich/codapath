@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 
-from .set_up import clear_memory
+from set_up import clear_memory
 
 class CenterLoss(nn.Module):
     def __init__(self, 
