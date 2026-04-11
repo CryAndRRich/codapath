@@ -196,7 +196,7 @@ def train_model(model: nn.Module,
         train_dataset, 
         batch_size=256, 
         shuffle=False, 
-        num_workers=4,
+        num_workers=0,
         worker_init_fn=seed_worker_fn, 
         generator=g_seed
     )

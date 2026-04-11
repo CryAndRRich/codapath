@@ -105,7 +105,7 @@ def get_data_loaders(data_path: str, seed: int) -> Tuple[DataLoader, DataLoader,
         train_dataset, 
         batch_size=256, 
         shuffle=False, 
-        num_workers=4, 
+        num_workers=0, 
         pin_memory=True
     )
 
@@ -113,7 +113,7 @@ def get_data_loaders(data_path: str, seed: int) -> Tuple[DataLoader, DataLoader,
         test_dataset, 
         batch_size=256, 
         shuffle=False, 
-        num_workers=4, 
+        num_workers=0, 
         pin_memory=True
     )
 
