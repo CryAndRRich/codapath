@@ -74,7 +74,9 @@ class ActiveLearningDataset(Dataset):
         img, _ = self.subset[idx] 
         return img, self.labels[idx]
 
-def get_data_loaders(data_path: str, seed: int) -> Tuple[DataLoader, DataLoader, List[str]]:
+def get_data_loaders(data_path: str, 
+                     seed: int,
+                     verbose: bool = False) -> Tuple[DataLoader, DataLoader, List[str]]:
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
@@ -99,7 +101,8 @@ def get_data_loaders(data_path: str, seed: int) -> Tuple[DataLoader, DataLoader,
             generator=generator
         )
 
-    # print(f"Train size: {len(train_dataset)} | Test size: {len(test_dataset)}")
+    if verbose:
+        print(f"Train size: {len(train_dataset)} | Test size: {len(test_dataset)}")
 
     train_loader = DataLoader(
         train_dataset, 

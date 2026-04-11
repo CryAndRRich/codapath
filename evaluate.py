@@ -17,15 +17,15 @@ from model import extract_image_embeddings
 
 def evaluate_model(model: nn.Module, 
                    test_loader: DataLoader, 
-                   true_labels: np.ndarray, 
+                   test_labels: np.ndarray, 
                    device: torch.device) -> Tuple[float, float, float, float]:
     _, probs, _ = extract_image_embeddings(test_loader, model, device=device)
     preds = np.argmax(probs, axis=1)
     
-    acc = accuracy_score(true_labels, preds)
-    pre = precision_score(true_labels, preds, average="macro", zero_division=0)
-    rec = recall_score(true_labels, preds, average="macro", zero_division=0)
-    f1 = f1_score(true_labels, preds, average="macro", zero_division=0)
+    acc = accuracy_score(test_labels, preds)
+    pre = precision_score(test_labels, preds, average="macro", zero_division=0)
+    rec = recall_score(test_labels, preds, average="macro", zero_division=0)
+    f1 = f1_score(test_labels, preds, average="macro", zero_division=0)
     
     print(f"Accuracy : {acc * 100:.2f}%")
     print(f"Precision: {pre * 100:.2f}%")

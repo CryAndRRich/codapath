@@ -38,7 +38,8 @@ def train_contrastive(model: nn.Module,
     model.train() 
     try:
         compiled_model = torch.compile(model)
-        print("Kích hoạt torch.compile()")
+        if verbose:
+            print("Kích hoạt torch.compile()")
     except:
         compiled_model = model
 

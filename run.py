@@ -31,7 +31,7 @@ def main(data_path: str,
     g_seed = torch.Generator()
     g_seed.manual_seed(random_seed)
 
-    train_loader, test_loader, class_names = get_data_loaders(data_path, random_seed)
+    train_loader, test_loader, class_names = get_data_loaders(data_path, random_seed, verbose)
 
     train_dataset = train_loader.dataset
     test_dataset = test_loader.dataset
