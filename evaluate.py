@@ -19,7 +19,7 @@ def evaluate_model(model: nn.Module,
                    test_loader: DataLoader, 
                    test_labels: np.ndarray, 
                    device: torch.device) -> Tuple[float, float, float, float]:
-    _, probs, _ = extract_image_embeddings(test_loader, model, device=device)
+    _, _, probs = extract_image_embeddings(test_loader, model, device=device)
     preds = np.argmax(probs, axis=1)
     
     acc = accuracy_score(test_labels, preds)

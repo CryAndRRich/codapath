@@ -201,7 +201,7 @@ def train_model(model: nn.Module,
         generator=g_seed
     )
     
-    embeddings_concat, _, _ = extract_image_embeddings(train_loader, model, device=device)
+    embeddings_concat, embeddings_proj, _ = extract_image_embeddings(train_loader, model, device=device)
 
     NON_SLICEABLE_SAMPLERS = ["entropy", "margin", "badge", "typiclust", "activeft"]
     master_selected_indices = None
@@ -240,7 +240,7 @@ def train_model(model: nn.Module,
 
         if verbose and budget == max(cumulative_budget):
             visualize_tsne(
-                embeddings_proj=embeddings_concat, 
+                embeddings_proj=embeddings_proj, 
                 true_labels=oracle_labels, 
                 class_names=class_names, 
                 title="Initial", 
@@ -248,6 +248,8 @@ def train_model(model: nn.Module,
                 seed=seed,
                 selected_indices=selected_indices
             )
+
+            del embeddings_proj
 
         selected_labels = oracle_labels[selected_indices]
         train_subset = Subset(train_dataset, selected_indices)
@@ -282,9 +284,9 @@ def train_model(model: nn.Module,
             evaluate_model(fresh_model, test_loader, test_labels, device)
             
             if budget == max(cumulative_budget):
-                embeddings_concat_new, _, _ = extract_image_embeddings(train_loader, fresh_model, device=device)
+                _, embeddings_proj_new, _ = extract_image_embeddings(train_loader, fresh_model, device=device)
                 visualize_tsne(
-                    embeddings_proj=embeddings_concat_new, 
+                    embeddings_proj=embeddings_proj_new, 
                     true_labels=oracle_labels, 
                     class_names=class_names, 
                     title=f"After {budget} samples", 
@@ -292,7 +294,7 @@ def train_model(model: nn.Module,
                     seed=seed,
                     selected_indices=selected_indices
                 )
-                del embeddings_concat_new
+                del embeddings_proj_new
                 clear_memory()
 
         save_path = f"{save_dir}/{sampler_name}_budget_{budget}.pth"
