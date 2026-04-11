@@ -153,8 +153,6 @@ def extract_text_embeddings(class_descriptions: Dict[str, str],
 
     return text_embeddings
 
-from evaluate import evaluate_model, visualize_tsne
-
 def save_model(model: nn.Module, save_path: str) -> None:
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     
@@ -192,6 +190,8 @@ def train_model(model: nn.Module,
                 save_dir: str,
                 verbose: bool = False) -> None:
     
+    from evaluate import evaluate_model, visualize_tsne
+    
     train_loader = DataLoader(
         train_dataset, 
         batch_size=256, 
@@ -200,55 +200,76 @@ def train_model(model: nn.Module,
         worker_init_fn=seed_worker_fn, 
         generator=g_seed
     )
-    embeddings_concat, _, _ = extract_image_embeddings(train_loader, model, device=device)
     
+    embeddings_concat, _, _ = extract_image_embeddings(train_loader, model, device=device)
+
     if verbose:
         visualize_tsne(
             embeddings_concat, 
             oracle_labels, 
             class_names, 
-            title="Initial", 
+            title=f"Initial", 
             color_map=color_map, 
             seed=seed
         )
 
-    queries_idx = get_sampler(
-        name=sampler_name,
-        image_embeddings=embeddings_concat, 
-        text_embeddings=text_embeddings, 
-        max_budget=max(cumulative_budget), 
-        alpha=alpha, 
-        device=device,
-    )
+    NON_SLICEABLE_SAMPLERS = ["entropy", "margin", "badge", "typiclust", "activeft"]
+    master_selected_indices = None
     
-    del embeddings_concat
-    clear_memory()
+    if sampler_name not in NON_SLICEABLE_SAMPLERS:
+        master_selected_indices = get_sampler(
+            name=sampler_name,
+            image_embeddings=embeddings_concat, 
+            text_embeddings=text_embeddings, 
+            max_budget=max(cumulative_budget), 
+            alpha=alpha, 
+            device=device,
+            chunk_szie=10000
+        )
 
     for budget in cumulative_budget:
-        queried_labels = oracle_labels[queries_idx[:budget]]
-        train_subset = Subset(train_dataset, queries_idx[:budget])
-        al_dataset = ActiveLearningDataset(train_subset, queried_labels)
+        if sampler_name in NON_SLICEABLE_SAMPLERS:
+            selected_indices = get_sampler(
+                name=sampler_name,
+                image_embeddings=embeddings_concat, 
+                max_budget=budget, 
+                train_dataset=train_dataset,
+                oracle_labels=oracle_labels,
+                train_loader=train_loader,
+                num_epochs=num_epochs,
+                learn_rate=learn_rate,
+                r=r,
+                class_names=class_names,
+                device=device,
+                seed_worker_fn=seed_worker_fn,
+                g_seed=g_seed,
+                chunk_szie=10000
+            )
+        else:
+            selected_indices = master_selected_indices[:budget]
+
+        selected_labels = oracle_labels[selected_indices]
+        train_subset = Subset(train_dataset, selected_indices)
+        al_dataset = ActiveLearningDataset(train_subset, selected_labels)
         al_loader = DataLoader(
             al_dataset, 
             batch_size=min(32, budget), 
             shuffle=True, 
+            num_workers=0,
             worker_init_fn=seed_worker_fn, 
             generator=g_seed
         )
         
-        print(f"\nTraining with {budget} samples...")
         num_classes_total = len(class_names)
-        del model 
-        clear_memory() 
         
-        model = CODAModel(
+        fresh_model = CODAModel(
             num_classes=num_classes_total, 
             r=r, 
             lora_alpha=r * 2
         ).to(device)
         
-        model = train_contrastive(
-            model=model, 
+        fresh_model = train_contrastive(
+            model=fresh_model, 
             labeled_loader=al_loader, 
             num_epochs=num_epochs, 
             learn_rate=learn_rate, 
@@ -257,22 +278,27 @@ def train_model(model: nn.Module,
         )
         
         if verbose:
-            evaluate_model(model, test_loader, test_labels, device)
-        
-            embeddings_concat, _, _ = extract_image_embeddings(train_loader, model, device=device)
+            evaluate_model(fresh_model, test_loader, test_labels, device)
+            
+            embeddings_concat_new, _, _ = extract_image_embeddings(train_loader, fresh_model, device=device)
             visualize_tsne(
-                embeddings_concat, 
+                embeddings_concat_new, 
                 oracle_labels, 
                 class_names, 
                 title=f"After {budget} samples", 
                 color_map=color_map, 
                 seed=seed
             )
-
-            del embeddings_concat
+            del embeddings_concat_new
+            clear_memory()
 
         save_path = f"{save_dir}/{sampler_name}_budget_{budget}.pth"
-        save_model(model, save_path)
+        save_model(fresh_model, save_path)
         
-        del train_subset, al_dataset, al_loader, model
+        del train_subset, al_dataset, al_loader, fresh_model
         clear_memory()
+
+    del embeddings_concat
+    if master_selected_indices is not None:
+        del master_selected_indices
+    clear_memory()
