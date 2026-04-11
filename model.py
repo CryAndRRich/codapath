@@ -191,7 +191,8 @@ def train_model(model: nn.Module,
                 verbose: bool = False) -> None:
     
     from evaluate import evaluate_model, visualize_tsne
-    
+    from set_up import set_seed
+
     train_loader = DataLoader(
         train_dataset, 
         batch_size=256, 
@@ -218,6 +219,10 @@ def train_model(model: nn.Module,
         )
 
     for budget in cumulative_budget:
+        seed_worker_fn = set_seed(seed)
+        g_seed = torch.Generator()
+        g_seed.manual_seed(seed)
+
         if sampler_name in NON_SLICEABLE_SAMPLERS:
             selected_indices = get_sampler(
                 name=sampler_name,
