@@ -224,7 +224,7 @@ def train_model(model: nn.Module,
             max_budget=max(cumulative_budget), 
             alpha=alpha, 
             device=device,
-            chunk_szie=10000
+            chunk_size=10000
         )
 
     for budget in cumulative_budget:
@@ -243,7 +243,7 @@ def train_model(model: nn.Module,
                 device=device,
                 seed_worker_fn=seed_worker_fn,
                 g_seed=g_seed,
-                chunk_szie=10000
+                chunk_size=10000
             )
         else:
             selected_indices = master_selected_indices[:budget]
