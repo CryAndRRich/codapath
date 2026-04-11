@@ -203,16 +203,6 @@ def train_model(model: nn.Module,
     
     embeddings_concat, _, _ = extract_image_embeddings(train_loader, model, device=device)
 
-    if verbose:
-        visualize_tsne(
-            embeddings_concat, 
-            oracle_labels, 
-            class_names, 
-            title=f"Initial", 
-            color_map=color_map, 
-            seed=seed
-        )
-
     NON_SLICEABLE_SAMPLERS = ["entropy", "margin", "badge", "typiclust", "activeft"]
     master_selected_indices = None
     
@@ -248,6 +238,17 @@ def train_model(model: nn.Module,
         else:
             selected_indices = master_selected_indices[:budget]
 
+        if verbose and budget == max(cumulative_budget):
+            visualize_tsne(
+                embeddings_proj=embeddings_concat, 
+                true_labels=oracle_labels, 
+                class_names=class_names, 
+                title="Initial", 
+                color_map=color_map, 
+                seed=seed,
+                selected_indices=selected_indices
+            )
+
         selected_labels = oracle_labels[selected_indices]
         train_subset = Subset(train_dataset, selected_indices)
         al_dataset = ActiveLearningDataset(train_subset, selected_labels)
@@ -280,17 +281,19 @@ def train_model(model: nn.Module,
         if verbose:
             evaluate_model(fresh_model, test_loader, test_labels, device)
             
-            embeddings_concat_new, _, _ = extract_image_embeddings(train_loader, fresh_model, device=device)
-            visualize_tsne(
-                embeddings_concat_new, 
-                oracle_labels, 
-                class_names, 
-                title=f"After {budget} samples", 
-                color_map=color_map, 
-                seed=seed
-            )
-            del embeddings_concat_new
-            clear_memory()
+            if budget == max(cumulative_budget):
+                embeddings_concat_new, _, _ = extract_image_embeddings(train_loader, fresh_model, device=device)
+                visualize_tsne(
+                    embeddings_proj=embeddings_concat_new, 
+                    true_labels=oracle_labels, 
+                    class_names=class_names, 
+                    title=f"After {budget} samples", 
+                    color_map=color_map, 
+                    seed=seed,
+                    selected_indices=selected_indices
+                )
+                del embeddings_concat_new
+                clear_memory()
 
         save_path = f"{save_dir}/{sampler_name}_budget_{budget}.pth"
         save_model(fresh_model, save_path)

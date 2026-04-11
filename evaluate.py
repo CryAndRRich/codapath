@@ -1,4 +1,4 @@
-from typing import List, Tuple, Dict
+from typing import List, Optional, Tuple, Dict
 import os
 
 import matplotlib.pyplot as plt
@@ -40,15 +40,37 @@ def visualize_tsne(embeddings_proj: np.ndarray,
                    title: str, 
                    color_map: Dict[str, str], 
                    seed: int, 
-                   max_samples: int = 25000) -> None:
-    if len(embeddings_proj) > max_samples:
+                   max_samples: int = 25000,
+                   selected_indices: Optional[List[int]] = None) -> None:
+    
+    num_total = len(embeddings_proj)
+    
+    if num_total > max_samples:
         np.random.seed(seed)
-        indices = np.random.choice(len(embeddings_proj), max_samples, replace=False)
+        
+        if selected_indices is not None and len(selected_indices) > 0:
+            sel_array = np.array(selected_indices)
+            unsel_array = np.setdiff1d(np.arange(num_total), sel_array)
+            
+            num_to_sample = max(0, max_samples - len(sel_array))
+            
+            if num_to_sample > 0:
+                sampled_unsel = np.random.choice(unsel_array, num_to_sample, replace=False)
+                indices = np.concatenate([sel_array, sampled_unsel])
+            else:
+                indices = sel_array[:max_samples] 
+                
+            local_selected_indices = np.arange(len(sel_array[:max_samples]))
+        else:
+            indices = np.random.choice(num_total, max_samples, replace=False)
+            local_selected_indices = []
+            
         X_feat = embeddings_proj[indices]
         y_lbl = true_labels[indices]
     else:
         X_feat = embeddings_proj
         y_lbl = true_labels
+        local_selected_indices = np.array(selected_indices) if selected_indices is not None else []
         
     tsne = TSNE(
         n_components=2, 
@@ -69,12 +91,27 @@ def visualize_tsne(embeddings_proj: np.ndarray,
         hue_order=hue_order, 
         palette=color_map,   
         legend="full", 
-        alpha=0.7, 
-        s=20 
+        alpha=0.4, 
+        s=20,
+        edgecolor=None
     )
     
-    plt.title(title, fontsize=16)
-    plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=10)
+    if len(local_selected_indices) > 0:
+        plt.scatter(
+            X_2d[local_selected_indices, 0],
+            X_2d[local_selected_indices, 1],
+            color="black",
+            edgecolor="white", 
+            linewidth=0.8,
+            s=60, 
+            label="Selected Samples",
+            zorder=5 
+        )
+    
+    plt.title(title, fontsize=16, fontweight="bold")
+    
+    handles, labels = plt.gca().get_legend_handles_labels()
+    plt.legend(handles, labels, bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=10)
     plt.tight_layout()
     
     os.makedirs("tsne_plots", exist_ok=True)
