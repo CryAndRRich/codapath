@@ -200,18 +200,16 @@ def train_model(model: nn.Module,
         worker_init_fn=seed_worker_fn, 
         generator=g_seed
     )
-    embeddings_concat, embeddings_proj, probs = extract_image_embeddings(train_loader, model, device=device)
+    embeddings_concat, _, _ = extract_image_embeddings(train_loader, model, device=device)
     
     visualize_tsne(
-        embeddings_proj, 
+        embeddings_concat, 
         oracle_labels, 
         class_names, 
         title="Initial", 
         color_map=color_map, 
         seed=seed
     )
-    del embeddings_proj, probs
-    clear_memory()
 
     queries_idx = get_sampler(
         name=sampler_name,
@@ -249,9 +247,9 @@ def train_model(model: nn.Module,
         ).to(device)
         
         model = train_contrastive(
-            model, 
-            al_loader, 
-            epochs=num_epochs, 
+            model=model, 
+            labeled_loader=al_loader, 
+            num_epochs=num_epochs, 
             learn_rate=learn_rate, 
             device=device,
             verbose=verbose
@@ -260,9 +258,9 @@ def train_model(model: nn.Module,
         if verbose:
             evaluate_model(model, test_loader, test_labels, class_names, device)
         
-        embeddings_concat, embeddings_proj, probs = extract_image_embeddings(train_loader, model, device=device)
+        embeddings_concat, _, _ = extract_image_embeddings(train_loader, model, device=device)
         visualize_tsne(
-            embeddings_proj, 
+            embeddings_concat, 
             oracle_labels, 
             class_names, 
             title=f"After {budget} samples", 
@@ -273,5 +271,5 @@ def train_model(model: nn.Module,
         save_path = f"{save_dir}/{sampler_name}_budget_{budget}.pth"
         save_model(model, save_path)
         
-        del train_subset, al_dataset, al_loader, embeddings_proj, probs, embeddings_concat, model
+        del train_subset, al_dataset, al_loader, embeddings_concat, model
         clear_memory()
