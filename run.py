@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import List, Dict, Union
 import os
 import yaml
 import argparse
@@ -14,7 +14,7 @@ from model import CODAModel, extract_text_embeddings, train_model
 def main(data_path: str,
          sampler_name: str,
          num_classes: int,
-         cumulative_budget: List[int],
+         cumulative_budget: Union[List[int], str],
          data_descriptions: Dict[str, str],
          prompt_templates: Dict[str, str],
          rank_lora: int,

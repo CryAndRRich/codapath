@@ -1,5 +1,5 @@
 import os
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Union
 from tqdm import tqdm
 
 import numpy as np 
@@ -178,7 +178,7 @@ def train_model(model: nn.Module,
                 class_names: List[str],
                 text_embeddings: np.ndarray, 
                 color_map: Dict[str, str],
-                cumulative_budget: List[int], 
+                cumulative_budget: Union[List[int], str], 
                 num_epochs: int, 
                 learn_rate: float,
                 alpha: float, 
@@ -192,6 +192,44 @@ def train_model(model: nn.Module,
     
     from evaluate import evaluate_model, visualize_tsne
     from set_up import set_seed
+
+    if isinstance(cumulative_budget, str):
+        al_dataset = ActiveLearningDataset(train_dataset, oracle_labels)
+        al_loader = DataLoader(
+            al_dataset, 
+            batch_size=32, 
+            shuffle=True, 
+            num_workers=0,
+            worker_init_fn=seed_worker_fn, 
+            generator=g_seed
+        )
+        
+        num_classes_total = len(class_names)
+        fresh_model = CODAModel(
+            num_classes=num_classes_total, 
+            r=r, 
+            lora_alpha=r * 2
+        ).to(device)
+        
+        fresh_model = train_contrastive(
+            model=fresh_model, 
+            labeled_loader=al_loader, 
+            num_epochs=num_epochs, 
+            learn_rate=learn_rate, 
+            device=device,
+            verbose=verbose
+        )
+        
+        if verbose:
+            evaluate_model(fresh_model, test_loader, test_labels, device)
+            
+        save_path = f"{save_dir}/{sampler_name}_{cumulative_budget}.pth"
+        save_model(fresh_model, save_path)
+        
+        del al_dataset, al_loader, fresh_model
+        clear_memory()
+        
+        return
 
     train_loader = DataLoader(
         train_dataset, 
