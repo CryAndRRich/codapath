@@ -274,7 +274,8 @@ def badge_sampling(**kwargs) -> List[int]:
             
             preds = torch.argmax(unlabeled_probs, dim=1)
             residuals = -unlabeled_probs
-            residuals.scatter_add_(1, preds.unsqueeze(1), torch.ones_like(preds.unsqueeze(1)))
+            
+            residuals = residuals + F.one_hot(preds, num_classes=residuals.shape[1]).to(residuals.dtype)
             
             emb_norms_sq = torch.sum(unlabeled_embs ** 2, dim=1)
             res_norms_sq = torch.sum(residuals ** 2, dim=1)
@@ -287,8 +288,13 @@ def badge_sampling(**kwargs) -> List[int]:
                     grad_magnitudes = emb_norms_sq * res_norms_sq
                     ind = torch.argmax(grad_magnitudes).item()
                 else:
-                    prob_dist = D2 / torch.sum(D2)
-                    ind = torch.multinomial(prob_dist, 1).item()
+                    sum_D2 = torch.sum(D2)
+                    if sum_D2 <= 1e-9:
+                        valid_choices = [idx for idx in range(len(D2)) if idx not in chosen_local]
+                        ind = np.random.choice(valid_choices) if valid_choices else 0
+                    else:
+                        prob_dist = D2 / sum_D2
+                        ind = torch.multinomial(prob_dist, 1).item()
                     
                 chosen_local.append(ind)
                 
