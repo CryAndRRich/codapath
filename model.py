@@ -156,18 +156,23 @@ def extract_text_embeddings(class_descriptions: Dict[str, str],
 def save_model(model: nn.Module, save_path: str) -> None:
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     
+    unwrapped_model = getattr(model, "_orig_mod", model)
+    full_sd = unwrapped_model.state_dict()
+    target_keys = ["lora", "projection_head", "classification_head"]
     trainable_state_dict = {
-        name: param.cpu() for name, param in model.named_parameters() if param.requires_grad
+        k: v.cpu() for k, v in full_sd.items() 
+        if any(substring in k for substring in target_keys)
     }
-    
     torch.save(trainable_state_dict, save_path)
-    print(f"Saved model parameters to: {save_path}")
+    print(f"Saved {len(trainable_state_dict)} components to: {save_path}")
 
-def load_model(model: nn.Module, load_path: str) -> nn.Module:
-    state_dict = torch.load(load_path, map_location="cpu")
-    model.load_state_dict(state_dict, strict=False)
+
+def load_model(model: nn.Module, load_path: str, device: torch.device) -> nn.Module:
+    checkpoint = torch.load(load_path, map_location=device)
+    model.load_state_dict(checkpoint, strict=False)
     print(f"Loaded model parameters from: {load_path}")
-    return model
+    return model.to(device).eval()
+
 
 def train_model(model: nn.Module, 
                 sampler_name: str,
