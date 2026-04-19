@@ -127,7 +127,7 @@ def visualize_tsne(embeddings_proj: np.ndarray,
 
 
 def plot_acc_diff(budgets_dict: Dict[str, List[int]],
-              acc_data: List[Dict[str, List[float]]]) -> None:
+                  acc_data: List[Dict[str, List[float]]]) -> None:
     
     styles = {
         "Random":    {"color": "black",    "marker": "o", "zorder": 5},
@@ -195,48 +195,84 @@ def plot_acc_diff(budgets_dict: Dict[str, List[int]],
     plt.savefig("al_results_acc.png", dpi=300, bbox_inches="tight")
     plt.show()
 
-if __name__ == "__main__":
-    budgets = {
-        "PathMNIST": [50, 100, 150, 200, 250, 300],
-        "HistoSet-5x14": [50, 100, 150, 200, 250, 300],
-        "SkinTissue": [50, 100, 150, 200, 250, 300]
-    }
 
-    methods = ["Random", "Margin", "Entropy", "Coreset", "BADGE", "TypiClust", "ActiveFT", "CODAPath"]
+def plot_label_diversity(dataset: str,
+                         methods: List[str],
+                         budget: int,
+                         class_names: List[str],
+                         selected_sample_dir: str,
+                         figsize: tuple = (11, 6)) -> None:
+    num_classes = len(class_names)
+    method_counts = []
+    method_entropies = []
 
-    acc_pathmnist = {
-        "CODAPath": [92.34, 92.7, 93.58, 94.05, 94.4, 94.67],
-        "Random": [89.0, 93.59, 94.92, 94.94, 95.13, 95.42],
-        "Margin": [88.54, 92.23, 93.84, 94.29, 92.87, 94.64],
-        "Entropy": [54.71, 87.44, 84.76, 92.91, 93.15, 92.76],
-        "Coreset": [80.61, 89.44, 92.84, 93.38, 94.74, 94.07],
-        "BADGE": [88.94, 92.63, 95.11, 95.32, 95.06, 95.17],
-        "TypiClust": [89.29, 89.21, 93.57, 94.44, 94.23, 94.89],
-        "ActiveFT": [89.37, 91.75, 94.11, 95.58, 95.71, 95.28]
-    }
+    for method in methods:
+        filename = f"{dataset}_{method.lower()}_budget_{budget}.pt"
+        filepath = os.path.join(selected_sample_dir, filename)
+        
+        counts = np.zeros(num_classes)
+        entropy = 0.0
+        
+        if os.path.exists(filepath):
+            data = torch.load(filepath, map_location="cpu", weights_only=False)
+            labels = data["selected_labels"]
+            
+            unique_lbls, lbl_counts = np.unique(labels, return_counts=True)
+            for lbl, cnt in zip(unique_lbls, lbl_counts):
+                counts[int(lbl)] = cnt
+                
+            total = np.sum(counts)
+            if total > 0:
+                probs = counts[counts > 0] / total
+                entropy = -np.sum(probs * np.log2(probs))
+        else:
+            print(f"Cannot find the file: {filepath}")
+            
+        method_counts.append(counts)
+        method_entropies.append(entropy)
 
-    acc_histoset = {
-        "CODAPath": [79.25, 82.13, 85.52, 86.93, 89.2, 90.29],
-        "Random": [63.93, 77.75, 82.36, 86.84, 87.98, 88.64],
-        "Margin": [67.23, 76.5, 86.02, 88.66, 90.36, 90.29],
-        "Entropy": [49.05, 58.27, 69.55, 75.0, 73.54, 80.57],
-        "Coreset": [56.68, 72.25, 77.46, 80.38, 81.86, 83.88],
-        "BADGE": [65.59, 78.86, 84.36, 86.52, 87.61, 87.68],
-        "TypiClust": [69.41, 79.41, 85.71, 85.34, 86.16, 88.93],
-        "ActiveFT": [67.73, 76.75, 82.61, 86.23, 87.64, 88.2]
-    }
+    max_count = max([max(c) for c in method_counts]) if method_counts else 1
 
-    acc_skin = {
-        "CODAPath": [80.0, 80.84, 84.65, 86.36, 87.65, 87.77],
-        "Random": [73.01, 77.68, 83.2, 84.68, 86.11, 87.17],
-        "Margin": [70.53, 77.94, 84.42, 85.67, 87.37, 88.08],
-        "Entropy": [46.52, 58.63, 71.98, 80.51, 82.0, 86.16],
-        "Coreset": [63.35, 71.8, 76.26, 78.15, 77.48, 78.29],
-        "BADGE": [68.67, 75.04, 83.85, 86.34, 86.71, 87.39],
-        "TypiClust": [73.73, 79.47, 83.71, 85.14, 86.5, 87.6],
-        "ActiveFT": [72.32, 79.35, 84.07, 85.02, 86.38, 87.36]
-    }
+    _, axes = plt.subplots(nrows=1, ncols=len(methods), figsize=figsize, sharey=True)
+    plt.subplots_adjust(wspace=0)
 
-    acc_data_list = [acc_pathmnist, acc_histoset, acc_skin]
+    y_positions = np.arange(num_classes)
 
-    plot_acc_diff(budgets, acc_data_list)
+    for i, (ax, method, counts, entropy) in enumerate(zip(axes, methods, method_counts, method_entropies)):
+        ax.barh(y_positions, counts, color="#C44E52", align="center")
+        
+        ax.set_title(method, fontsize=13, pad=7)
+        
+        ax.set_xlim(0, max_count * 1.05)
+        ax.set_xticks([])
+        
+        if i == 0:
+            ax.invert_yaxis()
+            ax.set_yticks(y_positions)
+            ax.set_yticklabels(class_names, fontsize=11)
+            ax.tick_params(axis="y", length=0, pad=10)
+            
+            ax.text(
+                -0.15, 
+                -0.025, 
+                "Entropy", 
+                transform=ax.transAxes,
+                ha="right", 
+                va="top", 
+                fontsize=11
+            )
+        else:
+            ax.tick_params(left=False) 
+            
+        ax.text(
+            0.5, 
+            -0.025, 
+            f"{entropy:.3f}", 
+            transform=ax.transAxes, 
+            ha="center", 
+            va="top", 
+            fontsize=11)
+
+    save_path = f"label_diversity_{dataset}_{budget}.png"
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.show()
