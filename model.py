@@ -330,6 +330,7 @@ def train_model(model: nn.Module,
 
         if budget == max(cumulative_budget):
             save_data_path = f"{save_dir}/{sampler_name}_selected_data_budget_{budget}.pt"
+            os.makedirs(os.path.dirname(save_data_path), exist_ok=True)
             
             torch.save({
                 "selected_indices": selected_indices,
