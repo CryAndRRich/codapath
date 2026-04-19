@@ -51,6 +51,42 @@ def _validate_sampler_embedding_shapes(
         )
 
 
+def _normalize_numpy_embeddings(embeddings: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms = np.clip(norms, a_min=1e-12, a_max=None)
+    return embeddings / norms
+
+
+def _extract_plip_text_features(
+    plip_model: CLIPModel,
+    tokenized_inputs: Dict[str, torch.Tensor],
+) -> torch.Tensor:
+    text_features = plip_model.get_text_features(**tokenized_inputs)
+    if isinstance(text_features, torch.Tensor):
+        return text_features
+
+    text_outputs = plip_model.text_model(**tokenized_inputs)
+    pooled_output = text_outputs.pooler_output
+    if hasattr(plip_model, "text_projection") and plip_model.text_projection is not None:
+        pooled_output = plip_model.text_projection(pooled_output)
+    return pooled_output
+
+
+def _extract_plip_image_features(
+    plip_model: CLIPModel,
+    pixel_values: torch.Tensor,
+) -> torch.Tensor:
+    image_features = plip_model.get_image_features(pixel_values=pixel_values)
+    if isinstance(image_features, torch.Tensor):
+        return image_features
+
+    vision_outputs = plip_model.vision_model(pixel_values=pixel_values)
+    pooled_output = vision_outputs.pooler_output
+    if hasattr(plip_model, "visual_projection") and plip_model.visual_projection is not None:
+        pooled_output = plip_model.visual_projection(pooled_output)
+    return pooled_output
+
+
 class AblationCODAModel(nn.Module):
     def __init__(
         self,
@@ -224,7 +260,7 @@ def extract_text_embeddings(
             return_tensors="pt",
         ).to(device)
         with torch.no_grad():
-            emb_plip = plip_model.get_text_features(**tokens_plip).cpu().numpy()
+            emb_plip = _extract_plip_text_features(plip_model, tokens_plip).cpu().numpy()
         embeddings_per_tower.append(emb_plip)
         del plip_model, plip_processor, tokens_plip, emb_plip
         clear_memory()
@@ -253,7 +289,7 @@ def extract_text_embeddings(
         else np.concatenate(embeddings_per_tower, axis=1)
     )
     text_embeddings = merged_embeddings.reshape(len(class_names), len(prompt_templates), -1).mean(axis=1)
-    text_embeddings = text_embeddings / np.linalg.norm(text_embeddings, axis=1, keepdims=True)
+    text_embeddings = _normalize_numpy_embeddings(text_embeddings)
     return text_embeddings
 
 
@@ -290,7 +326,7 @@ def extract_sampler_image_embeddings(
 
         with amp_context:
             if plip_model is not None:
-                plip_features = plip_model.get_image_features(pixel_values=images)
+                plip_features = _extract_plip_image_features(plip_model, images)
                 towers.append(plip_features)
 
             if biomed_model is not None:
@@ -306,7 +342,7 @@ def extract_sampler_image_embeddings(
         del biomed_model
     clear_memory()
 
-    return np.vstack(embeddings_per_batch)
+    return _normalize_numpy_embeddings(np.vstack(embeddings_per_batch))
 
 
 def inspect_sampler_alignment(
