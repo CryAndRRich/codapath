@@ -327,6 +327,14 @@ def train_model(model: nn.Module,
             device=device,
             verbose=verbose
         )
+
+        if budget == max(cumulative_budget):
+            save_data_path = f"{save_dir}/{sampler_name}_selected_data_budget_{budget}.pt"
+            
+            torch.save({
+                "selected_indices": selected_indices,
+                "selected_labels": selected_labels
+            }, save_data_path)
         
         if verbose:
             evaluate_model(fresh_model, test_loader, test_labels, device)

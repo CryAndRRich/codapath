@@ -84,6 +84,8 @@ def visualize_tsne(embeddings_proj: np.ndarray,
     label_names = [class_names[lbl] for lbl in y_lbl]
     hue_order = sorted(class_names) 
     
+    normal_size = 15
+    
     sns.scatterplot(
         x=X_2d[:, 0], 
         y=X_2d[:, 1],
@@ -92,7 +94,7 @@ def visualize_tsne(embeddings_proj: np.ndarray,
         palette=color_map,   
         legend="full", 
         alpha=0.4, 
-        s=20,
+        s=normal_size,
         edgecolor=None
     )
     
@@ -102,8 +104,8 @@ def visualize_tsne(embeddings_proj: np.ndarray,
             X_2d[local_selected_indices, 1],
             color="black",
             edgecolor="white", 
-            linewidth=0.8,
-            s=60, 
+            linewidth=0.5, 
+            s=normal_size * 0.8, 
             label="Selected Samples",
             zorder=5 
         )
