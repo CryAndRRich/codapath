@@ -11,7 +11,7 @@ from peft import LoraConfig, get_peft_model
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from torch.amp import autocast
 from torch.utils.data import DataLoader, Dataset, Subset
-from transformers import AutoModel, AutoTokenizer, CLIPTextModel, CLIPTokenizer, CLIPVisionModel
+from transformers import CLIPModel, CLIPProcessor, CLIPVisionModel
 
 from ablations import VALID_ABLATIONS
 from ablations.contrastive import train_contrastive
@@ -25,6 +25,29 @@ def _validate_ablation(ablation_approach: str) -> None:
     if ablation_approach not in VALID_ABLATIONS:
         raise ValueError(
             f"Unsupported ablation '{ablation_approach}'. Expected one of: {sorted(VALID_ABLATIONS)}"
+        )
+
+
+def _validate_sampler_embedding_shapes(
+    image_embeddings: np.ndarray,
+    text_embeddings: np.ndarray,
+    sampler_name: str,
+    ablation_approach: str,
+) -> None:
+    if image_embeddings.ndim != 2 or text_embeddings.ndim != 2:
+        raise ValueError(
+            "Sampler embeddings must be rank-2 arrays. "
+            f"Got image_embeddings.ndim={image_embeddings.ndim}, "
+            f"text_embeddings.ndim={text_embeddings.ndim}."
+        )
+
+    if sampler_name == "codapath" and image_embeddings.shape[1] != text_embeddings.shape[1]:
+        raise ValueError(
+            "CODAPath ablation embedding mismatch. "
+            f"ablation={ablation_approach}, "
+            f"image_embeddings.shape={tuple(image_embeddings.shape)}, "
+            f"text_embeddings.shape={tuple(text_embeddings.shape)}. "
+            "Both must share the same feature width because CODAPath computes image-text similarity."
         )
 
 
@@ -192,37 +215,33 @@ def extract_text_embeddings(
     embeddings_per_tower = []
 
     if use_plip:
-        tokenizer_plip = CLIPTokenizer.from_pretrained("vinid/plip")
-        encoder_plip = CLIPTextModel.from_pretrained("vinid/plip").to(device).eval()
-        tokens_plip = tokenizer_plip(
+        plip_processor = CLIPProcessor.from_pretrained("vinid/plip")
+        plip_model = CLIPModel.from_pretrained("vinid/plip").to(device).eval()
+        tokens_plip = plip_processor.tokenizer(
             prompts,
             padding=True,
             truncation=True,
             return_tensors="pt",
         ).to(device)
         with torch.no_grad():
-            emb_plip = encoder_plip(**tokens_plip).pooler_output.cpu().numpy()
+            emb_plip = plip_model.get_text_features(**tokens_plip).cpu().numpy()
         embeddings_per_tower.append(emb_plip)
-        del encoder_plip, tokens_plip, emb_plip
+        del plip_model, plip_processor, tokens_plip, emb_plip
         clear_memory()
 
     if use_biomedclip:
-        tokenizer_bio = AutoTokenizer.from_pretrained(
-            "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
+        biomed_model, _, _ = open_clip.create_model_and_transforms(
+            "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
         )
-        encoder_bio = AutoModel.from_pretrained(
-            "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
-        ).to(device).eval()
-        tokens_bio = tokenizer_bio(
-            prompts,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        ).to(device)
+        biomed_model = biomed_model.to(device).eval()
+        biomed_tokenizer = open_clip.get_tokenizer(
+            "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+        )
+        tokens_bio = biomed_tokenizer(prompts).to(device)
         with torch.no_grad():
-            emb_bio = encoder_bio(**tokens_bio).pooler_output.cpu().numpy()
+            emb_bio = biomed_model.encode_text(tokens_bio).cpu().numpy()
         embeddings_per_tower.append(emb_bio)
-        del encoder_bio, tokens_bio, emb_bio
+        del biomed_model, biomed_tokenizer, tokens_bio, emb_bio
         clear_memory()
 
     if not embeddings_per_tower:
@@ -236,6 +255,90 @@ def extract_text_embeddings(
     text_embeddings = merged_embeddings.reshape(len(class_names), len(prompt_templates), -1).mean(axis=1)
     text_embeddings = text_embeddings / np.linalg.norm(text_embeddings, axis=1, keepdims=True)
     return text_embeddings
+
+
+@torch.inference_mode()
+def extract_sampler_image_embeddings(
+    dataloader: DataLoader,
+    device: torch.device,
+    ablation_approach: str,
+) -> np.ndarray:
+    _validate_ablation(ablation_approach)
+    use_plip = ablation_approach != "biomedclip_only"
+    use_biomedclip = ablation_approach != "plip_only"
+
+    embeddings_per_batch = []
+
+    plip_model = None
+    plip_processor = None
+    if use_plip:
+        plip_processor = CLIPProcessor.from_pretrained("vinid/plip")
+        plip_model = CLIPModel.from_pretrained("vinid/plip").to(device).eval()
+
+    biomed_model = None
+    if use_biomedclip:
+        biomed_model, _, _ = open_clip.create_model_and_transforms(
+            "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+        )
+        biomed_model = biomed_model.to(device).eval()
+
+    amp_context = autocast(device_type=device.type) if device.type == "cuda" else nullcontext()
+
+    for images, _ in dataloader:
+        images = images.to(device, non_blocking=True)
+        towers = []
+
+        with amp_context:
+            if plip_model is not None:
+                plip_features = plip_model.get_image_features(pixel_values=images)
+                towers.append(plip_features)
+
+            if biomed_model is not None:
+                biomed_features = biomed_model.encode_image(images)
+                towers.append(biomed_features)
+
+        merged = towers[0] if len(towers) == 1 else torch.cat(towers, dim=1)
+        embeddings_per_batch.append(merged.cpu().numpy().astype(np.float32))
+
+    if plip_model is not None:
+        del plip_model, plip_processor
+    if biomed_model is not None:
+        del biomed_model
+    clear_memory()
+
+    return np.vstack(embeddings_per_batch)
+
+
+def inspect_sampler_alignment(
+    dataloader: DataLoader,
+    class_descriptions: Dict[str, str],
+    prompt_templates: List[str],
+    class_names: List[str],
+    device: torch.device,
+    ablation_approach: str,
+    sampler_name: str = "codapath",
+) -> Dict[str, Union[str, Tuple[int, ...], bool]]:
+    image_embeddings = extract_sampler_image_embeddings(
+        dataloader=dataloader,
+        device=device,
+        ablation_approach=ablation_approach,
+    )
+    text_embeddings = extract_text_embeddings(
+        class_descriptions=class_descriptions,
+        prompt_templates=prompt_templates,
+        class_names=class_names,
+        device=device,
+        ablation_approach=ablation_approach,
+    )
+
+    is_compatible = image_embeddings.shape[1] == text_embeddings.shape[1]
+    return {
+        "ablation_approach": ablation_approach,
+        "sampler_name": sampler_name,
+        "image_embeddings_shape": tuple(image_embeddings.shape),
+        "text_embeddings_shape": tuple(text_embeddings.shape),
+        "feature_width_match": is_compatible,
+    }
 
 
 def evaluate_model(
@@ -362,9 +465,20 @@ def train_model(
     )
 
     embeddings_concat, embeddings_proj, _ = extract_image_embeddings(train_loader, model, device=device)
+    sampler_image_embeddings = extract_sampler_image_embeddings(
+        dataloader=train_loader,
+        device=device,
+        ablation_approach=ablation_approach,
+    )
+    _validate_sampler_embedding_shapes(
+        image_embeddings=sampler_image_embeddings,
+        text_embeddings=text_embeddings,
+        sampler_name=sampler_name,
+        ablation_approach=ablation_approach,
+    )
     master_selected_indices = get_sampler(
         name=sampler_name,
-        image_embeddings=embeddings_concat,
+        image_embeddings=sampler_image_embeddings,
         text_embeddings=text_embeddings,
         max_budget=max(cumulative_budget),
         alpha=alpha,
@@ -441,5 +555,5 @@ def train_model(
         del train_subset, al_dataset, al_loader, fresh_model
         clear_memory()
 
-    del embeddings_concat, master_selected_indices
+    del embeddings_concat, sampler_image_embeddings, master_selected_indices
     clear_memory()
