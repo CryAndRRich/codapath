@@ -129,7 +129,10 @@ if __name__ == "__main__":
         "--sampler_name",
         type=str,
         default=config.get("sampler_name", "codapath"),
-        help="Sampling algorithm name. CODAPath ablations should normally use 'codapath'.",
+        help=(
+            "Sampling algorithm name. For sampling ablations, use "
+            "'codapath_no_uncertainty' or 'codapath_no_spatial_coverage'."
+        ),
     )
     parser.add_argument("--seed", type=int, default=config.get("random_seed", 42), help="Random seed")
     parser.add_argument("--device", type=str, default=config.get("device", "cuda"), help="Device to run on")

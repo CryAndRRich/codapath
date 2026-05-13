@@ -41,7 +41,7 @@ def _validate_sampler_embedding_shapes(
             f"text_embeddings.ndim={text_embeddings.ndim}."
         )
 
-    if sampler_name == "codapath" and image_embeddings.shape[1] != text_embeddings.shape[1]:
+    if sampler_name.startswith("codapath") and image_embeddings.shape[1] != text_embeddings.shape[1]:
         raise ValueError(
             "CODAPath ablation embedding mismatch. "
             f"ablation={ablation_approach}, "
@@ -450,7 +450,8 @@ def train_model(
         raise ValueError(
             f"Sampler '{sampler_name}' is not supported in ablations because its selection "
             "logic instantiates the baseline model internally. Use codapath, random, coreset, "
-            "typiclust, or activeft instead."
+            "typiclust, activeft, codapath_no_uncertainty, or "
+            "codapath_no_spatial_coverage instead."
         )
 
     use_center_loss = ablation_approach != "no_contrastive_loss"

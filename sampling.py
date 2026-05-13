@@ -477,8 +477,38 @@ def activeft_sampling(**kwargs) -> List[int]:
 
 @register_sampler("codapath")
 def coda_sampling(**kwargs) -> List[int]:
+    return _codapath_sampling(
+        use_uncertainty=True,
+        use_spatial_coverage=True,
+        desc="CODAPath Selection",
+        **kwargs
+    )
+
+@register_sampler("codapath_no_uncertainty")
+def coda_no_uncertainty_sampling(**kwargs) -> List[int]:
+    return _codapath_sampling(
+        use_uncertainty=False,
+        use_spatial_coverage=True,
+        desc="CODAPath Coverage-Only Selection",
+        **kwargs
+    )
+
+@register_sampler("codapath_no_spatial_coverage")
+def coda_no_spatial_coverage_sampling(**kwargs) -> List[int]:
+    return _codapath_sampling(
+        use_uncertainty=True,
+        use_spatial_coverage=False,
+        desc="CODAPath Uncertainty-Only Selection",
+        **kwargs
+    )
+
+def _codapath_sampling(
+    use_uncertainty: bool,
+    use_spatial_coverage: bool,
+    desc: str,
+    **kwargs
+) -> List[int]:
     image_embeddings = kwargs["image_embeddings"]
-    text_embeddings = kwargs["text_embeddings"]
     max_budget = kwargs["max_budget"]
     alpha = kwargs["alpha"]
     device = kwargs["device"]
@@ -487,57 +517,67 @@ def coda_sampling(**kwargs) -> List[int]:
     num_samples = image_embeddings.shape[0]
     
     img_tensor = torch.tensor(image_embeddings, device=device, dtype=torch.float32)
-    txt_tensor = torch.tensor(text_embeddings, device=device, dtype=torch.float32)
-    
     img_norm = F.normalize(img_tensor, p=2, dim=1)
-    txt_norm = F.normalize(txt_tensor, p=2, dim=1)
-    
-    sim_matrix_0 = torch.matmul(img_norm, txt_norm.T)
-    
-    probs_for_margin = F.softmax(sim_matrix_0 / 0.05, dim=1)
-    
-    sorted_probs, _ = torch.sort(probs_for_margin, dim=1)
-    margins = sorted_probs[:, -1] - sorted_probs[:, -2]
-    
-    predicted_classes = torch.argmax(probs_for_margin, dim=1)
-    one_hot_preds = torch.zeros_like(probs_for_margin)
-    one_hot_preds.scatter_(1, predicted_classes.unsqueeze(1), 1.0)
-    
-    M = 0.5 * (probs_for_margin + one_hot_preds)
-    
-    kl_p_m = torch.sum(probs_for_margin * torch.log(probs_for_margin / M + 1e-10), dim=1)
-    kl_q_m = torch.sum(one_hot_preds * torch.log(one_hot_preds / M + 1e-10), dim=1)
-    
-    jsd_scores = 0.5 * kl_p_m + 0.5 * kl_q_m
-    
-    uncertainty_weights = (1.0 - margins) * (1.0 + jsd_scores)
-    if uncertainty_weights.max() > 0:
-        uncertainty_weights = uncertainty_weights / uncertainty_weights.max()
+
+    if use_uncertainty:
+        text_embeddings = kwargs["text_embeddings"]
+        txt_tensor = torch.tensor(text_embeddings, device=device, dtype=torch.float32)
+        txt_norm = F.normalize(txt_tensor, p=2, dim=1)
+        
+        sim_matrix_0 = torch.matmul(img_norm, txt_norm.T)
+        
+        probs_for_margin = F.softmax(sim_matrix_0 / 0.05, dim=1)
+        
+        sorted_probs, _ = torch.sort(probs_for_margin, dim=1)
+        margins = sorted_probs[:, -1] - sorted_probs[:, -2]
+        
+        predicted_classes = torch.argmax(probs_for_margin, dim=1)
+        one_hot_preds = torch.zeros_like(probs_for_margin)
+        one_hot_preds.scatter_(1, predicted_classes.unsqueeze(1), 1.0)
+        
+        M = 0.5 * (probs_for_margin + one_hot_preds)
+        
+        kl_p_m = torch.sum(probs_for_margin * torch.log(probs_for_margin / M + 1e-10), dim=1)
+        kl_q_m = torch.sum(one_hot_preds * torch.log(one_hot_preds / M + 1e-10), dim=1)
+        
+        jsd_scores = 0.5 * kl_p_m + 0.5 * kl_q_m
+        
+        uncertainty_weights = (1.0 - margins) * (1.0 + jsd_scores)
+        if uncertainty_weights.max() > 0:
+            uncertainty_weights = uncertainty_weights / uncertainty_weights.max()
+            
+        del txt_tensor, txt_norm, sim_matrix_0, probs_for_margin
+        del sorted_probs, margins, predicted_classes, one_hot_preds, M
+        del kl_p_m, kl_q_m, jsd_scores
+    else:
+        uncertainty_weights = torch.zeros(num_samples, device=device)
 
     selected_indices = []
     
     unlabeled_tensor = img_norm
     uncertainty_tensor = uncertainty_weights
     
-    max_sim_to_S = torch.full((num_samples, 1), -float("inf"), device=device)
+    # Use a finite empty-set baseline so the first coverage-only step is well-defined.
+    max_sim_to_S = torch.zeros((num_samples, 1), device=device)
     
-    for _ in tqdm(range(max_budget), desc="CODAPath Selection"):
+    for _ in tqdm(range(max_budget), desc=desc):
         global_max_coverage = 0.0
         
-        for chunk_start in range(0, num_samples, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, num_samples)
-            chunk_tensor = unlabeled_tensor[chunk_start:chunk_end]
-            
-            sim_chunk = torch.matmul(unlabeled_tensor, chunk_tensor.T)
-            gain_chunk = torch.clamp(sim_chunk - max_sim_to_S, min=0.0)
-            coverage_gain_chunk = torch.sum(gain_chunk, dim=0)
-            
-            local_max = torch.max(coverage_gain_chunk).item()
-            if local_max > global_max_coverage:
-                global_max_coverage = local_max
+        if use_spatial_coverage:
+            for chunk_start in range(0, num_samples, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, num_samples)
+                chunk_tensor = unlabeled_tensor[chunk_start:chunk_end]
                 
-            del chunk_tensor, sim_chunk, gain_chunk, coverage_gain_chunk
-            clear_memory()
+                sim_chunk = torch.matmul(unlabeled_tensor, chunk_tensor.T)
+                gain_chunk = torch.clamp(sim_chunk - max_sim_to_S, min=0.0)
+                coverage_gain_chunk = torch.sum(gain_chunk, dim=0)
+                
+                local_max = torch.max(coverage_gain_chunk).item()
+                if local_max > global_max_coverage:
+                    global_max_coverage = local_max
+                    
+                del chunk_tensor, sim_chunk, gain_chunk, coverage_gain_chunk
+                clear_memory()
         
         best_candidate_global = -1
         best_objective_score = -float("inf")
@@ -548,16 +588,27 @@ def coda_sampling(**kwargs) -> List[int]:
             chunk_tensor = unlabeled_tensor[chunk_start:chunk_end]
             chunk_uncert = uncertainty_tensor[chunk_start:chunk_end]
             
-            sim_chunk = torch.matmul(unlabeled_tensor, chunk_tensor.T)
-            gain_chunk = torch.clamp(sim_chunk - max_sim_to_S, min=0.0)
-            coverage_gain_chunk = torch.sum(gain_chunk, dim=0)
-            
-            if global_max_coverage > 0:
-                normalized_coverage = coverage_gain_chunk / global_max_coverage
-            else:
-                normalized_coverage = torch.zeros_like(coverage_gain_chunk)
+            if use_spatial_coverage:
+                sim_chunk = torch.matmul(unlabeled_tensor, chunk_tensor.T)
+                gain_chunk = torch.clamp(sim_chunk - max_sim_to_S, min=0.0)
+                coverage_gain_chunk = torch.sum(gain_chunk, dim=0)
                 
-            objective_scores = (1 - alpha) * normalized_coverage + (alpha) * chunk_uncert
+                if global_max_coverage > 0:
+                    normalized_coverage = coverage_gain_chunk / global_max_coverage
+                else:
+                    normalized_coverage = torch.zeros_like(coverage_gain_chunk)
+            else:
+                sim_chunk = None
+                gain_chunk = None
+                coverage_gain_chunk = None
+                normalized_coverage = torch.zeros_like(chunk_uncert)
+
+            if use_uncertainty and use_spatial_coverage:
+                objective_scores = (1 - alpha) * normalized_coverage + alpha * chunk_uncert
+            elif use_uncertainty:
+                objective_scores = chunk_uncert.clone()
+            else:
+                objective_scores = normalized_coverage.clone()
             
             for selected_idx in selected_indices:
                 if chunk_start <= selected_idx < chunk_end:
@@ -570,14 +621,18 @@ def coda_sampling(**kwargs) -> List[int]:
             if local_best_score > best_objective_score or best_sim_column is None:
                 best_objective_score = local_best_score
                 best_candidate_global = chunk_start + local_best_idx
-                best_sim_column = sim_chunk[:, local_best_idx].reshape(-1, 1).clone() 
+                if use_spatial_coverage:
+                    best_sim_column = sim_chunk[:, local_best_idx].reshape(-1, 1).clone()
+                else:
+                    best_sim_column = torch.empty(0, device=device)
                 
             del chunk_tensor, chunk_uncert, sim_chunk, gain_chunk, coverage_gain_chunk, objective_scores
             clear_memory()
             
         if best_sim_column is not None:
             selected_indices.append(best_candidate_global)
-            max_sim_to_S = torch.maximum(max_sim_to_S, best_sim_column)
+            if use_spatial_coverage:
+                max_sim_to_S = torch.maximum(max_sim_to_S, best_sim_column)
             del best_sim_column
             clear_memory()
         else:
