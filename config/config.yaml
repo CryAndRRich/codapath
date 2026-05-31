@@ -1,14 +1,97 @@
 dataset: "pathmnist"
 sampler_name: "codapath"
 random_seed: 42
-device: "cuda" 
+device: "cuda"
 
-hyperparameters:
-  alpha: 0.5
-  num_epochs: 25
-  rank_lora: 8
-  learning_rate: 0.0001
+cumulative_budget: [50, 100, 150, 200, 250, 300]
 
+# ── Model names (HuggingFace Hub IDs) ──────────────────────────────────────
+# Change these to swap backbones without touching any Python code.
+models:
+  # Default ViT used for ALL methods: feature extraction + LinearProbe training
+  vit: "facebook/dinov2-base"               # 768-dim CLS token
+  # Default VLM used by CODAPath image encoder
+  vlm_primary: "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+  # Secondary VLM (PLIP) used by CODAPath image + text encoder
+  vlm_secondary: "vinid/plip"
+  # BiomedBERT text encoder used by CODAPath text features
+  biomedbert: "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
+
+# ── Training protocol (shared by all methods) ───────────────────────────────
+training:
+  mode: "linear"        # "linear" | "knn_linear"
+  probe_epochs: 100     # epochs for the evaluation LinearProbe
+  probe_lr: 0.001       # Adam lr for the evaluation LinearProbe
+  knn_k: 5              # KNN neighbours for pseudo-labelling (knn_linear only)
+  knn_threshold: 0.9    # min confidence to accept a pseudo-label (knn_linear only)
+
+# ── Per-sampler hyperparameters ─────────────────────────────────────────────
+samplers:
+  random: {}
+
+  coreset:
+    chunk_size: 10000
+
+  typiclust:
+    k_nn: 20
+    chunk_size: 10000
+
+  activeft:
+    lr: 0.01
+    temperature: 0.07
+    iterations: 100
+    balance: 1.0
+
+  codapath:
+    alpha: 0.5          # 0 = pure coverage, 1 = pure uncertainty
+    chunk_size: 10000
+
+  entropy:
+    probe_epochs: 50
+    probe_lr: 0.001
+
+  margin:
+    probe_epochs: 50
+    probe_lr: 0.001
+
+  badge:
+    probe_epochs: 50
+    probe_lr: 0.001
+
+  uncertainty_herding:
+    probe_epochs: 50
+    probe_lr: 0.001
+    chunk_size: 2000    # (N × chunk_size) kernel matrix; reduce on small-VRAM GPUs
+
+  dcom:
+    probe_epochs: 50
+    probe_lr: 0.001
+    competence_midpoint: 0.9    # logistic parameter a  (paper: 0.9 for ≤10 classes)
+    competence_steepness: 30.0  # logistic parameter k
+    # delta: null               # if null, estimated automatically from data purity
+
+  tcm:
+    probe_epochs: 50
+    probe_lr: 0.001
+    k_nn: 20
+    chunk_size: 5000
+    # transition_budget: null   # if null, defaults to min(2×num_classes, max_budget)
+
+  dropquery:
+    probe_epochs: 50
+    probe_lr: 0.001
+    dropout_ratio: 0.75   # ρ — feature-level dropout ratio
+    n_dropout: 3          # M — number of dropout passes (robust to 3–9)
+
+  refine:
+    probe_epochs: 30
+    probe_lr: 0.001
+    filter_rounds: 3      # R — filtering rounds (paper: 5; reduced for speed)
+    filter_alpha: 0.4     # α — subsample ratio per strategy call
+    filter_batches: 5     # J — batches per strategy per round (paper: 10)
+    chunk_size: 2000      # for final MaxHerding stage
+
+# ── Prompt templates for CODAPath text encoding ─────────────────────────────
 prompt_templates:
   - "Photomicrograph showing {}."
   - "Histopathology of {}."
@@ -16,13 +99,11 @@ prompt_templates:
   - "Pathological tissue section demonstrating {}."
   - "Cellular morphology characteristic of {}."
 
-cumulative_budget: [50, 100, 150, 200, 250, 300]
-
+# ── Dataset definitions ──────────────────────────────────────────────────────
 datasets:
   pathmnist:
     path: "data/pathmnist_224.npz"
     num_classes: 9
-    max_budget: 300
     descriptions:
       adipose: "adipose tissue consisting of mature adipocytes and fat cells"
       background: "empty background space without any tissue structures or cells"
@@ -37,7 +118,6 @@ datasets:
   histoset:
     path: "data/HistoSet-5x14/HistoSet-5x14"
     num_classes: 14
-    max_budget: 300
     descriptions:
       breast_benign: "benign breast tissue, showing non-cancerous fibroadenoma or adenosis"
       breast_malignant: "malignant breast carcinoma, invasive ductal or lobular cancer cells"
@@ -47,7 +127,7 @@ datasets:
       lung_n: "benign, healthy and normal lung tissue without malignancy"
       lung_scc: "lung squamous cell carcinoma, showing malignant squamous epithelial cells"
       oral_normal_oral_cavity: "normal oral cavity squamous epithelium without atypia"
-      oral_oscc: "oral squamous cell carcinoma, showing invasive malignant squamous cells with keratin pearls"
+      oral_oscc: "oral squamous cell carcinoma, invasive malignant squamous cells with keratin pearls"
       ovarian_clear_cell: "ovarian clear cell carcinoma with clear cytoplasm"
       ovarian_endometri: "ovarian endometrioid carcinoma resembling endometrial glands"
       ovarian_mucinous: "ovarian mucinous carcinoma with mucin-producing cells"
@@ -57,21 +137,20 @@ datasets:
   skintissue:
     path: "data/SkinTissue/SkinTissue/tiles"
     num_classes: 16
-    max_budget: 300
     descriptions:
       tumor_skin_epithelial_bcc: "basal cell carcinoma, displaying nests of atypical basaloid cells with characteristic peripheral palisading and stromal retraction artifact"
       tumor_skin_epithelial_sqcc: "squamous cell carcinoma, featuring invasive islands of atypical squamous epithelial cells, pleomorphic nuclei, and keratin pearls"
       tumor_skin_melanoma_melanoma: "malignant melanoma, characterized by invasive and highly atypical melanocytes, severe nuclear pleomorphism, and variable melanin pigmentation"
       tumor_skin_naevus_naevus: "benign melanocytic nevus, showing well-circumscribed nests of uniform, benign nevus cells without significant atypia"
-      nontumor_skin_epidermis_epidermis: "normal epidermis, characterized by a stratified squamous epithelium with distinct basal, spinous, and granular layers, topped by stratum corneum"
-      nontumor_skin_dermis_dermis: "normal dermal connective tissue, consisting of dense interwoven collagen bundles and scattered fibroblasts"
-      nontumor_skin_subcutis_subcutis: "normal subcutis or hypodermis, consisting of mature adipose tissue and fat cells divided by fibrous septa"
-      nontumor_skin_hairfollicle_hairfollicle: "benign hair follicles, displaying epithelial root sheaths, hair shafts, and surrounding fibrous connective tissue"
-      nontumor_skin_sebaceousglands_sebaceousglands: "normal sebaceous glands, composed of lobules with pale, foamy, lipid-filled sebocytes"
-      nontumor_skin_sweatglands_sweatglands: "normal sweat glands, showing coiled tubular structures lined by simple or stratified cuboidal epithelial cells"
-      nontumor_skin_vessel_vessel: "benign blood vessels, featuring endothelial cell linings, smooth muscle walls, and luminal spaces often containing erythrocytes"
-      nontumor_skin_nerves_nerves: "benign peripheral nerve bundles, consisting of wavy nerve fibers and elongated Schwann cell nuclei"
-      nontumor_skin_muscle_skeletal: "normal skeletal muscle, featuring bundles of striated, multinucleated muscle fibers"
-      nontumor_skin_chondraltissue_chondraltissue: "benign chondral tissue, featuring chondrocytes residing within lacunae and surrounding cartilaginous extracellular matrix"
-      nontumor_skin_elastosis_elastosis: "solar elastosis, showing basophilic degeneration and accumulation of thick, clumped abnormal elastic fibers in the dermis due to sun damage"
-      nontumor_skin_necrosis_necrosis: "necrotic tissue, characterized by eosinophilic cellular debris, loss of nuclear detail (karyolysis), and structureless dead tissue"
+      nontumor_skin_epidermis_epidermis: "normal epidermis with stratified squamous epithelium, distinct basal, spinous, and granular layers topped by stratum corneum"
+      nontumor_skin_dermis_dermis: "normal dermal connective tissue with dense interwoven collagen bundles and scattered fibroblasts"
+      nontumor_skin_subcutis_subcutis: "normal subcutis consisting of mature adipose tissue and fat cells divided by fibrous septa"
+      nontumor_skin_hairfollicle_hairfollicle: "benign hair follicles displaying epithelial root sheaths, hair shafts, and surrounding fibrous connective tissue"
+      nontumor_skin_sebaceousglands_sebaceousglands: "normal sebaceous glands composed of lobules with pale, foamy, lipid-filled sebocytes"
+      nontumor_skin_sweatglands_sweatglands: "normal sweat glands showing coiled tubular structures lined by simple or stratified cuboidal epithelial cells"
+      nontumor_skin_vessel_vessel: "benign blood vessels featuring endothelial cell linings, smooth muscle walls, and luminal spaces containing erythrocytes"
+      nontumor_skin_nerves_nerves: "benign peripheral nerve bundles consisting of wavy nerve fibers and elongated Schwann cell nuclei"
+      nontumor_skin_muscle_skeletal: "normal skeletal muscle featuring bundles of striated, multinucleated muscle fibers"
+      nontumor_skin_chondraltissue_chondraltissue: "benign chondral tissue featuring chondrocytes residing within lacunae and surrounding cartilaginous extracellular matrix"
+      nontumor_skin_elastosis_elastosis: "solar elastosis showing basophilic degeneration and accumulation of thick, clumped abnormal elastic fibers in the dermis"
+      nontumor_skin_necrosis_necrosis: "necrotic tissue characterized by eosinophilic cellular debris, loss of nuclear detail, and structureless dead tissue"

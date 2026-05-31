@@ -1,366 +1,44 @@
-import os
-from typing import List, Tuple, Dict, Union
-from tqdm import tqdm
+from typing import List
 
-import numpy as np 
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset, Dataset
-from torch.amp import autocast
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import Dinov2Model
 
-import open_clip
-from transformers import CLIPVisionModel, AutoTokenizer, AutoModel, CLIPTokenizer, CLIPTextModel
-from peft import LoraConfig, get_peft_model
-
-from load_data import ActiveLearningDataset
 from set_up import clear_memory
-from sampling import get_sampler
-from contrastive import train_contrastive
 
-class CODAModel(nn.Module):
-    def __init__(self, 
-                 num_classes: int, 
-                 r: int, 
-                 lora_alpha: int) -> None: 
-        super(CODAModel, self).__init__()
-        
-        backbone_plip = CLIPVisionModel.from_pretrained("vinid/plip")
-        biomed_full, _, _ = open_clip.create_model_and_transforms("hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224")
-        backbone_biomed = biomed_full.visual 
 
-        config_plip = LoraConfig(
-            r=r, 
-            lora_alpha=lora_alpha, 
-            target_modules=["q_proj", "v_proj"], 
-            lora_dropout=0.1, 
-            bias="none"
-        )
-        config_biomed = LoraConfig(
-            r=r, 
-            lora_alpha=lora_alpha, 
-            target_modules=["qkv", "in_proj", "out_proj"], 
-            lora_dropout=0.1, 
-            bias="none"
-        )
+class DINOv2Extractor(nn.Module):
+    """
+    Frozen DINOv2 ViT-B/14 (CLS token, 768-dim).
+    Default ViT backbone for ALL methods: final linear-probe training and iterative
+    sampler scoring. Model name is configurable via config.yaml (models.vit).
+    """
 
-        self.backbone_plip = get_peft_model(backbone_plip, config_plip)
-        self.backbone_biomed = get_peft_model(backbone_biomed, config_biomed)
+    def __init__(self, model_name: str = "facebook/dinov2-base") -> None:
+        super().__init__()
+        self.encoder = Dinov2Model.from_pretrained(model_name)
+        for p in self.encoder.parameters():
+            p.requires_grad = False
 
-        dummy_x = torch.randn(1, 3, 224, 224)
-        with torch.no_grad():
-            feat1 = self.backbone_plip(pixel_values=dummy_x).pooler_output
-            feat2 = self.backbone_biomed(dummy_x)
-            if isinstance(feat2, tuple): 
-                feat2 = feat2[0]
-                
-        fused_dim = feat1.shape[1] + feat2.shape[1]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.encoder(pixel_values=x).last_hidden_state[:, 0, :]  # CLS, 768-dim
 
-        self.projection_head = nn.Sequential(
-            nn.Linear(fused_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.4)
-        )
 
-        self.classification_head = nn.Linear(256, num_classes)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        plip_outputs = self.backbone_plip(pixel_values=x)
-        f_plip = plip_outputs.pooler_output
-
-        f_biomed = self.backbone_biomed(x)
-        if isinstance(f_biomed, tuple): 
-            f_biomed = f_biomed[0]
-            
-        f_concat = torch.cat((f_plip, f_biomed), dim=1) 
-        f_proj = self.projection_head(f_concat)
-        logits = self.classification_head(f_proj)
-        
-        return f_concat, f_proj, logits
-
-@torch.inference_mode() 
-def extract_image_embeddings(dataloader: DataLoader, 
-                             model: nn.Module, 
-                             device: torch.device) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    model = model.to(device)
-    model.eval()
-
-    list_embeddings_proj, list_probs, list_embeddings_concat = [], [], []
-
-    for images, _ in tqdm(dataloader, desc="Extracting Features", leave=False):
-        images = images.to(device, non_blocking=True)
-        with autocast(device_type="cuda"):
-            f_concat, f_proj, logits = model(images)
-            probs = F.softmax(logits, dim=1)
-        
-        list_embeddings_concat.append(f_concat.cpu().numpy().astype(np.float32))
-        list_embeddings_proj.append(f_proj.cpu().numpy().astype(np.float32))
-        list_probs.append(probs.cpu().numpy().astype(np.float32))
-
-    embeddings_concat = np.vstack(list_embeddings_concat)
-    embeddings_proj = np.vstack(list_embeddings_proj)
-    probs = np.vstack(list_probs)
-    
-    del list_embeddings_concat, list_embeddings_proj, list_probs
-    clear_memory()
-    
-    return embeddings_concat, embeddings_proj, probs
-
-def extract_text_embeddings(class_descriptions: Dict[str, str], 
-                            prompt_templates: List[str], 
-                            class_names: List[str], 
+@torch.inference_mode()
+def extract_image_features(dataloader: DataLoader,
+                            extractor: nn.Module,
                             device: torch.device) -> np.ndarray:
-    detailed_descriptions = [class_descriptions.get(cls, cls) for cls in class_names]
-    list_prompts = []
-    for desc in detailed_descriptions:
-        for template in prompt_templates:
-            list_prompts.append(template.format(desc))
-    
-    tokenizer_bio = AutoTokenizer.from_pretrained("microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext")
-    encoder_bio = AutoModel.from_pretrained("microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext").to(device).eval()
-    
-    tokenizer_plip = CLIPTokenizer.from_pretrained("vinid/plip")
-    encoder_plip = CLIPTextModel.from_pretrained("vinid/plip").to(device).eval()
-    
-    tokens_bio = tokenizer_bio(
-        list_prompts, 
-        padding=True, 
-        truncation=True, 
-        return_tensors="pt"
-    ).to(device)
-    with torch.no_grad(): 
-        emb_bio = encoder_bio(**tokens_bio).pooler_output.cpu().numpy()
-    
-    tokens_plip = tokenizer_plip(
-        list_prompts, 
-        padding=True, 
-        truncation=True, 
-        return_tensors="pt"
-    ).to(device)
-    with torch.no_grad(): 
-        emb_plip = encoder_plip(**tokens_plip).pooler_output.cpu().numpy()
-    
-    list_text_embeddings = np.concatenate((emb_plip, emb_bio), axis=1)
-    
-    text_embeddings = list_text_embeddings.reshape(
-        len(class_names), len(prompt_templates), -1
-    ).mean(axis=1)
-    text_embeddings = text_embeddings / np.linalg.norm(text_embeddings, axis=1, keepdims=True)
-    
-    del encoder_bio, encoder_plip, tokens_bio, tokens_plip, emb_bio, emb_plip, list_text_embeddings
-    clear_memory()
+    """Generic image feature extraction — works with DINOv2Extractor and DualVLMExtractor."""
+    extractor = extractor.to(device)
+    extractor.eval()
 
-    return text_embeddings
+    all_features = []
+    for images, _ in tqdm(dataloader, desc="Extracting image features", leave=False):
+        images = images.to(device, non_blocking=True)
+        features = extractor(images)
+        all_features.append(features.cpu().numpy().astype(np.float32))
 
-def save_model(model: nn.Module, save_path: str) -> None:
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    
-    unwrapped_model = getattr(model, "_orig_mod", model)
-    full_sd = unwrapped_model.state_dict()
-    target_keys = ["lora", "projection_head", "classification_head"]
-    trainable_state_dict = {
-        k: v.cpu() for k, v in full_sd.items() 
-        if any(substring in k for substring in target_keys)
-    }
-    torch.save(trainable_state_dict, save_path)
-    print(f"Saved {len(trainable_state_dict)} components to: {save_path}")
-
-
-def load_model(model: nn.Module, load_path: str, device: torch.device) -> nn.Module:
-    checkpoint = torch.load(load_path, map_location=device)
-    model.load_state_dict(checkpoint, strict=False)
-    print(f"Loaded model parameters from: {load_path}")
-    return model.to(device).eval()
-
-
-def train_model(model: nn.Module, 
-                sampler_name: str,
-                train_dataset: Dataset, 
-                oracle_labels: np.ndarray, 
-                test_loader: DataLoader, 
-                test_labels: np.ndarray, 
-                class_names: List[str],
-                text_embeddings: np.ndarray, 
-                color_map: Dict[str, str],
-                cumulative_budget: Union[List[int], str], 
-                num_epochs: int, 
-                learn_rate: float,
-                alpha: float, 
-                r: int, 
-                device: torch.device, 
-                seed_worker_fn: callable, 
-                g_seed: torch.Generator, 
-                seed: int,
-                save_dir: str,
-                verbose: bool = False) -> None:
-    
-    from evaluate import evaluate_model, visualize_tsne
-    from set_up import set_seed
-
-    if isinstance(cumulative_budget, str):
-        al_dataset = ActiveLearningDataset(train_dataset, oracle_labels)
-        al_loader = DataLoader(
-            al_dataset, 
-            batch_size=32, 
-            shuffle=True, 
-            num_workers=0,
-            worker_init_fn=seed_worker_fn, 
-            generator=g_seed
-        )
-        
-        num_classes_total = len(class_names)
-        fresh_model = CODAModel(
-            num_classes=num_classes_total, 
-            r=r, 
-            lora_alpha=r * 2
-        ).to(device)
-        
-        fresh_model = train_contrastive(
-            model=fresh_model, 
-            labeled_loader=al_loader, 
-            num_epochs=num_epochs, 
-            learn_rate=learn_rate, 
-            device=device,
-            verbose=verbose
-        )
-        
-        if verbose:
-            evaluate_model(fresh_model, test_loader, test_labels, device)
-            
-        save_path = f"{save_dir}/{sampler_name}_{cumulative_budget}.pth"
-        save_model(fresh_model, save_path)
-        
-        del al_dataset, al_loader, fresh_model
-        clear_memory()
-        
-        return
-
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=256, 
-        shuffle=False, 
-        num_workers=0,
-        worker_init_fn=seed_worker_fn, 
-        generator=g_seed
-    )
-    
-    embeddings_concat, embeddings_proj, _ = extract_image_embeddings(train_loader, model, device=device)
-
-    NON_SLICEABLE_SAMPLERS = ["entropy", "margin", "badge", "typiclust", "activeft"]
-    master_selected_indices = None
-    
-    if sampler_name not in NON_SLICEABLE_SAMPLERS:
-        master_selected_indices = get_sampler(
-            name=sampler_name,
-            image_embeddings=embeddings_concat, 
-            text_embeddings=text_embeddings, 
-            max_budget=max(cumulative_budget), 
-            alpha=alpha, 
-            device=device,
-            chunk_size=10000
-        )
-
-    for budget in cumulative_budget:
-        seed_worker_fn = set_seed(seed)
-        g_seed = torch.Generator()
-        g_seed.manual_seed(seed)
-
-        if sampler_name in NON_SLICEABLE_SAMPLERS:
-            selected_indices = get_sampler(
-                name=sampler_name,
-                image_embeddings=embeddings_concat, 
-                max_budget=budget, 
-                train_dataset=train_dataset,
-                oracle_labels=oracle_labels,
-                train_loader=train_loader,
-                num_epochs=num_epochs,
-                learn_rate=learn_rate,
-                r=r,
-                class_names=class_names,
-                device=device,
-                seed_worker_fn=seed_worker_fn,
-                g_seed=g_seed,
-                chunk_size=10000
-            )
-        else:
-            selected_indices = master_selected_indices[:budget]
-
-        if verbose and budget == max(cumulative_budget):
-            visualize_tsne(
-                embeddings_proj=embeddings_proj, 
-                true_labels=oracle_labels, 
-                class_names=class_names, 
-                title="Initial", 
-                color_map=color_map, 
-                seed=seed,
-                selected_indices=selected_indices
-            )
-
-            del embeddings_proj
-
-        selected_labels = oracle_labels[selected_indices]
-        train_subset = Subset(train_dataset, selected_indices)
-        al_dataset = ActiveLearningDataset(train_subset, selected_labels)
-        al_loader = DataLoader(
-            al_dataset, 
-            batch_size=min(32, budget), 
-            shuffle=True, 
-            num_workers=0,
-            worker_init_fn=seed_worker_fn, 
-            generator=g_seed
-        )
-        
-        num_classes_total = len(class_names)
-        
-        fresh_model = CODAModel(
-            num_classes=num_classes_total, 
-            r=r, 
-            lora_alpha=r * 2
-        ).to(device)
-        
-        fresh_model = train_contrastive(
-            model=fresh_model, 
-            labeled_loader=al_loader, 
-            num_epochs=num_epochs, 
-            learn_rate=learn_rate, 
-            device=device,
-            verbose=verbose
-        )
-
-        if budget == max(cumulative_budget):
-            save_data_path = f"{save_dir}/{sampler_name}_selected_data_budget_{budget}.pt"
-            os.makedirs(os.path.dirname(save_data_path), exist_ok=True)
-            
-            torch.save({
-                "selected_indices": selected_indices,
-                "selected_labels": selected_labels
-            }, save_data_path)
-        
-        if verbose:
-            evaluate_model(fresh_model, test_loader, test_labels, device)
-            
-            if budget == max(cumulative_budget):
-                _, embeddings_proj_new, _ = extract_image_embeddings(train_loader, fresh_model, device=device)
-                visualize_tsne(
-                    embeddings_proj=embeddings_proj_new, 
-                    true_labels=oracle_labels, 
-                    class_names=class_names, 
-                    title=f"After {budget} samples", 
-                    color_map=color_map, 
-                    seed=seed,
-                    selected_indices=selected_indices
-                )
-                del embeddings_proj_new
-                clear_memory()
-
-        save_path = f"{save_dir}/{sampler_name}_budget_{budget}.pth"
-        save_model(fresh_model, save_path)
-        
-        del train_subset, al_dataset, al_loader, fresh_model
-        clear_memory()
-
-    del embeddings_concat
-    if master_selected_indices is not None:
-        del master_selected_indices
-    clear_memory()
+    return np.vstack(all_features)
