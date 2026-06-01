@@ -37,7 +37,10 @@ from . import codapath
 
 # ── New hybrid / ensemble samplers ───────────────────────────────────────────
 from . import uncertainty_herding
-from . import dcom               
-from . import tcm                
-from . import dropquery          
-from . import refine             
+from . import dcom
+from . import tcm
+from . import dropquery
+from . import refine
+
+# ── SCALPEL: EDL vacuity + joint structural-semantic coverage ─────────────
+from . import scalpel

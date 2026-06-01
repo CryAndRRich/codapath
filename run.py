@@ -17,7 +17,7 @@ from sampling import get_sampler
 # SLICEABLE: run ONCE at max_budget; [:budget] gives the result for any smaller budget.
 # Greedy methods (coreset, codapath, uncertainty_herding, dcom, tcm, refine) and
 # random all satisfy this property.
-SLICEABLE_SAMPLERS = {"random", "coreset", "codapath",
+SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "scalpel",
                       "uncertainty_herding", "dcom", "tcm", "refine"}
 
 # PER_BUDGET: must re-run for each budget (clustering depends on K=budget,
@@ -93,9 +93,28 @@ def main(data_path: str,
                 "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"),
         )
 
+    # ── SCALPEL-specific features (single PLIP VLM + text; only when needed) ─
+    # train_vlm_features reused for PLIP image embeddings (N, 512).
+    # text_embeddings reused for PLIP text prototypes (L, 512).
+    # Both are separate from CODAPath's dual-VLM embeddings.
+    if sampler_name == "scalpel":
+        from sampling.scalpel import PLIPExtractor, extract_plip_text_features
+        plip_model_name = model_cfg.get("vlm_secondary", "vinid/plip")
+        plip = PLIPExtractor(model_name=plip_model_name).to(device)
+        train_vlm_features = extract_image_features(train_loader, plip, device)
+        del plip
+        clear_memory()
+        text_embeddings = extract_plip_text_features(
+            data_descriptions, prompt_templates, class_names, device,
+            plip_model=plip_model_name,
+        )
+
     # ── Sliceable: run once at max_budget ─────────────────────────────────────
     master_selected = None
     if sampler_name in SLICEABLE_SAMPLERS:
+        # SCALPEL: image_embeddings = DINOv2 (structural); vlm_image_embeddings = PLIP (semantic)
+        # CODAPath: image_embeddings = dual-VLM concat
+        # Others:   image_embeddings = DINOv2
         samp_features = train_vlm_features if sampler_name == "codapath" else train_features
         kwargs = {
             "image_embeddings": samp_features,
@@ -106,6 +125,10 @@ def main(data_path: str,
             **sampler_cfg,
         }
         if sampler_name == "codapath":
+            kwargs["text_embeddings"] = text_embeddings
+        if sampler_name == "scalpel":
+            kwargs["image_embeddings"] = train_features        # DINOv2 structural
+            kwargs["vlm_image_embeddings"] = train_vlm_features  # PLIP semantic
             kwargs["text_embeddings"] = text_embeddings
         master_selected = get_sampler(name=sampler_name, **kwargs)
 

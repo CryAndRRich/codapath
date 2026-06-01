@@ -91,6 +91,11 @@ samplers:
     filter_batches: 5     # J — batches per strategy per round (paper: 10)
     chunk_size: 2000      # for final MaxHerding stage
 
+  scalpel:
+    tau: 0.05             # EDL temperature: alpha = exp(cos/tau); smaller = sharper Dirichlet
+    chunk_size: 500       # rows per kernel block (n_chunk = c_chunk = chunk_size); reduce on small VRAM
+    n_sigma: 2000         # subsample size for adaptive sigma (median pairwise dist on DINOv2 features)
+
 # ── Prompt templates for CODAPath text encoding ─────────────────────────────
 prompt_templates:
   - "Photomicrograph showing {}."
