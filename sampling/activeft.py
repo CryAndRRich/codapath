@@ -36,20 +36,49 @@ def activeft_sampling(**kwargs) -> List[int]:
 
         theta_norm = F.normalize(theta, p=2, dim=1)
 
-        sim_matrix = torch.matmul(features, theta_norm.t()) / tau
-        max_sim, _ = torch.max(sim_matrix, dim=1)
-        loss_dist = -torch.mean(max_sim)
+        # FIX (major): rewrite loss to match official ActiveFT log-ratio formulation.
+        # Previous code used two SEPARATE additive terms (loss_dist + lambda_reg * loss_reg),
+        # which is a non-equivalent approximation of the official InfoNCE-style loss.
+        #
+        # Official loss (get_loss in the ActiveFT repo):
+        #   J = -mean( log(max_exp_sim_i) - log(max_exp_sim_i + balance * cent_self_sim[argmax_i]) )
+        # where:
+        #   sim_matrix[i, k] = features[i] · theta_norm[k] / tau   (N x K)
+        #   max_exp_sim_i    = exp(sim_matrix[i, argmax_k])
+        #   cent_self_sim[k] = sum_{k'≠k} exp(theta_norm[k] · theta_norm[k'] / tau)
+        #                      (self-similarity sum of the MATCHED centroid for sample i)
+        #
+        # The log-ratio naturally couples distribution-matching and diversity in one term.
 
-        theta_sim = torch.matmul(theta_norm, theta_norm.t()) / tau
-        mask = ~torch.eye(max_budget, device=device, dtype=torch.bool)
-        theta_sim_filtered = theta_sim[mask].view(max_budget, max_budget - 1)
-        loss_reg = torch.mean(torch.log(torch.sum(torch.exp(theta_sim_filtered), dim=1)))
+        # Step 1: feature-centroid similarities.
+        sim_matrix = torch.matmul(features, theta_norm.t()) / tau   # [N, K]
+        max_sim_vals, argmax_cols = torch.max(sim_matrix, dim=1)     # [N], [N]
+        max_exp_sim = torch.exp(max_sim_vals)                        # [N]
 
-        loss = loss_dist + lambda_reg * loss_reg
+        # Step 2: centroid self-similarity sums (exclude self-pair for each centroid).
+        theta_sim = torch.matmul(theta_norm, theta_norm.t()) / tau   # [K, K]
+        mask_self = torch.eye(max_budget, device=device, dtype=torch.bool)
+        theta_sim_no_self = theta_sim.masked_fill(mask_self, float("-inf"))
+        # sum exp over non-self pairs, per centroid row → shape [K]
+        cent_exp_sum = torch.sum(torch.exp(theta_sim_no_self), dim=1)
+
+        # Step 3: for each feature i, look up cent_exp_sum of its matched centroid.
+        cent_term = cent_exp_sum[argmax_cols]                        # [N]
+
+        # Step 4: log-ratio loss (InfoNCE-style, couples both objectives in one term).
+        loss = -torch.mean(
+            torch.log(max_exp_sim + 1e-9)
+            - torch.log(max_exp_sim + lambda_reg * cent_term + 1e-9)
+        )
         loss.backward()
         optimizer.step()
 
-    selected_indices = set()
+    # FIX (minor): use an ordered list + set to guarantee deterministic insertion order.
+    # Python sets are hash-ordered; list(set(...)) produces non-deterministic ordering
+    # across runs even with the same seed, which breaks reproducibility.
+    selected_indices = []   # preserves insertion order
+    selected_set = set()    # O(1) membership check
+
     with torch.no_grad():
         theta_final = F.normalize(theta, p=2, dim=1)
         dist_to_real = torch.matmul(theta_final, features.t())
@@ -58,12 +87,13 @@ def activeft_sampling(**kwargs) -> List[int]:
 
         for i in tqdm(range(max_budget), desc="ActiveFT Selection"):
             for j in range(num_samples):
-                candidate_idx = ids_sort[i, j]
-                if candidate_idx not in selected_indices:
-                    selected_indices.add(candidate_idx)
+                candidate_idx = int(ids_sort[i, j])
+                if candidate_idx not in selected_set:
+                    selected_indices.append(candidate_idx)
+                    selected_set.add(candidate_idx)
                     break
 
-    del features, theta, sim_matrix, theta_sim, mask, dist_to_real, ids_sort
+    del features, theta, sim_matrix, theta_sim, mask_self, dist_to_real, ids_sort
     clear_memory()
 
-    return list(selected_indices)
+    return selected_indices

@@ -11,14 +11,14 @@ from load_data import get_data_loaders
 from model import DINOv2Extractor, extract_image_features
 from trainer import train_linear, train_knn_linear, save_model
 from sampling import get_sampler
+from palm_eval import palm_evaluate, format_palm_report
 
 
 # ── Sampler categories ────────────────────────────────────────────────────────
 # SLICEABLE: run ONCE at max_budget; [:budget] gives the result for any smaller budget.
-# Greedy methods (coreset, codapath, uncertainty_herding, dcom, tcm, refine) and
-# random all satisfy this property.
+# Greedy methods produce a naturally ordered list — slicing gives any sub-budget.
 SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "scalpel",
-                      "uncertainty_herding", "dcom", "tcm", "refine"}
+                      "uncertainty_herding", "tcm", "refine"}
 
 # PER_BUDGET: must re-run for each budget (clustering depends on K=budget,
 # or K-means output not naturally ordered).
@@ -133,6 +133,8 @@ def main(data_path: str,
         master_selected = get_sampler(name=sampler_name, **kwargs)
 
     # ── Per-budget training loop ───────────────────────────────────────────────
+    palm_results: Dict[int, float] = {}   # budget -> test accuracy (for PALM fitting)
+
     for budget in cumulative_budget:
         set_seed(random_seed)
 
@@ -173,10 +175,12 @@ def main(data_path: str,
                 knn_k, knn_threshold, probe_epochs, probe_lr, device,
             )
 
+        # ── Evaluate and accumulate accuracy for PALM fitting ─────────────────
+        from evaluate import evaluate_model
         if verbose:
-            from evaluate import evaluate_model
             print(f"\n── {sampler_name.upper()} | budget={budget} ──")
-            evaluate_model(probe, test_features, test_labels, device)
+        acc, _, _, _ = evaluate_model(probe, test_features, test_labels, device)
+        palm_results[budget] = acc
 
         # ── Save selected indices for this budget ─────────────────────────────
         data_save_path = os.path.join(save_dir, f"{sampler_name}_selected_budget_{budget}.pt")
@@ -193,6 +197,25 @@ def main(data_path: str,
 
         del probe
         clear_memory()
+
+    # ── PALM: fit parametric learning curve across all budgets ────────────────
+    if len(palm_results) >= 4:
+        try:
+            palm_params = palm_evaluate(
+                budgets=list(palm_results.keys()),
+                accuracies=list(palm_results.values()),
+            )
+            if verbose:
+                print(format_palm_report(palm_params, sampler_name,
+                                         os.path.basename(save_dir)))
+            palm_save_path = os.path.join(save_dir, f"{sampler_name}_palm.pt")
+            os.makedirs(os.path.dirname(palm_save_path), exist_ok=True)
+            torch.save(palm_params, palm_save_path)
+            print(f"PALM params saved → {palm_save_path}")
+        except Exception as e:
+            print(f"[PALM] Fitting failed: {e}")
+    else:
+        print(f"[PALM] Skipped: need >= 4 budget points, got {len(palm_results)}.")
 
 
 if __name__ == "__main__":

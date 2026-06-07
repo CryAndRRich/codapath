@@ -36,11 +36,11 @@ from . import badge
 from . import codapath           
 
 # ── New hybrid / ensemble samplers ───────────────────────────────────────────
-from . import uncertainty_herding
-from . import dcom
-from . import tcm
-from . import dropquery
-from . import refine
+from . import uncertainty_herding  # ICLR 2025
+from . import tcm                  # ICLR 2024 Workshop
+from . import dropquery            # TMLR 2024
+from . import refine               # CVPR 2026
+# REMOVED (arxiv-only, no peer review): dcom — arXiv:2407.01804
 
 # ── SCALPEL: EDL vacuity + joint structural-semantic coverage ─────────────
 from . import scalpel
