@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import CLIPVisionModel, CLIPTokenizer, CLIPTextModel, AutoTokenizer, AutoModel
 
@@ -12,18 +11,7 @@ from set_up import clear_memory
 from . import register_sampler
 
 
-# ---------------------------------------------------------------------------
-# CODAPath-specific encoders (dual VLM visual + text)
-# Model names are read from config; defaults below match original design.
-# ---------------------------------------------------------------------------
-
 class DualVLMExtractor(nn.Module):
-    """
-    Frozen PLIP + BiomedCLIP fused visual encoder.
-    Used ONLY for CODAPath sampling — preserves the method's original design.
-    Model names configurable: plip_model, biomedclip_model (HuggingFace hub IDs).
-    """
-
     def __init__(self,
                  plip_model: str = "vinid/plip",
                  biomedclip_model: str = "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
@@ -56,12 +44,6 @@ def extract_text_features(class_descriptions: Dict[str, str],
                            plip_model: str = "vinid/plip",
                            biomedbert_model: str = "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
                            ) -> np.ndarray:
-    """
-    Encodes per-class descriptions with PLIP text encoder + BiomedBERT, concatenates
-    and L2-normalises — mirrors CODAPath's original design.
-    Returns shape (num_classes, d_plip + d_bio).
-    Model names configurable via plip_model and biomedbert_model arguments.
-    """
     detailed_descriptions = [class_descriptions.get(cls, cls) for cls in class_names]
     list_prompts = [
         template.format(desc)
@@ -98,10 +80,6 @@ def extract_text_features(class_descriptions: Dict[str, str],
 
     return text_embeddings
 
-
-# ---------------------------------------------------------------------------
-# CODAPath sampler
-# ---------------------------------------------------------------------------
 
 @register_sampler("codapath")
 def coda_sampling(**kwargs) -> List[int]:
@@ -140,7 +118,6 @@ def coda_sampling(**kwargs) -> List[int]:
     if uncertainty_weights.max() > 0:
         uncertainty_weights = uncertainty_weights / uncertainty_weights.max()
 
-    # --- Greedy Facility Location ---
     selected_indices = []
     unlabeled_tensor = img_norm
     uncertainty_tensor = uncertainty_weights

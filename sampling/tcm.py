@@ -1,21 +1,3 @@
-"""
-TCM: TypiClust → Margin transition.
-
-Simple two-phase heuristic for pre-trained backbone settings:
-  Phase 1 (diversity): TypiClust-style selection for `transition_budget` samples.
-  Phase 2 (uncertainty): sort remaining unlabeled by Margin (ascending) after fitting
-                         a LinearProbe on phase-1 selections.
-
-The returned list is ordered [phase1..., phase2...] and is therefore **sliceable**:
-  budget ≤ transition_budget  → first `budget` phase-1 elements
-  budget >  transition_budget → all phase-1 + first (budget − transition_budget) phase-2 elements
-
-Transition heuristic (from paper): total diversity budget ≈ 20 × num_classes,
-so transition_budget = min(2 × num_classes, max_budget).  Configurable via
-'transition_budget' kwarg.
-
-Reference: Doucet et al., arXiv:2403.03728 (2024)
-"""
 from typing import List
 
 import numpy as np
@@ -32,14 +14,8 @@ def _typiclust_phase(features: torch.Tensor,
                      num_select: int,
                      k_nn: int = 20,
                      chunk_size: int = 5000) -> List[int]:
-    """
-    Greedy typicality-based selection for `num_select` samples.
-    Mirrors the TypiClust sampler: K-means(num_select) → most typical per cluster,
-    clusters visited in decreasing size order (gives a natural priority ordering).
-    """
     num_samples = features.shape[0]
 
-    # Typicality = 1 / mean_kNN_dist  (chunked for memory)
     typicality = torch.zeros(num_samples, device=features.device)
     for cs in range(0, num_samples, chunk_size):
         ce = min(cs + chunk_size, num_samples)
@@ -83,7 +59,6 @@ def _typiclust_phase(features: torch.Tensor,
             if i > len(valid_clusters) * num_select:
                 break
 
-    # Fallback if clustering didn't fill quota
     if len(selected) < num_select:
         remaining = list(set(range(num_samples)) - selected_set)
         missing = num_select - len(selected)
@@ -94,12 +69,6 @@ def _typiclust_phase(features: torch.Tensor,
 
 @register_sampler("tcm")
 def tcm_sampling(**kwargs) -> List[int]:
-    """
-    TCM: TypiClust → Margin transition — sliceable.
-
-    Returns a single ordered list [phase1..., phase2...] that can be sliced
-    at any cumulative budget.
-    """
     image_embeddings = kwargs["image_embeddings"]
     oracle_labels = kwargs["oracle_labels"]
     max_budget = kwargs["max_budget"]
@@ -109,7 +78,6 @@ def tcm_sampling(**kwargs) -> List[int]:
     device = kwargs["device"]
     k_nn = kwargs.get("k_nn", 20)
     chunk_size = kwargs.get("chunk_size", 5000)
-    # transition_budget: how many samples to collect via TypiClust before switching
     transition_budget = kwargs.get("transition_budget", min(2 * num_classes, max_budget))
     transition_budget = min(transition_budget, max_budget)
 
@@ -118,7 +86,6 @@ def tcm_sampling(**kwargs) -> List[int]:
     features = torch.tensor(image_embeddings, device=device, dtype=torch.float32)
     features = F.normalize(features, p=2, dim=1)
 
-    # ── Phase 1: TypiClust-style diversity selection ───────────────────────────
     phase1 = _typiclust_phase(features, transition_budget, k_nn=k_nn, chunk_size=chunk_size)
 
     if transition_budget >= max_budget:
@@ -126,7 +93,6 @@ def tcm_sampling(**kwargs) -> List[int]:
         clear_memory()
         return phase1[:max_budget]
 
-    # ── Phase 2: Margin uncertainty on remaining unlabeled ────────────────────
     remaining_budget = max_budget - transition_budget
     phase1_set = set(phase1)
     unlabeled_indices = [i for i in range(len(image_embeddings)) if i not in phase1_set]
@@ -139,7 +105,6 @@ def tcm_sampling(**kwargs) -> List[int]:
     probs = probe.predict_proba(image_embeddings[unlabeled_indices], device)
     s_probs = np.sort(probs, axis=1)
     margin = s_probs[:, -1] - s_probs[:, -2]
-    # Sort ascending: smallest margin = most uncertain
     order = np.argsort(margin)
     phase2 = [unlabeled_indices[i] for i in order[:remaining_budget]]
     del probe, features

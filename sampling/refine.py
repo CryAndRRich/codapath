@@ -1,29 +1,3 @@
-"""
-REFINE: Progressive Filtering + Coverage-Based Selection.
-
-Stage 1 — Progressive Filtering:
-  C_0 = U  (full unlabeled pool)
-  For r in [1..R]:
-    C_r = ∅
-    For each strategy s in ensemble:
-      For j in [1..J]:
-        U_sample = SubSample(C_{r-1}, α·|C_{r-1}|)
-        C_r ←  C_r  ∪  s(U_sample, b)
-  → C_R = filtered candidate pool
-
-Stage 2 — Coverage-Based Selection:
-  Greedy MaxHerding (facility-location) on C_R for max_budget steps.
-  Returns ordered list → sliceable.
-
-Ensemble: [coreset_mini, typiclust_mini, margin_mini] (all run on subsampled pool).
-
-Hyperparameters (paper defaults):
-  R=5, α=0.4, J=10, b=max_budget
-  (reduced to R=3, J=5 here for speed; configurable)
-
-Reference: Huseljic et al., arXiv:2511.22344 (2025)
-GitHub:    https://github.com/dhuseljic/dal-toolbox
-"""
 from typing import List
 
 import numpy as np
@@ -35,12 +9,7 @@ from set_up import clear_memory
 from . import register_sampler
 
 
-# ---------------------------------------------------------------------------
-# Lightweight sub-samplers used inside the filtering loop
-# ---------------------------------------------------------------------------
-
 def _coreset_mini(feats: np.ndarray, b: int, device: torch.device) -> List[int]:
-    """Greedy k-centre (CoreSet) on a feature subset; returns b indices."""
     n = feats.shape[0]
     b = min(b, n)
     f = torch.tensor(feats, device=device, dtype=torch.float32)
@@ -62,21 +31,19 @@ def _coreset_mini(feats: np.ndarray, b: int, device: torch.device) -> List[int]:
 
 
 def _typiclust_mini(feats: np.ndarray, b: int) -> List[int]:
-    """TypiClust on a feature subset; returns b indices."""
     from sklearn.cluster import MiniBatchKMeans, KMeans
 
     n = feats.shape[0]
     b = min(b, n)
 
     feats_norm = feats / (np.linalg.norm(feats, axis=1, keepdims=True) + 1e-8)
-    # typicality via mean cosine NN distance (approximate)
     chunk = min(1000, n)
     typicality = np.zeros(n, dtype=np.float32)
     k_nn = min(20, n - 1)
     for s in range(0, n, chunk):
         e = min(s + chunk, n)
-        sim = feats_norm[s:e] @ feats_norm.T          # (c, n)
-        sim[:, s:e] -= 2 * np.eye(e - s, n, k=s)     # mask self
+        sim = feats_norm[s:e] @ feats_norm.T         
+        sim[:, s:e] -= 2 * np.eye(e - s, n, k=s)   
         topk_sim = np.sort(sim, axis=1)[:, :-1][:, -k_nn:]
         typicality[s:e] = topk_sim.mean(axis=1)
 
@@ -115,7 +82,6 @@ def _margin_mini(feats: np.ndarray,
                  num_classes: int,
                  probe_epochs: int = 30,
                  probe_lr: float = 1e-3) -> List[int]:
-    """Margin sampling on a feature subset with a quick LinearProbe."""
     from trainer import train_linear
 
     n = feats.shape[0]
@@ -131,7 +97,7 @@ def _margin_mini(feats: np.ndarray,
     margin = sp[:, -1] - sp[:, -2]
 
     selected_set = set()
-    order = np.argsort(margin)  # ascending = most uncertain first
+    order = np.argsort(margin) 
     selected = []
     for idx in order:
         if len(selected) >= b:
@@ -142,19 +108,10 @@ def _margin_mini(feats: np.ndarray,
     return selected
 
 
-# ---------------------------------------------------------------------------
-# Final greedy MaxHerding on filtered pool (coverage-based selection)
-# ---------------------------------------------------------------------------
-
 def _maxherding(feats_np: np.ndarray,
                 budget: int,
                 device: torch.device,
                 chunk_size: int = 2000) -> List[int]:
-    """
-    Greedy MaxHerding: argmax_x̄ Σ_n max_{x'∈S} k(x_n, x̄) marginal gain.
-    Uses cosine similarity as kernel (equivalent to Gaussian for unit vectors).
-    Returns `budget` indices (local, relative to feats_np rows).
-    """
     n = feats_np.shape[0]
     budget = min(budget, n)
     feats = torch.tensor(feats_np, device=device, dtype=torch.float32)
@@ -171,10 +128,10 @@ def _maxherding(feats_np: np.ndarray,
 
         for cs in range(0, n, chunk_size):
             ce = min(cs + chunk_size, n)
-            chunk = feats[cs:ce]                         # (C, D)
-            sim = torch.matmul(feats, chunk.T)           # (N, C)
+            chunk = feats[cs:ce]                         
+            sim = torch.matmul(feats, chunk.T)           
             gain = torch.clamp(sim - max_sim.unsqueeze(1), min=0.0)
-            scores = gain.sum(dim=0)                     # (C,)
+            scores = gain.sum(dim=0)                    
             for si in sel_set:
                 if cs <= si < ce:
                     scores[si - cs] = -float("inf")
@@ -200,40 +157,28 @@ def _maxherding(feats_np: np.ndarray,
     return selected
 
 
-# ---------------------------------------------------------------------------
-# REFINE sampler
-# ---------------------------------------------------------------------------
-
 @register_sampler("refine")
 def refine_sampling(**kwargs) -> List[int]:
-    """
-    REFINE ensemble active learning — sliceable (run once at max_budget).
-
-    Stage 1: progressive filtering using an ensemble of [coreset, typiclust, margin].
-    Stage 2: greedy MaxHerding on the filtered pool → ordered list.
-    """
     image_embeddings = kwargs["image_embeddings"]
     oracle_labels = kwargs["oracle_labels"]
     max_budget = kwargs["max_budget"]
     num_classes = kwargs["num_classes"]
     device = kwargs["device"]
-    R = kwargs.get("filter_rounds", 3)          # filtering rounds (paper: 5)
-    alpha = kwargs.get("filter_alpha", 0.4)     # subsample ratio
-    J = kwargs.get("filter_batches", 5)         # batches per strategy per round
+    R = kwargs.get("filter_rounds", 3)       
+    alpha = kwargs.get("filter_alpha", 0.4)    
+    J = kwargs.get("filter_batches", 5)       
     probe_epochs = kwargs.get("probe_epochs", 30)
     probe_lr = kwargs.get("probe_lr", 1e-3)
     chunk_size = kwargs.get("chunk_size", 2000)
 
     num_samples = image_embeddings.shape[0]
-    # b = batch size for each strategy call (= max_budget)
     b = max_budget
 
-    # ── Stage 1: Progressive Filtering ───────────────────────────────────────
-    pool_indices = list(range(num_samples))   # C_0 = U
+    pool_indices = list(range(num_samples)) 
 
     for r in tqdm(range(R), desc="REFINE Filtering", leave=True):
         if len(pool_indices) <= b:
-            break  # pool already small enough
+            break
 
         next_pool_set: set = set()
 
@@ -241,21 +186,19 @@ def refine_sampling(**kwargs) -> List[int]:
 
         for s_name in strategies:
             for _ in range(J):
-                # SubSample(C_{r-1}, α·|C_{r-1}|)
                 sample_size = max(b + 1, int(alpha * len(pool_indices)))
                 sample_size = min(sample_size, len(pool_indices))
                 sub_local = np.random.choice(len(pool_indices), sample_size, replace=False)
                 sub_global = [pool_indices[i] for i in sub_local]
 
-                sub_feats = image_embeddings[sub_global]  # (sample_size, D)
+                sub_feats = image_embeddings[sub_global] 
                 sub_labels = oracle_labels[sub_global]
 
-                # Run strategy on sub_feats → local indices
                 if s_name == "coreset":
                     local_sel = _coreset_mini(sub_feats, b, device)
                 elif s_name == "typiclust":
                     local_sel = _typiclust_mini(sub_feats, b)
-                else:  # margin
+                else:  
                     local_sel = _margin_mini(sub_feats, sub_labels, b,
                                              device, num_classes,
                                              probe_epochs, probe_lr)
@@ -263,22 +206,18 @@ def refine_sampling(**kwargs) -> List[int]:
                 for li in local_sel:
                     next_pool_set.add(sub_global[li])
 
-        # Enforce minimum pool size
         if len(next_pool_set) < b:
-            # restore enough from previous pool to maintain size ≥ b
             missing = b - len(next_pool_set)
             extras = [i for i in pool_indices if i not in next_pool_set]
             next_pool_set.update(np.random.choice(extras, missing, replace=False).tolist())
 
         pool_indices = list(next_pool_set)
 
-    # ── Stage 2: Coverage-Based Selection (MaxHerding on C_R) ────────────────
-    pool_feats = image_embeddings[pool_indices]     # (|C_R|, D)
+    pool_feats = image_embeddings[pool_indices]    
     local_order = _maxherding(pool_feats, max_budget, device, chunk_size=chunk_size)
 
     selected_indices = [pool_indices[li] for li in local_order]
 
-    # Pad with random remaining unlabeled if pool was exhausted before max_budget
     if len(selected_indices) < max_budget:
         used = set(selected_indices)
         remaining = [i for i in range(num_samples) if i not in used]

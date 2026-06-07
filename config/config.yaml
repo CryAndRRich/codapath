@@ -3,29 +3,21 @@ sampler_name: "codapath"
 random_seed: 42
 device: "cuda"
 
-cumulative_budget: [50, 100, 150, 200, 250, 300]
+cumulative_budget: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500]
 
-# ── Model names (HuggingFace Hub IDs) ──────────────────────────────────────
-# Change these to swap backbones without touching any Python code.
 models:
-  # Default ViT used for ALL methods: feature extraction + LinearProbe training
-  vit: "facebook/dinov2-base"               # 768-dim CLS token
-  # Default VLM used by CODAPath image encoder
+  vit: "facebook/dinov2-base"              
   vlm_primary: "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-  # Secondary VLM (PLIP) used by CODAPath image + text encoder
   vlm_secondary: "vinid/plip"
-  # BiomedBERT text encoder used by CODAPath text features
   biomedbert: "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
 
-# ── Training protocol (shared by all methods) ───────────────────────────────
 training:
-  mode: "linear"        # "linear" | "knn_linear"
-  probe_epochs: 100     # epochs for the evaluation LinearProbe
-  probe_lr: 0.001       # Adam lr for the evaluation LinearProbe
-  knn_k: 5              # KNN neighbours for pseudo-labelling (knn_linear only)
-  knn_threshold: 0.9    # min confidence to accept a pseudo-label (knn_linear only)
+  mode: "linear"       
+  probe_epochs: 100    
+  probe_lr: 0.001     
+  knn_k: 5             
+  knn_threshold: 0.9   
 
-# ── Per-sampler hyperparameters ─────────────────────────────────────────────
 samplers:
   random: {}
 
@@ -43,7 +35,7 @@ samplers:
     balance: 1.0
 
   codapath:
-    alpha: 0.5          # 0 = pure coverage, 1 = pure uncertainty
+    alpha: 0.5         
     chunk_size: 10000
 
   entropy:
@@ -61,42 +53,39 @@ samplers:
   uncertainty_herding:
     probe_epochs: 50
     probe_lr: 0.001
-    chunk_size: 2000    # (N × chunk_size) kernel matrix; reduce on small-VRAM GPUs
+    chunk_size: 2000   
 
   dcom:
     probe_epochs: 50
     probe_lr: 0.001
-    competence_midpoint: 0.9    # logistic parameter a  (paper: 0.9 for ≤10 classes)
-    competence_steepness: 30.0  # logistic parameter k
-    # delta: null               # if null, estimated automatically from data purity
+    competence_midpoint: 0.9  
+    competence_steepness: 30.0  
 
   tcm:
     probe_epochs: 50
     probe_lr: 0.001
     k_nn: 20
     chunk_size: 5000
-    # transition_budget: null   # if null, defaults to min(2×num_classes, max_budget)
 
   dropquery:
     probe_epochs: 50
     probe_lr: 0.001
-    dropout_ratio: 0.75   # ρ — feature-level dropout ratio
-    n_dropout: 3          # M — number of dropout passes (robust to 3–9)
+    dropout_ratio: 0.75  
+    n_dropout: 3         
 
   refine:
     probe_epochs: 30
     probe_lr: 0.001
-    filter_rounds: 3      # R — filtering rounds (paper: 5; reduced for speed)
-    filter_alpha: 0.4     # α — subsample ratio per strategy call
-    filter_batches: 5     # J — batches per strategy per round (paper: 10)
-    chunk_size: 2000      # for final MaxHerding stage
+    filter_rounds: 3     
+    filter_alpha: 0.4    
+    filter_batches: 5   
+    chunk_size: 2000    
 
   scalpel:
-    tau: 0.05             # EDL temperature: alpha = exp(cos/tau); smaller = sharper Dirichlet
-    chunk_size: 500       # rows per kernel block (n_chunk = c_chunk = chunk_size); reduce on small VRAM
-    n_sigma: 2000         # subsample size for adaptive sigma (median pairwise dist on DINOv2 features)
+    tau: 0.05         
+    chunk_size: 500     
+    n_sigma: 2000       
 
-# ── Prompt templates for CODAPath text encoding ─────────────────────────────
 prompt_templates:
   - "Photomicrograph showing {}."
   - "Histopathology of {}."
@@ -104,7 +93,6 @@ prompt_templates:
   - "Pathological tissue section demonstrating {}."
   - "Cellular morphology characteristic of {}."
 
-# ── Dataset definitions ──────────────────────────────────────────────────────
 datasets:
   pathmnist:
     path: "data/pathmnist_224.npz"

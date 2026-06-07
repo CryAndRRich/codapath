@@ -1,13 +1,3 @@
-"""
-Basic / classic active learning samplers.
-Merged into one file to keep the sampling/ directory clean and avoid
-naming conflicts with Python's built-in `random` module.
-
-Methods:
-  - random    : uniform random selection
-  - margin    : iterative margin uncertainty (lowest top-2 gap)
-  - entropy   : iterative entropy uncertainty
-"""
 from typing import List
 
 import numpy as np
@@ -17,7 +7,6 @@ from . import register_sampler
 
 @register_sampler("random")
 def random_sampling(**kwargs) -> List[int]:
-    """Uniform random selection — sliceable (run once at max_budget)."""
     image_embeddings = kwargs["image_embeddings"]
     max_budget = kwargs["max_budget"]
     num_samples = image_embeddings.shape[0]
@@ -26,11 +15,6 @@ def random_sampling(**kwargs) -> List[int]:
 
 @register_sampler("margin")
 def margin_sampling(**kwargs) -> List[int]:
-    """
-    Iterative margin uncertainty sampling.
-    Warm-start with random step_budget samples, then greedily select the samples
-    with smallest top-2 softmax gap (most uncertain) using an internal LinearProbe.
-    """
     image_embeddings = kwargs["image_embeddings"]
     oracle_labels = kwargs["oracle_labels"]
     max_budget = kwargs["max_budget"]
@@ -75,11 +59,6 @@ def margin_sampling(**kwargs) -> List[int]:
 
 @register_sampler("entropy")
 def entropy_sampling(**kwargs) -> List[int]:
-    """
-    Iterative entropy uncertainty sampling.
-    Warm-start with random step_budget samples, then greedily select the samples
-    with highest predictive entropy using an internal LinearProbe.
-    """
     image_embeddings = kwargs["image_embeddings"]
     oracle_labels = kwargs["oracle_labels"]
     max_budget = kwargs["max_budget"]

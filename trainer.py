@@ -1,5 +1,5 @@
 import os
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 import torch
@@ -12,8 +12,6 @@ from set_up import clear_memory
 
 
 class LinearProbe(nn.Module):
-    """Single linear layer classifier on frozen ViT features."""
-
     def __init__(self, feat_dim: int, num_classes: int) -> None:
         super().__init__()
         self.fc = nn.Linear(feat_dim, num_classes)
@@ -43,7 +41,6 @@ def train_linear(features: np.ndarray,
                  num_epochs: int,
                  lr: float,
                  device: torch.device) -> LinearProbe:
-    """Train a linear probe on frozen features (mode 1: labeled only)."""
     feat_dim = features.shape[1]
     probe = LinearProbe(feat_dim, num_classes).to(device)
 
@@ -78,27 +75,15 @@ def train_knn_linear(all_features: np.ndarray,
                      num_epochs: int,
                      lr: float,
                      device: torch.device) -> LinearProbe:
-    """
-    Mode 2: KNN pseudo-label the whole unlabeled pool, then train on
-    labeled + confident pseudo-labeled data.
-
-    Step 1 — fit a warm-start probe on labeled data only.
-    Step 2 — KNN majority-vote pseudo-labels on unlabeled subset.
-    Step 3 — keep pseudo-labels where the probe's max-class probability
-              exceeds knn_threshold.
-    Step 4 — retrain probe on combined (labeled + confident pseudo-labeled).
-    """
     labeled_set = set(labeled_indices)
     unlabeled_indices = [i for i in range(len(all_features)) if i not in labeled_set]
 
     labeled_features = all_features[labeled_indices]
     unlabeled_features = all_features[unlabeled_indices]
 
-    # Step 1: warm-start probe on labeled data
     warm_probe = train_linear(labeled_features, labeled_labels, num_classes,
                               max(1, num_epochs // 2), lr, device)
 
-    # Step 2: KNN pseudo-labels
     labeled_tensor = torch.tensor(labeled_features, device=device, dtype=torch.float32)
     labeled_norm = F.normalize(labeled_tensor, p=2, dim=1)
 
@@ -106,8 +91,8 @@ def train_knn_linear(all_features: np.ndarray,
     unlabeled_norm = F.normalize(unlabeled_tensor, p=2, dim=1)
 
     k = min(knn_k, len(labeled_indices))
-    sim = torch.matmul(unlabeled_norm, labeled_norm.T)             # (N_u, N_l)
-    _, topk_ids = torch.topk(sim, k=k, dim=1)                     # (N_u, k)
+    sim = torch.matmul(unlabeled_norm, labeled_norm.T)            
+    _, topk_ids = torch.topk(sim, k=k, dim=1)                  
     topk_ids_np = topk_ids.cpu().numpy()
 
     pseudo_labels = np.array([
@@ -118,12 +103,10 @@ def train_knn_linear(all_features: np.ndarray,
     del labeled_tensor, labeled_norm, unlabeled_tensor, unlabeled_norm, sim, topk_ids
     clear_memory()
 
-    # Step 3: confidence filter using warm probe
     unlabeled_probs = warm_probe.predict_proba(unlabeled_features, device)
     confident_mask = unlabeled_probs.max(axis=1) >= knn_threshold
     del warm_probe
 
-    # Step 4: combined training
     combined_features = np.vstack([labeled_features, unlabeled_features[confident_mask]])
     combined_labels = np.concatenate([labeled_labels, pseudo_labels[confident_mask]])
 
@@ -135,7 +118,6 @@ def train_knn_linear(all_features: np.ndarray,
 
 
 def save_model(probe: LinearProbe, save_path: str) -> None:
-    """Save only the linear layer weights (weight + bias tensors)."""
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save({
         "feat_dim": probe.fc.in_features,

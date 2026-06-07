@@ -16,8 +16,6 @@ def typiclust_sampling(**kwargs) -> List[int]:
     max_budget = kwargs["max_budget"]
     device = kwargs["device"]
     chunk_size = kwargs["chunk_size"]
-    # FIX (major): existing labeled indices needed for correct num_clusters and sort order.
-    # Default to empty list for cold-start (behaviour is identical to original in that case).
     existing_labeled_indices = kwargs.get("existing_labeled_indices", [])
 
     num_samples = image_embeddings.shape[0]
@@ -27,9 +25,6 @@ def typiclust_sampling(**kwargs) -> List[int]:
     features_tensor = F.normalize(features_tensor, p=2, dim=1)
     features_np = features_tensor.cpu().numpy()
 
-    # FIX (major): num_clusters = |labeled_set| + budget, capped at 500.
-    # Official TypiClust: num_clusters = len(labeled_set) + budget_size (MAX_NUM_CLUSTERS=500).
-    # In pure cold-start (labeled_set=∅) this equals max_budget, same as before.
     num_clusters = min(len(existing_labeled_indices) + max_budget, 500)
 
     if num_clusters <= 50:
@@ -40,10 +35,6 @@ def typiclust_sampling(**kwargs) -> List[int]:
     cluster_ids = km.fit_predict(features_np)
     cluster_sizes = np.bincount(cluster_ids, minlength=num_clusters)
 
-    # FIX (critical): typicality must be computed WITHIN each cluster, not globally.
-    # Official TypiClust: for sample x in cluster c, K nearest neighbours are drawn
-    # only from cluster c.  Global typicality favours globally dense regions rather
-    # than the most representative point within each local cluster.
     typicality = np.zeros(num_samples, dtype=np.float32)
 
     for c in range(num_clusters):
@@ -51,21 +42,19 @@ def typiclust_sampling(**kwargs) -> List[int]:
         if len(in_cluster) == 0:
             continue
 
-        cluster_feats = features_tensor[in_cluster]  # shape: [M, D]
-
-        # Pairwise cosine-distance matrix within the cluster (chunked for memory).
+        cluster_feats = features_tensor[in_cluster] 
+        
         n_c = len(in_cluster)
         mean_nn_dist = torch.zeros(n_c, device=device)
 
         for cs in range(0, n_c, chunk_size):
             ce = min(cs + chunk_size, n_c)
-            chunk = cluster_feats[cs:ce]                    # [B, D]
-            sim = torch.matmul(chunk, cluster_feats.T)      # [B, M]
-            dist = 1.0 - sim                                # cosine distance
+            chunk = cluster_feats[cs:ce]                   
+            sim = torch.matmul(chunk, cluster_feats.T)     
+            dist = 1.0 - sim                               
 
             k_val = min(K_NN + 1, n_c)
             topk_dist, _ = torch.topk(dist, k=k_val, dim=1, largest=False)
-            # topk_dist[:, 0] is self (distance 0); skip it.
             mean_nn_dist[cs:ce] = topk_dist[:, 1:].mean(dim=1)
 
             del sim, dist, topk_dist
@@ -74,10 +63,6 @@ def typiclust_sampling(**kwargs) -> List[int]:
         del cluster_feats, mean_nn_dist
         clear_memory()
 
-    # FIX (major): sort clusters by (existing_labeled_count ASC, cluster_size DESC).
-    # Official: prioritise clusters with fewest already-labeled samples first; break
-    # ties by cluster size descending.  In cold-start, existing_count=0 everywhere so
-    # the sort reduces to size-descending — identical to the prior local behaviour.
     existing_set = set(existing_labeled_indices)
     existing_count_per_cluster = np.array([
         np.sum(np.isin(np.where(cluster_ids == c)[0],
@@ -85,7 +70,6 @@ def typiclust_sampling(**kwargs) -> List[int]:
         for c in range(num_clusters)
     ])
 
-    # Stable sort: primary key = existing_count ASC, secondary = cluster_size DESC.
     sort_keys = [(existing_count_per_cluster[c], -cluster_sizes[c]) for c in range(num_clusters)]
     sorted_clusters = sorted(range(num_clusters), key=lambda c: sort_keys[c])
     valid_clusters = [c for c in sorted_clusters if cluster_sizes[c] > 0]
