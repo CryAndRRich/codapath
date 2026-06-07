@@ -45,6 +45,9 @@ def typiclust_sampling(**kwargs) -> List[int]:
         cluster_feats = features_tensor[in_cluster] 
         
         n_c = len(in_cluster)
+        if n_c < 2:
+            typicality[in_cluster] = 0.0
+            continue
         mean_nn_dist = torch.zeros(n_c, device=device)
 
         for cs in range(0, n_c, chunk_size):
@@ -72,10 +75,10 @@ def typiclust_sampling(**kwargs) -> List[int]:
 
     sort_keys = [(existing_count_per_cluster[c], -cluster_sizes[c]) for c in range(num_clusters)]
     sorted_clusters = sorted(range(num_clusters), key=lambda c: sort_keys[c])
-    valid_clusters = [c for c in sorted_clusters if cluster_sizes[c] > 0]
+    valid_clusters = [c for c in sorted_clusters if cluster_sizes[c] > 1]
 
     selected_indices = []
-    selected_set = set()
+    selected_set = set(existing_labeled_indices)
 
     i = 0
     with tqdm(total=max_budget, desc="TypiClust Selection") as pbar:

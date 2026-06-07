@@ -42,9 +42,9 @@ def _typiclust_mini(feats: np.ndarray, b: int) -> List[int]:
     k_nn = min(20, n - 1)
     for s in range(0, n, chunk):
         e = min(s + chunk, n)
-        sim = feats_norm[s:e] @ feats_norm.T         
-        sim[:, s:e] -= 2 * np.eye(e - s, n, k=s)   
-        topk_sim = np.sort(sim, axis=1)[:, :-1][:, -k_nn:]
+        sim = feats_norm[s:e] @ feats_norm.T         # [e-s, n]
+        sim[np.arange(e - s), np.arange(s, e)] = -2.0  # exclude self-similarity
+        topk_sim = np.sort(sim, axis=1)[:, -k_nn:]   # self-sim=-2 won't appear in top-k
         typicality[s:e] = topk_sim.mean(axis=1)
 
     if b <= 50:
