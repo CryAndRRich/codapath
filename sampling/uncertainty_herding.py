@@ -54,7 +54,7 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
             sel_dist = torch.sqrt(torch.clamp(2.0 - 2.0 * sel_sim, min=0.0))
             sel_dist.fill_diagonal_(float("inf"))
             new_sigma = sel_dist.min().item()
-            sigma = max(new_sigma, 1e-6)
+            sigma = max(new_sigma, 1e-3)
             del sel_feats, sel_sim, sel_dist
             clear_memory()
 
@@ -71,12 +71,13 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
                     del chunk, sim_c, dist_sq_c, k_c
             clear_memory()
 
+            norm_embeddings = features.cpu().numpy()
             probe = train_linear(
-                image_embeddings[selected_indices],
+                norm_embeddings[selected_indices],
                 oracle_labels[selected_indices],
                 num_classes, probe_epochs, probe_lr, device,
             )
-            probs = probe.predict_proba(image_embeddings, device)  
+            probs = probe.predict_proba(norm_embeddings, device)
             s_probs = np.sort(probs, axis=1)
             margin = s_probs[:, -1] - s_probs[:, -2]
             U = torch.tensor(1.0 - margin, device=device, dtype=torch.float32)
