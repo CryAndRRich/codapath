@@ -82,9 +82,9 @@ samplers:
     chunk_size: 2000    
 
   scalpel:
-    tau: 0.05         
-    chunk_size: 500     
-    n_sigma: 2000       
+    tau: 0.0           # 0.0 = auto-adaptive from pool statistics
+    chunk_size: 500
+    n_sigma: 2000
 
 prompt_templates:
   - "Photomicrograph showing {}."

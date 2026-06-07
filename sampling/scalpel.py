@@ -1,3 +1,4 @@
+import math
 from typing import Dict, List
 
 import numpy as np
@@ -9,8 +10,6 @@ from transformers import CLIPModel, CLIPTokenizer
 
 from set_up import clear_memory
 from . import register_sampler
-
-_LN2 = float(np.log(2.0))
 
 
 class PLIPExtractor(nn.Module):
@@ -52,7 +51,7 @@ def extract_plip_text_features(
     ).to(device)
     with torch.no_grad():
         text_out = clip_model.text_model(**tokens)
-        emb = clip_model.text_projection(text_out.pooler_output).cpu().numpy()  # (N*T, projection_dim=512)
+        emb = clip_model.text_projection(text_out.pooler_output).cpu().numpy()  # (N*T, 512)
     del clip_model, tokens
     clear_memory()
 
@@ -62,26 +61,54 @@ def extract_plip_text_features(
     return text_embeddings
 
 
-def _compute_edl(
-    vlm_img: torch.Tensor,  
-    text_emb: torch.Tensor, 
-    tau: float,
-) -> tuple:
-    sim = torch.matmul(vlm_img, text_emb.T)      
-    alpha = torch.exp(sim / tau)                   
-    S = alpha.sum(dim=1, keepdim=True)             
-    L = text_emb.shape[0]
-    U = L / S.squeeze(1)                            
-    P = alpha / S                              
-    return U, P
+# ---------------------------------------------------------------------------
+# EDL branch — returns only U (vacuity); P no longer needed after K_joint change
+# ---------------------------------------------------------------------------
 
+def _adaptive_tau(sim_cal: torch.Tensor, L: int, target_u_conf: float = 0.2) -> float:
+    """
+    Pick τ so the 90th-percentile-confident sample has U ≈ target_u_conf.
+    After class-mean subtraction, s_cal_max ~ 0 for a uniform-uncertainty sample
+    and > 0 for a confident one.  τ = s90 / log(L / target_u_conf).
+    """
+    s90 = torch.quantile(sim_cal.max(dim=1).values, 0.90).item()
+    if s90 <= 0:
+        return 0.1
+    denom = math.log(max(L / target_u_conf, 1.001))
+    return max(s90 / denom, 1e-4)
+
+
+def _compute_edl(
+    vlm_img: torch.Tensor,   # (N, d_vlm) L2-normalised PLIP image features
+    text_emb: torch.Tensor,  # (L, d_vlm) L2-normalised PLIP text prototypes
+    tau: float,              # 0.0 → auto-calibrate from pool statistics
+) -> torch.Tensor:           # returns U (N,)
+    sim = torch.matmul(vlm_img, text_emb.T)           # (N, L) cosine similarities
+    sim_cal = sim - sim.mean(dim=0, keepdim=True)      # Option B: per-class mean subtraction
+    if tau <= 0.0:
+        tau = _adaptive_tau(sim_cal, text_emb.shape[0])
+    alpha = torch.exp(sim_cal / tau)
+    S = alpha.sum(dim=1, keepdim=True)
+    return text_emb.shape[0] / S.squeeze(1)            # U = L / S
+
+
+def _rank_normalize(x: torch.Tensor) -> torch.Tensor:
+    """Map values to their fractional ranks in [1/N, 1]. Removes absolute scale sensitivity."""
+    N = x.shape[0]
+    ranks = torch.argsort(torch.argsort(x)).float() + 1.0
+    return ranks / N
+
+
+# ---------------------------------------------------------------------------
+# Kernel functions — unified Gaussian kernel used for both DINOv2 and PLIP
+# ---------------------------------------------------------------------------
 
 def _adaptive_sigma(features: torch.Tensor, n_ref: int = 2000) -> float:
     N = features.shape[0]
     n_ref = min(n_ref, N)
     idx = np.random.choice(N, n_ref, replace=False)
-    ref = features[idx]                            
-    sim = torch.matmul(ref, ref.T)             
+    ref = features[idx]
+    sim = torch.matmul(ref, ref.T)
     dist_sq = torch.clamp(2.0 - 2.0 * sim, min=0.0)
     dist = torch.sqrt(dist_sq)
     dist.fill_diagonal_(float("inf"))
@@ -91,63 +118,62 @@ def _adaptive_sigma(features: torch.Tensor, n_ref: int = 2000) -> float:
     return max(sigma, 1e-4)
 
 
-def _k_struct(
-    row_dino: torch.Tensor, 
-    col_dino: torch.Tensor,
+def _k_gaussian(
+    row: torch.Tensor,
+    col: torch.Tensor,
     sigma: float,
 ) -> torch.Tensor:
-    cos_sim = torch.matmul(row_dino, col_dino.T)        
+    cos_sim = torch.matmul(row, col.T)
     return torch.exp(-torch.clamp(1.0 - cos_sim, min=0.0) / (sigma ** 2))
 
 
-def _d_sem(
-    row_P: torch.Tensor,  
-    col_P: torch.Tensor,  
-) -> torch.Tensor:
-    eps = 1e-10
-    P_n = row_P.unsqueeze(1)  
-    P_c = col_P.unsqueeze(0)  
-    M = (P_n + P_c) * 0.5     
-    kl_n = (P_n * (torch.log(P_n + eps) - torch.log(M + eps))).sum(-1) 
-    kl_c = (P_c * (torch.log(P_c + eps) - torch.log(M + eps))).sum(-1) 
-    return torch.clamp(0.5 * (kl_n + kl_c) / _LN2, min=0.0, max=1.0)  
-
-
 def _k_joint(
-    row_dino: torch.Tensor, col_dino: torch.Tensor, sigma: float,
-    row_P: torch.Tensor, col_P: torch.Tensor,
+    row_dino: torch.Tensor, col_dino: torch.Tensor, sigma_dino: float,
+    row_vlm:  torch.Tensor, col_vlm:  torch.Tensor, sigma_vlm:  float,
 ) -> torch.Tensor:
-    ks = _k_struct(row_dino, col_dino, sigma)
-    ds = _d_sem(row_P, col_P)
-    return ks * (1.0 - ds)
+    """
+    Product kernel: K_joint = K_dino × K_vlm.
+    Two samples are redundant only when similar in BOTH structural (DINOv2)
+    AND semantic (PLIP image) space.  Product of two PD kernels is PD,
+    so submodular coverage guarantees carry through.
+    """
+    return _k_gaussian(row_dino, col_dino, sigma_dino) * _k_gaussian(row_vlm, col_vlm, sigma_vlm)
 
 
 def _k_joint_col(
-    dino: torch.Tensor,     
-    P: torch.Tensor,         
-    best_dino: torch.Tensor, 
-    best_P: torch.Tensor,    
-    sigma: float,
+    dino:       torch.Tensor,
+    vlm_img:    torch.Tensor,
+    best_dino:  torch.Tensor,
+    best_vlm:   torch.Tensor,
+    sigma_dino: float,
+    sigma_vlm:  float,
     chunk_size: int,
 ) -> torch.Tensor:
     N = dino.shape[0]
     col = torch.empty(N, device=dino.device, dtype=torch.float32)
     for ns in range(0, N, chunk_size):
         ne = min(ns + chunk_size, N)
-        kj = _k_joint(dino[ns:ne], best_dino, sigma, P[ns:ne], best_P)  # (chunk,1)
+        kj = _k_joint(
+            dino[ns:ne], best_dino, sigma_dino,
+            vlm_img[ns:ne], best_vlm, sigma_vlm,
+        )
         col[ns:ne] = kj.squeeze(1)
         del kj
     return col
 
 
+# ---------------------------------------------------------------------------
+# Main sampling function
+# ---------------------------------------------------------------------------
+
 @register_sampler("scalpel")
 def scalpel_sampling(**kwargs) -> List[int]:
-    dino_np: np.ndarray      = kwargs["image_embeddings"]
-    vlm_np: np.ndarray       = kwargs["vlm_image_embeddings"]
-    text_np: np.ndarray      = kwargs["text_embeddings"]
+    dino_np: np.ndarray      = kwargs["image_embeddings"]       # (N, 768) DINOv2
+    vlm_np:  np.ndarray      = kwargs["vlm_image_embeddings"]   # (N, 512) PLIP image
+    text_np: np.ndarray      = kwargs["text_embeddings"]        # (L, 512) PLIP text
     max_budget: int          = kwargs["max_budget"]
     device: torch.device     = kwargs["device"]
-    tau: float               = kwargs.get("tau", 0.05)
+    tau: float               = kwargs.get("tau", 0.0)           # 0.0 = auto-adaptive
     chunk_size: int          = kwargs.get("chunk_size", 500)
     n_sigma: int             = kwargs.get("n_sigma", 2000)
 
@@ -163,11 +189,18 @@ def scalpel_sampling(**kwargs) -> List[int]:
         torch.tensor(text_np, device=device, dtype=torch.float32), p=2, dim=1
     )
 
-    U, P = _compute_edl(vlm_img, text_emb, tau)      
-    del vlm_img, text_emb
+    # EDL: returns only U (P no longer needed after product-kernel change)
+    U = _compute_edl(vlm_img, text_emb, tau)
+    del text_emb
     clear_memory()
 
-    sigma = _adaptive_sigma(dino, n_ref=n_sigma)
+    # Rank-normalise U → removes outlier/domain-gap domination
+    U_norm = _rank_normalize(U)
+    del U
+
+    # Kernel bandwidths — independent for each feature space
+    sigma_dino = _adaptive_sigma(dino,    n_ref=n_sigma)
+    sigma_vlm  = _adaptive_sigma(vlm_img, n_ref=n_sigma)
 
     K_n = torch.zeros(N, device=device, dtype=torch.float32)
     selected_indices: List[int] = []
@@ -177,27 +210,26 @@ def scalpel_sampling(**kwargs) -> List[int]:
 
         best_idx   = -1
         best_score = -float("inf")
+
         for cs in range(0, N, chunk_size):
             ce = min(cs + chunk_size, N)
-            cand_dino = dino[cs:ce]   
-            cand_P    = P[cs:ce]     
-            cand_U    = U[cs:ce]     
+            cand_dino   = dino[cs:ce]
+            cand_vlm    = vlm_img[cs:ce]
+            cand_U_norm = U_norm[cs:ce]
 
             delta_cov = torch.zeros(ce - cs, device=device, dtype=torch.float32)
 
             for ns in range(0, N, chunk_size):
                 ne = min(ns + chunk_size, N)
                 kj = _k_joint(
-                    dino[ns:ne], cand_dino, sigma,
-                    P[ns:ne], cand_P,
+                    dino[ns:ne], cand_dino, sigma_dino,
+                    vlm_img[ns:ne], cand_vlm, sigma_vlm,
                 )
-                gain = torch.clamp(
-                    kj - K_n[ns:ne].unsqueeze(1), min=0.0
-                )
-                delta_cov += (U[ns:ne].unsqueeze(1) * gain).sum(0)
+                gain = torch.clamp(kj - K_n[ns:ne].unsqueeze(1), min=0.0)
+                delta_cov += (U_norm[ns:ne].unsqueeze(1) * gain).sum(0)
                 del kj, gain
 
-            scores = cand_U * delta_cov                     
+            scores = cand_U_norm * delta_cov
 
             for si in selected_set:
                 if cs <= si < ce:
@@ -208,7 +240,7 @@ def scalpel_sampling(**kwargs) -> List[int]:
                 best_score = scores[local_best].item()
                 best_idx   = cs + local_best
 
-            del cand_dino, cand_P, cand_U, delta_cov, scores
+            del cand_dino, cand_vlm, cand_U_norm, delta_cov, scores
             clear_memory()
 
         if best_idx < 0 or best_idx in selected_set:
@@ -219,15 +251,15 @@ def scalpel_sampling(**kwargs) -> List[int]:
         selected_set.add(best_idx)
 
         best_k_col = _k_joint_col(
-            dino, P,
+            dino, vlm_img,
             dino[best_idx].unsqueeze(0),
-            P[best_idx].unsqueeze(0),
-            sigma, chunk_size,
-        )                                                       
+            vlm_img[best_idx].unsqueeze(0),
+            sigma_dino, sigma_vlm, chunk_size,
+        )
         K_n = torch.maximum(K_n, best_k_col)
         del best_k_col
         clear_memory()
 
-    del dino, P, U, K_n
+    del dino, vlm_img, U_norm, K_n
     clear_memory()
     return selected_indices
