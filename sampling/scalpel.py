@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import CLIPVisionModel, CLIPTokenizer, CLIPTextModel
+from transformers import CLIPModel, CLIPTokenizer
 
 from set_up import clear_memory
 from . import register_sampler
@@ -16,12 +16,16 @@ _LN2 = float(np.log(2.0))
 class PLIPExtractor(nn.Module):
     def __init__(self, model_name: str = "vinid/plip") -> None:
         super().__init__()
-        self.encoder = CLIPVisionModel.from_pretrained(model_name)
-        for p in self.encoder.parameters():
+        clip = CLIPModel.from_pretrained(model_name)
+        self.vision_model = clip.vision_model
+        self.visual_projection = clip.visual_projection
+        del clip
+        for p in self.parameters():
             p.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(pixel_values=x).pooler_output  # (B, 512)
+        pooled = self.vision_model(pixel_values=x).pooler_output
+        return self.visual_projection(pooled)  # (B, projection_dim=512)
 
 
 def extract_plip_text_features(
@@ -41,14 +45,14 @@ def extract_plip_text_features(
     num_templates = len(prompt_templates)
 
     tokenizer = CLIPTokenizer.from_pretrained(plip_model)
-    text_model = CLIPTextModel.from_pretrained(plip_model).to(device).eval()
+    clip_model = CLIPModel.from_pretrained(plip_model).to(device).eval()
 
     tokens = tokenizer(
         list_prompts, padding=True, truncation=True, return_tensors="pt"
     ).to(device)
     with torch.no_grad():
-        emb = text_model(**tokens).pooler_output.cpu().numpy() 
-    del text_model, tokens
+        emb = clip_model.get_text_features(**tokens).cpu().numpy()  # (N*T, projection_dim=512)
+    del clip_model, tokens
     clear_memory()
 
     text_embeddings = emb.reshape(num_classes, num_templates, -1).mean(axis=1).astype(np.float32)
@@ -185,13 +189,12 @@ def scalpel_sampling(**kwargs) -> List[int]:
                 kj = _k_joint(
                     dino[ns:ne], cand_dino, sigma,
                     P[ns:ne], cand_P,
-                )                                           
+                )
                 gain = torch.clamp(
                     kj - K_n[ns:ne].unsqueeze(1), min=0.0
-                )                                             
-                delta_cov += (U[ns:ne].unsqueeze(1) * gain).sum(0)  
+                )
+                delta_cov += (U[ns:ne].unsqueeze(1) * gain).sum(0)
                 del kj, gain
-            clear_memory()
 
             scores = cand_U * delta_cov                     
 
