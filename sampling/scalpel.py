@@ -51,7 +51,8 @@ def extract_plip_text_features(
         list_prompts, padding=True, truncation=True, return_tensors="pt"
     ).to(device)
     with torch.no_grad():
-        emb = clip_model.get_text_features(**tokens).cpu().numpy()  # (N*T, projection_dim=512)
+        text_out = clip_model.text_model(**tokens)
+        emb = clip_model.text_projection(text_out.pooler_output).cpu().numpy()  # (N*T, projection_dim=512)
     del clip_model, tokens
     clear_memory()
 
