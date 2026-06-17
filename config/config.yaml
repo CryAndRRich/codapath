@@ -82,9 +82,15 @@ samplers:
     chunk_size: 2000    
 
   scalpel:
-    tau: 0.0           # 0.0 = auto-adaptive from pool statistics
-    chunk_size: 500
-    n_sigma: 2000
+    num_rounds: 5        # iterative AL rounds (like SaE T=5)
+    chunk_size: 2000     # greedy coverage chunk size (DINOv2 space)
+    tau: 0.1             # PLIP zero-shot posterior temperature
+    kappa: 1.0           # fallback evidence scale (λ=κ/H) when too few labels for SEH
+    beta: 0.5            # SEH loss balance (SaE Eq.3)
+    seh_epochs: 200      # SEH training epochs per round
+    seh_lr: 0.001        # SEH Adam lr
+    use_dissonance: true # false → vacuity-only weighting
+    n_sigma: 2000        # subsample size for adaptive sigma
 
 prompt_templates:
   - "Photomicrograph showing {}."

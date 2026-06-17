@@ -14,12 +14,12 @@ from sampling import get_sampler
 from evaluate import evaluate_model, palm_evaluate, format_palm_report
 
 
-SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "scalpel",
+SLICEABLE_SAMPLERS = {"random", "coreset", "codapath",
                       "uncertainty_herding", "tcm", "refine"}
 
 PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery"}
 
-ITERATIVE_SAMPLERS = {"entropy", "margin", "badge"}
+ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel"}
 
 
 def _save(path: str, obj) -> None:
@@ -116,10 +116,6 @@ def main(
         }
         if sampler_name == "codapath":
             kwargs["text_embeddings"] = text_embeddings
-        if sampler_name == "scalpel":
-            kwargs["image_embeddings"]     = train_features      
-            kwargs["vlm_image_embeddings"] = train_vlm_features  
-            kwargs["text_embeddings"]      = text_embeddings
         master_selected = get_sampler(name=sampler_name, **kwargs)
 
     palm_acc: Dict[str, Dict[int, float]] = {"linear": {}, "knn": {}}
@@ -133,6 +129,8 @@ def main(
             selected_indices = get_sampler(
                 name=sampler_name,
                 image_embeddings=train_features,
+                vlm_image_embeddings=train_vlm_features,   # None unless scalpel
+                text_embeddings=text_embeddings,           # None unless scalpel
                 oracle_labels=train_labels,
                 max_budget=budget,
                 num_classes=num_classes,
