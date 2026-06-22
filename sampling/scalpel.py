@@ -1,170 +1,110 @@
-"""SCALPEL v5 — Dual-Evidence Iterative Coverage (round-based, label-aware).
+"""SCALPEL v6 — Stain<->Morphology Cross-View Evidential Conflict (pathology-specific).
 
-Design rationale (2026-06-13)
------------------------------
-v1-v3 computed EDL vacuity from *raw* zero-shot PLIP similarity — the exact
-miscalibration SaE was written to fix (SaE's SEH recalibrates similarity *using
-labels*). v4 added a faithful SEH but kept the evidence *direction* p entirely in
-PLIP space, while the linear probe is trained/evaluated in DINOv2 space. So even
-SEH-calibrated vacuity/dissonance could point the wrong way when PLIP zero-shot
-is weak on a dataset — and UHerding/BADGE stayed ahead because their uncertainty
-lives in the SAME (DINOv2) space as evaluation.
+Motivation (2026-06-23)
+-----------------------
+v1-v5 borrowed SaE (VLM evidence) + UHerding (coverage). But (a) raw/zero-shot
+PLIP evidence lives in the wrong space and is weak on pathology, and (b) the
+"PLIP vs DINOv2" idea is NOT pathology-specific — it transfers verbatim to
+natural images (CLIP vs DINOv2). A reviewer asks: why pathology?
 
-v5 fuses BOTH evidence sources in one Dirichlet (evidence is additive in EDL):
+v6 anchors the novelty on the ONE property unique to H&E histopathology: STAIN.
+Stain is a nuisance factor *confounded* with class — a good cold-start sample is
+one where the model has not yet separated biology (morphology) from stain (color).
 
-    e_k(x) = (1-m_r)·λ_SEH(x)·p_vlm_k(x)   +   m_r·λ_probe(x)·p_dino_k(x)
-    α_k(x) = e_k(x) + 1
+Two complementary, label-trained evidential views of each patch:
+  * Morphology view (M): DINOv2 features -> linear probe -> posterior p_M.
+      "What does the tissue STRUCTURE look like?"  (this is the eval space)
+  * Stain view (S): H&E color-deconvolution descriptor -> linear probe -> p_S.
+      "What does the COLOR/STAIN look like?"
 
-  * p_vlm : PLIP zero-shot posterior, λ_SEH from the SaE head (semantic prior).
-  * p_dino: DINOv2 linear-probe posterior trained on revealed labels (eval-space).
-  * m_r = r/(T-1) grows across rounds: COLD-START leans on the VLM prior, and as
-    labels accumulate the eval-aligned DINOv2 probe takes over (like UHerding).
+New acquisition signal = Dempster-Shafer CONFLICT between the two evidential
+opinions:  C(x) = (1-u_M)(1-u_S) - <b_M, b_S>.  C is high exactly when BOTH views
+are confident yet point to DIFFERENT classes — i.e. color says one thing but
+structure says another. Labelling those teaches the model to stop relying on
+stain shortcuts. This signal is meaningless for natural images (no stain) -> it
+does not transfer, unlike PLIP-vs-DINOv2.
 
-Vacuity (explore rare/under-covered) and dissonance (refine boundaries) are
-decomposed from the fused Dirichlet (SaE Eqs. 5-6) and drive an explore->refine
-schedule over a DINOv2 submodular-coverage objective — the batch diversity SaE
-itself lists as future work.
+Round-based (T rounds, like SaE T=5):
+  * Round 1 (cold): pure MaxHerding coverage in DINOv2.
+  * Rounds 2..T: train both probes on revealed labels; schedule
+        explore (morphology vacuity, cover unknowns)  ->  reconcile (cross-view conflict).
+    Coverage stays as submodular batch-diversity (DINOv2).
 
-Set `dual_evidence: false` to recover v4 (VLM/SEH evidence only) for ablation.
-Set `use_dissonance: false` for vacuity-only weighting.
+Ablation: `use_conflict: false` -> vacuity-only weighting.
 """
 
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
-from transformers import CLIPModel, CLIPTokenizer
 
 from set_up import clear_memory
 from . import register_sampler
 
 
 # ---------------------------------------------------------------------------
-# PLIP feature extraction (called by run.py)
+# Stain feature extraction — H&E color deconvolution (Ruifrok-Johnston)
 # ---------------------------------------------------------------------------
 
-class PLIPExtractor(nn.Module):
-    def __init__(self, model_name: str = "vinid/plip") -> None:
-        super().__init__()
-        clip = CLIPModel.from_pretrained(model_name)
-        self.vision_model = clip.vision_model
-        self.visual_projection = clip.visual_projection
-        del clip
-        for p in self.parameters():
-            p.requires_grad = False
+# Standard H&E (+ residual) stain optical-density vectors in RGB (rows = stains).
+_HE_OD = np.array([[0.65, 0.70, 0.29],
+                   [0.07, 0.99, 0.11],
+                   [0.27, 0.57, 0.78]], dtype=np.float64)
+_HE_OD = _HE_OD / np.linalg.norm(_HE_OD, axis=1, keepdims=True)
+_DECONV = np.linalg.inv(_HE_OD).astype(np.float32)   # OD(P,3) @ _DECONV -> concentrations(P,3)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        pooled = self.vision_model(pixel_values=x).pooler_output
-        return self.visual_projection(pooled)  # (B, projection_dim=512)
-
-
-def extract_plip_text_features(
-    class_descriptions: Dict[str, str],
-    prompt_templates: List[str],
-    class_names: List[str],
-    device: torch.device,
-    plip_model: str = "vinid/plip",
-) -> np.ndarray:
-    detailed_descriptions = [class_descriptions.get(cls, cls) for cls in class_names]
-    list_prompts = [
-        template.format(desc)
-        for desc in detailed_descriptions
-        for template in prompt_templates
-    ]
-    num_classes = len(class_names)
-    num_templates = len(prompt_templates)
-
-    tokenizer = CLIPTokenizer.from_pretrained(plip_model)
-    clip_model = CLIPModel.from_pretrained(plip_model).to(device).eval()
-    tokens = tokenizer(
-        list_prompts, padding=True, truncation=True, return_tensors="pt"
-    ).to(device)
-    with torch.no_grad():
-        text_out = clip_model.text_model(**tokens)
-        emb = clip_model.text_projection(text_out.pooler_output).cpu().numpy()
-    del clip_model, tokens
-    clear_memory()
-
-    text_embeddings = emb.reshape(num_classes, num_templates, -1).mean(axis=1).astype(np.float32)
-    norms = np.linalg.norm(text_embeddings, axis=1, keepdims=True)
-    text_embeddings /= np.maximum(norms, 1e-8)
-    return text_embeddings
-
-
-# ---------------------------------------------------------------------------
-# Similarity Evidence Head (SaE 3.2.2) — calibrates PLIP similarity with labels
-# ---------------------------------------------------------------------------
-
-class _SEH(nn.Module):
-    """Dual-branch MLP: (PLIP image emb, similarity vector) -> evidence strength λ>0."""
-
-    def __init__(self, img_dim: int, n_classes: int, hidden: int = 128, p_drop: float = 0.3) -> None:
-        super().__init__()
-        self.img_branch = nn.Sequential(
-            nn.Linear(img_dim, hidden), nn.ReLU(), nn.Dropout(p_drop),
-            nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(p_drop),
-        )
-        self.sim_branch = nn.Sequential(
-            nn.Linear(n_classes, hidden), nn.ReLU(), nn.Dropout(p_drop),
-        )
-        self.fuse = nn.Sequential(
-            nn.Linear(2 * hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, 1),
-        )
-
-    def forward(self, x_img: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        z = torch.cat([self.img_branch(x_img), self.sim_branch(s)], dim=1)
-        return F.softplus(self.fuse(z)).squeeze(-1)  # λ > 0
-
-
-def _train_seh(
-    img_lab: np.ndarray, sim_lab: np.ndarray, p_lab: np.ndarray, y_lab: np.ndarray,
-    device: torch.device, epochs: int = 200, lr: float = 1e-3, beta: float = 0.5,
-) -> _SEH:
-    eps, eps_h = 1e-6, 0.1
-    n, d = img_lab.shape
-    L = p_lab.shape[1]
-
-    l_cls = -np.log(np.clip(p_lab[np.arange(n), y_lab], eps, 1.0))          # difficulty
-    H = -(p_lab * np.log(np.clip(p_lab, eps, 1.0))).sum(axis=1)            # entropy
-    tgt_inv = torch.tensor(l_cls, device=device, dtype=torch.float32)
-    tgt_lam = torch.tensor(1.0 / (H + eps_h), device=device, dtype=torch.float32)
-
-    Xi = torch.tensor(img_lab, device=device, dtype=torch.float32)
-    Si = torch.tensor(sim_lab, device=device, dtype=torch.float32)
-
-    seh = _SEH(d, L).to(device)
-    opt = torch.optim.Adam(seh.parameters(), lr=lr, weight_decay=1e-3)
-    seh.train()
-    for _ in range(epochs):
-        opt.zero_grad()
-        lam = seh(Xi, Si).clamp(1e-3, 50.0)
-        loss = F.mse_loss(1.0 / (lam + eps), tgt_inv) + beta * F.mse_loss(lam, tgt_lam)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(seh.parameters(), 5.0)
-        opt.step()
-    seh.eval()
-    return seh
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 @torch.no_grad()
-def _seh_lambda(seh: _SEH, img_all: np.ndarray, sim_all: np.ndarray,
-                device: torch.device, chunk: int = 8192) -> np.ndarray:
-    N = img_all.shape[0]
-    out = np.empty(N, dtype=np.float32)
-    for s in range(0, N, chunk):
-        e = min(s + chunk, N)
-        xi = torch.tensor(img_all[s:e], device=device, dtype=torch.float32)
-        si = torch.tensor(sim_all[s:e], device=device, dtype=torch.float32)
-        out[s:e] = seh(xi, si).clamp(1e-3, 50.0).cpu().numpy()
-    return out
+def extract_stain_features(loader, device: torch.device,
+                           mean=_IMAGENET_MEAN, std=_IMAGENET_STD,
+                           down: int = 64) -> np.ndarray:
+    """Per-image H&E stain descriptor from a (ImageNet-normalised) image loader.
+
+    Recovers raw RGB by inverting the loader normalisation, deconvolves into
+    Hematoxylin / Eosin concentration channels, and summarises each patch by a
+    compact stain/appearance descriptor (concentration + colour moments).
+    """
+    mean_t = torch.tensor(mean, device=device).view(1, 3, 1, 1)
+    std_t = torch.tensor(std, device=device).view(1, 3, 1, 1)
+    deconv = torch.tensor(_DECONV, device=device)            # (3,3)
+
+    feats: List[np.ndarray] = []
+    for imgs, _ in tqdm(loader, desc="Stain feature extraction"):
+        imgs = imgs.to(device, non_blocking=True)
+        rgb = (imgs * std_t + mean_t).clamp(0.0, 1.0)        # raw RGB in [0,1]
+        if down and rgb.shape[-1] > down:
+            rgb = F.interpolate(rgb, size=(down, down), mode="bilinear", align_corners=False)
+        B = rgb.shape[0]
+
+        I255 = rgb * 255.0
+        od = -torch.log10((I255 + 1.0) / 256.0).clamp(min=0.0)   # (B,3,H,W)
+        od_flat = od.permute(0, 2, 3, 1).reshape(B, -1, 3)        # (B,P,3)
+        C = torch.clamp(od_flat @ deconv, min=0.0)                # (B,P,3) [H,E,res]
+
+        rgb_flat = rgb.permute(0, 2, 3, 1).reshape(B, -1, 3)      # (B,P,3)
+        sat = rgb_flat.max(-1).values - rgb_flat.min(-1).values   # (B,P)
+        od_mag = od_flat.sum(-1)                                  # (B,P)
+        tissue = (od_mag > 0.15).float().mean(1, keepdim=True)    # (B,1)
+
+        desc = torch.cat([
+            C.mean(1), C.std(1),               # H/E/res concentration mean+std (6)
+            rgb_flat.mean(1), rgb_flat.std(1), # colour mean+std (6)
+            sat.mean(1, keepdim=True),         # mean saturation (1)
+            tissue,                            # tissue fraction (1)
+        ], dim=1)                              # -> (B, 14)
+        feats.append(desc.cpu().numpy().astype(np.float32))
+        del imgs, rgb, od, od_flat, C, rgb_flat, sat, od_mag, desc
+    clear_memory()
+    return np.concatenate(feats, axis=0)
 
 
 # ---------------------------------------------------------------------------
-# Dual-evidence Dirichlet — fuse VLM (SEH) + DINOv2 probe; vacuity & dissonance
+# Evidential helpers — Dirichlet opinion + Dempster-Shafer cross-view conflict
 # ---------------------------------------------------------------------------
 
 def _minmax(x: np.ndarray) -> np.ndarray:
@@ -184,38 +124,31 @@ def _entropy(p: np.ndarray) -> np.ndarray:
     return -(p * np.log(p)).sum(axis=1)
 
 
-def _dissonance_from_belief(b: np.ndarray) -> np.ndarray:
-    """Dissonance (SaE Eq.6): conflict among competing belief masses."""
-    eps = 1e-8
-    L = b.shape[1]
-    bi = b[:, :, None]
-    bj = b[:, None, :]
-    bal = 1.0 - np.abs(bi - bj) / (bi + bj + eps)
-    offdiag = 1.0 - np.eye(L, dtype=b.dtype)[None]
-    num = (bj * bal * offdiag).sum(axis=2)
-    den = (bj * offdiag).sum(axis=2) + eps
-    return (b * num / den).sum(axis=1)
+def _opinion(p: np.ndarray, kappa: float) -> Tuple[np.ndarray, np.ndarray]:
+    """From a calibrated posterior, build a Dirichlet opinion.
 
-
-def _evidence_dual(
-    p_vlm: np.ndarray, lam_seh: np.ndarray,
-    p_dino: np.ndarray, lam_probe: np.ndarray, m: float,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Fuse VLM (SEH) and DINOv2-probe evidence into one Dirichlet.
-
-    e_k = (1-m)·λ_seh·p_vlm_k + m·λ_probe·p_dino_k ; α_k = e_k + 1.
-    m=0 → VLM only (v4 behaviour); m=1 → DINOv2-probe only.
-    Returns (vacuity, dissonance) from the fused Dirichlet (SaE Eqs.5-6).
+    λ(x)=κ/(H[p]+0.1) ties evidence to probe certainty; α_k=λ·p_k+1.
+    Returns (vacuity u=L/S, belief masses b_k=(α_k-1)/S).
     """
-    L = p_vlm.shape[1]
-    e = (1.0 - m) * (lam_seh[:, None] * _norm_rows(p_vlm))
-    if p_dino is not None and m > 0.0:
-        e = e + m * (lam_probe[:, None] * _norm_rows(p_dino))
-    S = e.sum(axis=1) + L                              # Σα = Σe + L
-    vacuity = L / S
-    b = e / S[:, None]                                 # belief = (α-1)/S = e/S
-    dissonance = _dissonance_from_belief(b)
-    return vacuity.astype(np.float32), dissonance.astype(np.float32)
+    p = _norm_rows(p)
+    L = p.shape[1]
+    lam = kappa / (_entropy(p) + 0.1)
+    S = lam + L
+    u = (L / S).astype(np.float32)
+    b = (lam[:, None] * p) / S[:, None]
+    return u, b.astype(np.float32)
+
+
+def _cross_conflict(u_m, b_m, u_s, b_s) -> np.ndarray:
+    """Dempster-Shafer conflict between two opinions: mass on contradictory classes.
+
+    C = Σ_{i≠j} b_m_i·b_s_j = (1-u_m)(1-u_s) − Σ_k b_m_k·b_s_k  ∈ [0,1).
+    High only when BOTH views are confident (low vacuity) and point to
+    DIFFERENT classes.
+    """
+    agree = (b_m * b_s).sum(axis=1)
+    conflict = (1.0 - u_m) * (1.0 - u_s) - agree
+    return np.clip(conflict, 0.0, None).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -293,47 +226,37 @@ def _greedy_coverage_batch(
 
 
 # ---------------------------------------------------------------------------
-# Main sampling function — iterative, round-based, dual evidence
+# Main sampling function — iterative, round-based, cross-view conflict
 # ---------------------------------------------------------------------------
 
 @register_sampler("scalpel")
 def scalpel_sampling(**kwargs) -> List[int]:
-    dino_np: np.ndarray   = kwargs["image_embeddings"]        # (N, 768) DINOv2 — coverage + probe
-    vlm_np:  np.ndarray   = kwargs["vlm_image_embeddings"]    # (N, 512) PLIP image — evidence
-    text_np: np.ndarray   = kwargs["text_embeddings"]         # (L, 512) PLIP text prototypes
+    dino_np: np.ndarray   = kwargs["image_embeddings"]   # (N, 768) DINOv2 — morphology + coverage
+    stain_np: np.ndarray  = kwargs["stain_features"]     # (N, d_s) H&E stain descriptor
     oracle_labels         = np.asarray(kwargs["oracle_labels"])
     num_classes: int      = kwargs["num_classes"]
     max_budget: int       = kwargs["max_budget"]
     device: torch.device  = kwargs["device"]
     chunk_size: int       = kwargs.get("chunk_size", 2000)
     num_rounds: int       = kwargs.get("num_rounds", 5)
-    tau: float            = kwargs.get("tau", 0.1)
     kappa: float          = kwargs.get("kappa", 1.0)
-    kappa_probe: float    = kwargs.get("kappa_probe", kwargs.get("kappa", 1.0))
-    beta: float           = kwargs.get("beta", 0.5)
-    seh_epochs: int       = kwargs.get("seh_epochs", 200)
-    seh_lr: float         = kwargs.get("seh_lr", 1e-3)
     probe_epochs: int     = kwargs.get("probe_epochs", 50)
     probe_lr: float       = kwargs.get("probe_lr", 1e-3)
-    use_dissonance: bool  = kwargs.get("use_dissonance", True)
-    dual_evidence: bool   = kwargs.get("dual_evidence", True)
+    use_conflict: bool    = kwargs.get("use_conflict", True)
     diag: bool            = kwargs.get("diag", True)
     n_sigma: int          = kwargs.get("n_sigma", 2000)
 
     from trainer import train_linear
 
-    if tau <= 0.0:
-        tau = 0.1
     N = dino_np.shape[0]
     L = num_classes
     B = min(max_budget, N)
     T = max(1, min(num_rounds, B))
-    seh_min = kwargs.get("seh_min", max(2 * L, 16))
 
     base, rem = divmod(B, T)
     sizes = [base + (1 if r < rem else 0) for r in range(T)]
 
-    # ---- DINOv2 coverage space ----
+    # ---- DINOv2 morphology / coverage space ----
     features = F.normalize(
         torch.tensor(dino_np, device=device, dtype=torch.float32), p=2, dim=1
     )
@@ -341,20 +264,11 @@ def scalpel_sampling(**kwargs) -> List[int]:
     sigma = _adaptive_sigma(features, n_ref=n_sigma)
     K_n = torch.zeros(N, device=device, dtype=torch.float32)
 
-    # ---- PLIP semantic space: zero-shot posterior + similarity vectors ----
-    vlm = F.normalize(torch.tensor(vlm_np, device=device, dtype=torch.float32), p=2, dim=1)
-    txt = F.normalize(torch.tensor(text_np, device=device, dtype=torch.float32), p=2, dim=1)
-    sim_all = torch.matmul(vlm, txt.T)
-    p_vlm = F.softmax(sim_all / tau, dim=1).cpu().numpy().astype(np.float32)
-    sim_np = sim_all.cpu().numpy().astype(np.float32)
-    vlm_np_norm = vlm.cpu().numpy().astype(np.float32)
-    H_vlm = _entropy(p_vlm)
-    del vlm, txt, sim_all
-    clear_memory()
-
-    if diag:
-        zs_acc = float((p_vlm.argmax(1) == oracle_labels).mean())
-        print(f"[DIAG b={B}] PLIP zero-shot acc={zs_acc:.4f} (L={L}, chance={1.0/L:.3f})")
+    # ---- stain descriptor: z-score so the linear probe sees comparable scales ----
+    stain_z = stain_np.astype(np.float32)
+    mu = stain_z.mean(0, keepdims=True)
+    sd = stain_z.std(0, keepdims=True) + 1e-6
+    stain_z = (stain_z - mu) / sd
 
     selected_indices: List[int] = []
     selected_set: set = set()
@@ -367,38 +281,35 @@ def scalpel_sampling(**kwargs) -> List[int]:
         if r == 0 or len(selected_indices) < 2:
             W = torch.ones(N, device=device, dtype=torch.float32)        # cold: pure coverage
         else:
-            # ---- VLM evidence strength λ_SEH ----
-            if len(selected_indices) >= seh_min:
-                seh = _train_seh(
-                    vlm_np_norm[selected_indices], sim_np[selected_indices],
-                    p_vlm[selected_indices], oracle_labels[selected_indices],
-                    device, epochs=seh_epochs, lr=seh_lr, beta=beta,
-                )
-                lam_seh = _seh_lambda(seh, vlm_np_norm, sim_np, device)
-                del seh
-                clear_memory()
+            sel = selected_indices
+            y = oracle_labels[sel]
+
+            # Morphology view (eval space) — DINOv2 probe
+            probe_m = train_linear(feat_np[sel], y, L, probe_epochs, probe_lr, device)
+            p_m = probe_m.predict_proba(feat_np, device)
+            u_m, b_m = _opinion(p_m, kappa)
+            del probe_m
+
+            # Stain view — H&E colour-deconvolution probe
+            probe_s = train_linear(stain_z[sel], y, L, probe_epochs, probe_lr, device)
+            p_s = probe_s.predict_proba(stain_z, device)
+            u_s, b_s = _opinion(p_s, kappa)
+            del probe_s
+            clear_memory()
+
+            conflict = _cross_conflict(u_m, b_m, u_s, b_s)
+
+            if diag:
+                acc_m = float((p_m.argmax(1) == oracle_labels).mean())
+                acc_s = float((p_s.argmax(1) == oracle_labels).mean())
+                print(f"[DIAG b={B} r={r}] probe_M acc={acc_m:.3f} | probe_S(stain) acc={acc_s:.3f} "
+                      f"| mean_conflict={conflict.mean():.4f} max={conflict.max():.4f}")
+
+            t = r / max(1, T - 1)                                         # explore -> reconcile
+            if use_conflict:
+                w_np = (1.0 - t) * _minmax(u_m) + t * _minmax(conflict)
             else:
-                lam_seh = kappa / (H_vlm + 0.1)                          # uncalibrated fallback
-
-            # ---- DINOv2-probe evidence (eval-aligned), weight grows by round ----
-            m = (r / max(1, T - 1)) if dual_evidence else 0.0
-            p_dino = lam_probe = None
-            if m > 0.0:
-                probe = train_linear(
-                    feat_np[selected_indices], oracle_labels[selected_indices],
-                    L, probe_epochs, probe_lr, device,
-                )
-                p_dino = probe.predict_proba(feat_np, device)
-                lam_probe = kappa_probe / (_entropy(p_dino) + 0.1)
-                if diag:
-                    print(f"[DIAG b={B} r={r}] m={m:.2f} "
-                          f"DINOv2-probe acc={float((p_dino.argmax(1) == oracle_labels).mean()):.4f}")
-                del probe
-                clear_memory()
-
-            vac, dis = _evidence_dual(p_vlm, lam_seh, p_dino, lam_probe, m)
-            t = r / max(1, T - 1)                                        # explore -> refine
-            w_np = (1.0 - t) * _minmax(vac) + t * _minmax(dis) if use_dissonance else _minmax(vac)
+                w_np = _minmax(u_m)
             W = torch.tensor(w_np, device=device, dtype=torch.float32)
             if float(W.max()) <= 0.0:
                 W = torch.ones(N, device=device, dtype=torch.float32)

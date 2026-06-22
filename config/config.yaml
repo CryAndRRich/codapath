@@ -84,17 +84,11 @@ samplers:
   scalpel:
     num_rounds: 5        # iterative AL rounds (like SaE T=5)
     chunk_size: 2000     # greedy coverage chunk size (DINOv2 space)
-    tau: 0.1             # PLIP zero-shot posterior temperature
-    kappa: 1.0           # VLM fallback evidence scale (λ=κ/H) when too few labels for SEH
-    kappa_probe: 1.0     # DINOv2-probe evidence scale (λ_probe=κ/H)
-    beta: 0.5            # SEH loss balance (SaE Eq.3)
-    seh_epochs: 200      # SEH training epochs per round
-    seh_lr: 0.001        # SEH Adam lr
-    probe_epochs: 50     # DINOv2 evidence-probe epochs per round
-    probe_lr: 0.001      # DINOv2 evidence-probe lr
-    dual_evidence: true  # false → VLM/SEH evidence only (v4 ablation)
-    use_dissonance: true # false → vacuity-only weighting
-    diag: true           # print PLIP zero-shot acc + per-round DINOv2-probe acc
+    kappa: 1.0           # evidence scale λ=κ/(H+0.1) for both views
+    probe_epochs: 50     # per-round linear probe epochs (morphology + stain)
+    probe_lr: 0.001      # per-round linear probe lr
+    use_conflict: true   # false → vacuity-only weighting (ablation)
+    diag: true           # print per-round morphology/stain probe acc + conflict stats
     n_sigma: 2000        # subsample size for adaptive sigma
 
 prompt_templates:

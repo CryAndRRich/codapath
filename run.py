@@ -71,8 +71,9 @@ def main(
     del dinov2
     clear_memory()
 
-    train_vlm_features = None
-    text_embeddings    = None
+    train_vlm_features   = None
+    text_embeddings      = None
+    train_stain_features = None
 
     if sampler_name == "codapath":
         from sampling.codapath import DualVLMExtractor, extract_text_features
@@ -92,16 +93,8 @@ def main(
         )
 
     if sampler_name == "scalpel":
-        from sampling.scalpel import PLIPExtractor, extract_plip_text_features
-        plip_name = model_cfg.get("vlm_secondary", "vinid/plip")
-        plip = PLIPExtractor(model_name=plip_name).to(device)
-        train_vlm_features = extract_image_features(train_loader, plip, device)
-        del plip
-        clear_memory()
-        text_embeddings = extract_plip_text_features(
-            data_descriptions, prompt_templates, class_names, device,
-            plip_model=plip_name,
-        )
+        from sampling.scalpel import extract_stain_features
+        train_stain_features = extract_stain_features(train_loader, device)
 
     master_selected = None
     if sampler_name in SLICEABLE_SAMPLERS:
@@ -129,8 +122,7 @@ def main(
             selected_indices = get_sampler(
                 name=sampler_name,
                 image_embeddings=train_features,
-                vlm_image_embeddings=train_vlm_features,   # None unless scalpel
-                text_embeddings=text_embeddings,           # None unless scalpel
+                stain_features=train_stain_features,       # None unless scalpel
                 oracle_labels=train_labels,
                 max_budget=budget,
                 num_classes=num_classes,
