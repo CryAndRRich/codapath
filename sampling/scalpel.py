@@ -1,34 +1,32 @@
-"""SCALPEL v4 — Iterative Evidential Coverage (round-based, VLM + label-aware).
+"""SCALPEL v5 — Dual-Evidence Iterative Coverage (round-based, label-aware).
 
-Design rationale (2026-06-12)
+Design rationale (2026-06-13)
 -----------------------------
-Earlier SCALPEL versions computed EDL vacuity directly from *raw* zero-shot PLIP
-similarity. The parent paper SaE shows precisely that raw VLM similarity is
-overconfident/miscalibrated — its core contribution, the Similarity Evidence
-Head (SEH), *recalibrates similarity using labels*. Skipping the SEH (v1-v3) is
-the exact failure mode SaE was written to fix, and it kept SCALPEL below UHerding
-and CODAPath.
+v1-v3 computed EDL vacuity from *raw* zero-shot PLIP similarity — the exact
+miscalibration SaE was written to fix (SaE's SEH recalibrates similarity *using
+labels*). v4 added a faithful SEH but kept the evidence *direction* p entirely in
+PLIP space, while the linear probe is trained/evaluated in DINOv2 space. So even
+SEH-calibrated vacuity/dissonance could point the wrong way when PLIP zero-shot
+is weak on a dataset — and UHerding/BADGE stayed ahead because their uncertainty
+lives in the SAME (DINOv2) space as evaluation.
 
-v4 is faithful to SaE and adds the missing batch-diversity SaE itself lists as
-future work ("combination with coverage/clustering"):
+v5 fuses BOTH evidence sources in one Dirichlet (evidence is additive in EDL):
 
-  Per target budget B, selection runs in T rounds of ~B/T (standard pool AL,
-  like SaE's T=5):
-    * Round 1 (cold, no labels): pure MaxHerding coverage in DINOv2 — diverse seed.
-    * Rounds 2..T: reveal labels of everything selected so far and TRAIN AN SEH
-      (SaE Eq. 3) to map PLIP similarity -> calibrated evidence strength lambda(x).
-      Build the Dirichlet alpha_k = lambda(x)*p_k + 1 (SaE Eq. 4) from the PLIP
-      zero-shot posterior p, and decompose it into VACUITY (explore rare/under-
-      covered classes) and DISSONANCE (refine decision boundaries, SaE Eqs. 5-6).
-      The next batch maximises evidence-weighted submodular coverage gain in
-      DINOv2, with SaE's dynamic explore->refine schedule across rounds.
+    e_k(x) = (1-m_r)·λ_SEH(x)·p_vlm_k(x)   +   m_r·λ_probe(x)·p_dino_k(x)
+    α_k(x) = e_k(x) + 1
 
-Two spaces, each where it belongs:
-  * PLIP (image + text)  -> semantic evidence (SEH-calibrated vacuity/dissonance).
-  * DINOv2               -> coverage kernel (the space the linear probe lives in).
+  * p_vlm : PLIP zero-shot posterior, λ_SEH from the SaE head (semantic prior).
+  * p_dino: DINOv2 linear-probe posterior trained on revealed labels (eval-space).
+  * m_r = r/(T-1) grows across rounds: COLD-START leans on the VLM prior, and as
+    labels accumulate the eval-aligned DINOv2 probe takes over (like UHerding).
 
-When too few labels exist to fit an SEH reliably (very low budgets), lambda falls
-back to the uncalibrated proxy kappa/(H+eps) so the round still runs.
+Vacuity (explore rare/under-covered) and dissonance (refine boundaries) are
+decomposed from the fused Dirichlet (SaE Eqs. 5-6) and drive an explore->refine
+schedule over a DINOv2 submodular-coverage objective — the batch diversity SaE
+itself lists as future work.
+
+Set `dual_evidence: false` to recover v4 (VLM/SEH evidence only) for ablation.
+Set `use_dissonance: false` for vacuity-only weighting.
 """
 
 from typing import Dict, List, Tuple
@@ -123,20 +121,13 @@ class _SEH(nn.Module):
 
 
 def _train_seh(
-    img_lab: np.ndarray,   # (n, d) PLIP image emb of labeled
-    sim_lab: np.ndarray,   # (n, L) similarity vectors of labeled
-    p_lab: np.ndarray,     # (n, L) VLM posterior of labeled
-    y_lab: np.ndarray,     # (n,)   oracle labels
-    device: torch.device,
-    epochs: int = 200,
-    lr: float = 1e-3,
-    beta: float = 0.5,
+    img_lab: np.ndarray, sim_lab: np.ndarray, p_lab: np.ndarray, y_lab: np.ndarray,
+    device: torch.device, epochs: int = 200, lr: float = 1e-3, beta: float = 0.5,
 ) -> _SEH:
     eps, eps_h = 1e-6, 0.1
     n, d = img_lab.shape
     L = p_lab.shape[1]
 
-    # detached targets from the frozen VLM posterior (SaE Eq. 3)
     l_cls = -np.log(np.clip(p_lab[np.arange(n), y_lab], eps, 1.0))          # difficulty
     H = -(p_lab * np.log(np.clip(p_lab, eps, 1.0))).sum(axis=1)            # entropy
     tgt_inv = torch.tensor(l_cls, device=device, dtype=torch.float32)
@@ -173,7 +164,7 @@ def _seh_lambda(seh: _SEH, img_all: np.ndarray, sim_all: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Evidential uncertainty: Dirichlet from (λ, posterior) — vacuity & dissonance
+# Dual-evidence Dirichlet — fuse VLM (SEH) + DINOv2 probe; vacuity & dissonance
 # ---------------------------------------------------------------------------
 
 def _minmax(x: np.ndarray) -> np.ndarray:
@@ -183,25 +174,47 @@ def _minmax(x: np.ndarray) -> np.ndarray:
     return (x - lo) / (hi - lo)
 
 
-def _evidence(p: np.ndarray, lam: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """alpha_k = lam*p_k + 1 (SaE Eq.4); return (vacuity, dissonance) (SaE Eqs.5-6)."""
+def _norm_rows(p: np.ndarray) -> np.ndarray:
+    p = np.clip(p, 1e-8, 1.0)
+    return p / p.sum(axis=1, keepdims=True)
+
+
+def _entropy(p: np.ndarray) -> np.ndarray:
+    p = np.clip(p, 1e-8, 1.0)
+    return -(p * np.log(p)).sum(axis=1)
+
+
+def _dissonance_from_belief(b: np.ndarray) -> np.ndarray:
+    """Dissonance (SaE Eq.6): conflict among competing belief masses."""
     eps = 1e-8
-    N, L = p.shape
-    p = np.clip(p, eps, 1.0)
-    p = p / p.sum(axis=1, keepdims=True)
-
-    S = lam + L                                       # Dirichlet strength (N,)
-    vacuity = L / S                                   # (N,)
-
-    b = (lam[:, None] * p) / S[:, None]               # belief masses (N, L)
+    L = b.shape[1]
     bi = b[:, :, None]
     bj = b[:, None, :]
     bal = 1.0 - np.abs(bi - bj) / (bi + bj + eps)
-    offdiag = 1.0 - np.eye(L, dtype=p.dtype)[None]
+    offdiag = 1.0 - np.eye(L, dtype=b.dtype)[None]
     num = (bj * bal * offdiag).sum(axis=2)
     den = (bj * offdiag).sum(axis=2) + eps
-    dissonance = (b * num / den).sum(axis=1)          # (N,)
+    return (b * num / den).sum(axis=1)
 
+
+def _evidence_dual(
+    p_vlm: np.ndarray, lam_seh: np.ndarray,
+    p_dino: np.ndarray, lam_probe: np.ndarray, m: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Fuse VLM (SEH) and DINOv2-probe evidence into one Dirichlet.
+
+    e_k = (1-m)·λ_seh·p_vlm_k + m·λ_probe·p_dino_k ; α_k = e_k + 1.
+    m=0 → VLM only (v4 behaviour); m=1 → DINOv2-probe only.
+    Returns (vacuity, dissonance) from the fused Dirichlet (SaE Eqs.5-6).
+    """
+    L = p_vlm.shape[1]
+    e = (1.0 - m) * (lam_seh[:, None] * _norm_rows(p_vlm))
+    if p_dino is not None and m > 0.0:
+        e = e + m * (lam_probe[:, None] * _norm_rows(p_dino))
+    S = e.sum(axis=1) + L                              # Σα = Σe + L
+    vacuity = L / S
+    b = e / S[:, None]                                 # belief = (α-1)/S = e/S
+    dissonance = _dissonance_from_belief(b)
     return vacuity.astype(np.float32), dissonance.astype(np.float32)
 
 
@@ -280,27 +293,34 @@ def _greedy_coverage_batch(
 
 
 # ---------------------------------------------------------------------------
-# Main sampling function — iterative, round-based
+# Main sampling function — iterative, round-based, dual evidence
 # ---------------------------------------------------------------------------
 
 @register_sampler("scalpel")
 def scalpel_sampling(**kwargs) -> List[int]:
-    dino_np: np.ndarray   = kwargs["image_embeddings"]        # (N, 768) DINOv2 — coverage space
+    dino_np: np.ndarray   = kwargs["image_embeddings"]        # (N, 768) DINOv2 — coverage + probe
     vlm_np:  np.ndarray   = kwargs["vlm_image_embeddings"]    # (N, 512) PLIP image — evidence
     text_np: np.ndarray   = kwargs["text_embeddings"]         # (L, 512) PLIP text prototypes
     oracle_labels         = np.asarray(kwargs["oracle_labels"])
     num_classes: int      = kwargs["num_classes"]
-    max_budget: int       = kwargs["max_budget"]              # target budget B for this call
+    max_budget: int       = kwargs["max_budget"]
     device: torch.device  = kwargs["device"]
     chunk_size: int       = kwargs.get("chunk_size", 2000)
     num_rounds: int       = kwargs.get("num_rounds", 5)
-    tau: float            = kwargs.get("tau", 0.1)            # VLM posterior temperature
-    kappa: float          = kwargs.get("kappa", 1.0)         # fallback λ scale
-    beta: float           = kwargs.get("beta", 0.5)          # SEH loss balance
+    tau: float            = kwargs.get("tau", 0.1)
+    kappa: float          = kwargs.get("kappa", 1.0)
+    kappa_probe: float    = kwargs.get("kappa_probe", kwargs.get("kappa", 1.0))
+    beta: float           = kwargs.get("beta", 0.5)
     seh_epochs: int       = kwargs.get("seh_epochs", 200)
     seh_lr: float         = kwargs.get("seh_lr", 1e-3)
+    probe_epochs: int     = kwargs.get("probe_epochs", 50)
+    probe_lr: float       = kwargs.get("probe_lr", 1e-3)
     use_dissonance: bool  = kwargs.get("use_dissonance", True)
+    dual_evidence: bool   = kwargs.get("dual_evidence", True)
+    diag: bool            = kwargs.get("diag", True)
     n_sigma: int          = kwargs.get("n_sigma", 2000)
+
+    from trainer import train_linear
 
     if tau <= 0.0:
         tau = 0.1
@@ -317,19 +337,24 @@ def scalpel_sampling(**kwargs) -> List[int]:
     features = F.normalize(
         torch.tensor(dino_np, device=device, dtype=torch.float32), p=2, dim=1
     )
+    feat_np = features.cpu().numpy()
     sigma = _adaptive_sigma(features, n_ref=n_sigma)
     K_n = torch.zeros(N, device=device, dtype=torch.float32)
 
-    # ---- PLIP semantic space: zero-shot posterior p and similarity vectors ----
+    # ---- PLIP semantic space: zero-shot posterior + similarity vectors ----
     vlm = F.normalize(torch.tensor(vlm_np, device=device, dtype=torch.float32), p=2, dim=1)
     txt = F.normalize(torch.tensor(text_np, device=device, dtype=torch.float32), p=2, dim=1)
-    sim_all = torch.matmul(vlm, txt.T)                       # (N, L) cosine similarity
-    p_all = F.softmax(sim_all / tau, dim=1).cpu().numpy().astype(np.float32)
+    sim_all = torch.matmul(vlm, txt.T)
+    p_vlm = F.softmax(sim_all / tau, dim=1).cpu().numpy().astype(np.float32)
     sim_np = sim_all.cpu().numpy().astype(np.float32)
     vlm_np_norm = vlm.cpu().numpy().astype(np.float32)
-    H_all = -(np.clip(p_all, 1e-8, 1.0) * np.log(np.clip(p_all, 1e-8, 1.0))).sum(axis=1)
+    H_vlm = _entropy(p_vlm)
     del vlm, txt, sim_all
     clear_memory()
+
+    if diag:
+        zs_acc = float((p_vlm.argmax(1) == oracle_labels).mean())
+        print(f"[DIAG b={B}] PLIP zero-shot acc={zs_acc:.4f} (L={L}, chance={1.0/L:.3f})")
 
     selected_indices: List[int] = []
     selected_set: set = set()
@@ -339,28 +364,41 @@ def scalpel_sampling(**kwargs) -> List[int]:
         if n_select <= 0:
             continue
 
-        # ---- evidence weights ------------------------------------------------
         if r == 0 or len(selected_indices) < 2:
             W = torch.ones(N, device=device, dtype=torch.float32)        # cold: pure coverage
         else:
+            # ---- VLM evidence strength λ_SEH ----
             if len(selected_indices) >= seh_min:
                 seh = _train_seh(
                     vlm_np_norm[selected_indices], sim_np[selected_indices],
-                    p_all[selected_indices], oracle_labels[selected_indices],
+                    p_vlm[selected_indices], oracle_labels[selected_indices],
                     device, epochs=seh_epochs, lr=seh_lr, beta=beta,
                 )
-                lam = _seh_lambda(seh, vlm_np_norm, sim_np, device)
+                lam_seh = _seh_lambda(seh, vlm_np_norm, sim_np, device)
                 del seh
                 clear_memory()
             else:
-                lam = kappa / (H_all + 0.1)                              # uncalibrated fallback
+                lam_seh = kappa / (H_vlm + 0.1)                          # uncalibrated fallback
 
-            vac, dis = _evidence(p_all, lam)
-            t = r / max(1, T - 1)                                        # 0 -> 1 across rounds
-            if use_dissonance:
-                w_np = (1.0 - t) * _minmax(vac) + t * _minmax(dis)       # explore -> refine
-            else:
-                w_np = _minmax(vac)
+            # ---- DINOv2-probe evidence (eval-aligned), weight grows by round ----
+            m = (r / max(1, T - 1)) if dual_evidence else 0.0
+            p_dino = lam_probe = None
+            if m > 0.0:
+                probe = train_linear(
+                    feat_np[selected_indices], oracle_labels[selected_indices],
+                    L, probe_epochs, probe_lr, device,
+                )
+                p_dino = probe.predict_proba(feat_np, device)
+                lam_probe = kappa_probe / (_entropy(p_dino) + 0.1)
+                if diag:
+                    print(f"[DIAG b={B} r={r}] m={m:.2f} "
+                          f"DINOv2-probe acc={float((p_dino.argmax(1) == oracle_labels).mean()):.4f}")
+                del probe
+                clear_memory()
+
+            vac, dis = _evidence_dual(p_vlm, lam_seh, p_dino, lam_probe, m)
+            t = r / max(1, T - 1)                                        # explore -> refine
+            w_np = (1.0 - t) * _minmax(vac) + t * _minmax(dis) if use_dissonance else _minmax(vac)
             W = torch.tensor(w_np, device=device, dtype=torch.float32)
             if float(W.max()) <= 0.0:
                 W = torch.ones(N, device=device, dtype=torch.float32)
