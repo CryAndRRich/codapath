@@ -1,36 +1,31 @@
-"""SCALPEL v6 — Stain<->Morphology Cross-View Evidential Conflict (pathology-specific).
+"""SCALPEL v7 — Stain-Perturbation Instability (pathology-specific).
 
-Motivation (2026-06-23)
------------------------
-v1-v5 borrowed SaE (VLM evidence) + UHerding (coverage). But (a) raw/zero-shot
-PLIP evidence lives in the wrong space and is weak on pathology, and (b) the
-"PLIP vs DINOv2" idea is NOT pathology-specific — it transfers verbatim to
-natural images (CLIP vs DINOv2). A reviewer asks: why pathology?
+Why this version (2026-06-23)
+-----------------------------
+v6 tried a stain<->morphology cross-view *conflict*. Diagnostics killed it: the
+stain probe classifies at 0.10-0.24 acc (chance 0.07) — stain is a NUISANCE, so a
+"stain classifier" is inherently weak and can never form a confident, meaningful
+second opinion. Cross-view conflict therefore degenerated to ~0.
 
-v6 anchors the novelty on the ONE property unique to H&E histopathology: STAIN.
-Stain is a nuisance factor *confounded* with class — a good cold-start sample is
-one where the model has not yet separated biology (morphology) from stain (color).
+v7 uses stain the way its nature demands — as a NUISANCE to perturb, not a signal
+to classify (this is DropQuery's feature-perturbation idea, but the perturbation
+is realistic H&E stain variation):
 
-Two complementary, label-trained evidential views of each patch:
-  * Morphology view (M): DINOv2 features -> linear probe -> posterior p_M.
-      "What does the tissue STRUCTURE look like?"  (this is the eval space)
-  * Stain view (S): H&E color-deconvolution descriptor -> linear probe -> p_S.
-      "What does the COLOR/STAIN look like?"
+  * Morphology probe p_M: DINOv2 linear probe trained on revealed labels (eval space).
+  * For each image we precompute DINOv2 features of K stain-PERTURBED versions
+    (HED stain augmentation: jitter H&E concentrations, re-encode).
+  * Stain-instability(x) = how much the probe's prediction DISAGREES across the
+    stain-perturbed views (BALD-style mutual information). High instability = the
+    model's decision flips with the stain => it relies on a stain shortcut for x
+    => labelling x teaches stain-invariant morphology. This needs NO stain
+    classifier, so it sidesteps v6's paradox.
 
-New acquisition signal = Dempster-Shafer CONFLICT between the two evidential
-opinions:  C(x) = (1-u_M)(1-u_S) - <b_M, b_S>.  C is high exactly when BOTH views
-are confident yet point to DIFFERENT classes — i.e. color says one thing but
-structure says another. Labelling those teaches the model to stop relying on
-stain shortcuts. This signal is meaningless for natural images (no stain) -> it
-does not transfer, unlike PLIP-vs-DINOv2.
+Round-based (T rounds): round 1 = pure coverage; rounds 2..T schedule
+explore (morphology vacuity) -> reconcile (stain-instability), over a DINOv2
+submodular-coverage objective. Stain-instability is meaningless for natural
+images (no stain) -> the novelty is genuinely pathology-specific.
 
-Round-based (T rounds, like SaE T=5):
-  * Round 1 (cold): pure MaxHerding coverage in DINOv2.
-  * Rounds 2..T: train both probes on revealed labels; schedule
-        explore (morphology vacuity, cover unknowns)  ->  reconcile (cross-view conflict).
-    Coverage stays as submodular batch-diversity (DINOv2).
-
-Ablation: `use_conflict: false` -> vacuity-only weighting.
+Ablation: `use_instability: false` -> vacuity-only weighting.
 """
 
 from typing import List, Tuple
@@ -45,66 +40,71 @@ from . import register_sampler
 
 
 # ---------------------------------------------------------------------------
-# Stain feature extraction — H&E color deconvolution (Ruifrok-Johnston)
+# H&E stain augmentation + DINOv2 features of stain-perturbed images
 # ---------------------------------------------------------------------------
 
-# Standard H&E (+ residual) stain optical-density vectors in RGB (rows = stains).
 _HE_OD = np.array([[0.65, 0.70, 0.29],
                    [0.07, 0.99, 0.11],
                    [0.27, 0.57, 0.78]], dtype=np.float64)
 _HE_OD = _HE_OD / np.linalg.norm(_HE_OD, axis=1, keepdims=True)
-_DECONV = np.linalg.inv(_HE_OD).astype(np.float32)   # OD(P,3) @ _DECONV -> concentrations(P,3)
+_DECONV = np.linalg.inv(_HE_OD).astype(np.float32)       # OD(P,3) @ _DECONV -> concentrations
+_HE_OD_F = _HE_OD.astype(np.float32)                     # concentrations(P,3) @ _HE_OD -> OD
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-@torch.no_grad()
-def extract_stain_features(loader, device: torch.device,
-                           mean=_IMAGENET_MEAN, std=_IMAGENET_STD,
-                           down: int = 64) -> np.ndarray:
-    """Per-image H&E stain descriptor from a (ImageNet-normalised) image loader.
+@torch.inference_mode()
+def extract_stain_perturbed_features(
+    loader, extractor, device: torch.device,
+    K: int = 3, sigma_alpha: float = 0.15, sigma_beta: float = 0.08,
+    mean=_IMAGENET_MEAN, std=_IMAGENET_STD,
+) -> np.ndarray:
+    """DINOv2 features of K independently stain-augmented versions of the pool.
 
-    Recovers raw RGB by inverting the loader normalisation, deconvolves into
-    Hematoxylin / Eosin concentration channels, and summarises each patch by a
-    compact stain/appearance descriptor (concentration + colour moments).
+    HED stain augmentation (Tellez et al.): recover raw RGB, deconvolve into H&E
+    concentrations, jitter each stain channel multiplicatively (1±σ_α) and
+    additively (±σ_β), re-compose to RGB, re-encode with the frozen encoder.
+    Returns array of shape (K, N, feat_dim).
     """
+    extractor = extractor.to(device).eval()
     mean_t = torch.tensor(mean, device=device).view(1, 3, 1, 1)
     std_t = torch.tensor(std, device=device).view(1, 3, 1, 1)
-    deconv = torch.tensor(_DECONV, device=device)            # (3,3)
+    M = torch.tensor(_HE_OD_F, device=device)
+    D = torch.tensor(_DECONV, device=device)
 
-    feats: List[np.ndarray] = []
-    for imgs, _ in tqdm(loader, desc="Stain feature extraction"):
-        imgs = imgs.to(device, non_blocking=True)
-        rgb = (imgs * std_t + mean_t).clamp(0.0, 1.0)        # raw RGB in [0,1]
-        if down and rgb.shape[-1] > down:
-            rgb = F.interpolate(rgb, size=(down, down), mode="bilinear", align_corners=False)
-        B = rgb.shape[0]
+    passes: List[np.ndarray] = []
+    for k in range(K):
+        feats: List[np.ndarray] = []
+        for imgs, _ in tqdm(loader, desc=f"Stain-aug DINOv2 pass {k+1}/{K}", leave=False):
+            imgs = imgs.to(device, non_blocking=True)
+            rgb = (imgs * std_t + mean_t).clamp(0.0, 1.0)
+            B, _, H, W = rgb.shape
 
-        I255 = rgb * 255.0
-        od = -torch.log10((I255 + 1.0) / 256.0).clamp(min=0.0)   # (B,3,H,W)
-        od_flat = od.permute(0, 2, 3, 1).reshape(B, -1, 3)        # (B,P,3)
-        C = torch.clamp(od_flat @ deconv, min=0.0)                # (B,P,3) [H,E,res]
+            I255 = rgb * 255.0
+            od = -torch.log10((I255 + 1.0) / 256.0).clamp(min=0.0)
+            odf = od.permute(0, 2, 3, 1).reshape(B, -1, 3)            # (B,P,3)
+            C = odf @ D                                               # concentrations
 
-        rgb_flat = rgb.permute(0, 2, 3, 1).reshape(B, -1, 3)      # (B,P,3)
-        sat = rgb_flat.max(-1).values - rgb_flat.min(-1).values   # (B,P)
-        od_mag = od_flat.sum(-1)                                  # (B,P)
-        tissue = (od_mag > 0.15).float().mean(1, keepdim=True)    # (B,1)
+            alpha = (torch.rand(B, 1, 3, device=device) * 2 - 1) * sigma_alpha + 1.0
+            beta = (torch.rand(B, 1, 3, device=device) * 2 - 1) * sigma_beta
+            Cp = C * alpha + beta
 
-        desc = torch.cat([
-            C.mean(1), C.std(1),               # H/E/res concentration mean+std (6)
-            rgb_flat.mean(1), rgb_flat.std(1), # colour mean+std (6)
-            sat.mean(1, keepdim=True),         # mean saturation (1)
-            tissue,                            # tissue fraction (1)
-        ], dim=1)                              # -> (B, 14)
-        feats.append(desc.cpu().numpy().astype(np.float32))
-        del imgs, rgb, od, od_flat, C, rgb_flat, sat, od_mag, desc
-    clear_memory()
-    return np.concatenate(feats, axis=0)
+            odp = torch.clamp(Cp @ M, min=0.0)
+            Ip = (256.0 * torch.pow(10.0, -odp) - 1.0).clamp(0.0, 255.0)
+            rgbp = (Ip / 255.0).reshape(B, H, W, 3).permute(0, 3, 1, 2)
+            normp = (rgbp - mean_t) / std_t
+
+            f = extractor(normp)
+            feats.append(f.cpu().numpy().astype(np.float32))
+            del imgs, rgb, od, odf, C, Cp, odp, Ip, rgbp, normp, f
+        passes.append(np.vstack(feats))
+        clear_memory()
+    return np.stack(passes, axis=0)                                   # (K, N, feat_dim)
 
 
 # ---------------------------------------------------------------------------
-# Evidential helpers — Dirichlet opinion + Dempster-Shafer cross-view conflict
+# Evidential / uncertainty helpers
 # ---------------------------------------------------------------------------
 
 def _minmax(x: np.ndarray) -> np.ndarray:
@@ -124,31 +124,25 @@ def _entropy(p: np.ndarray) -> np.ndarray:
     return -(p * np.log(p)).sum(axis=1)
 
 
-def _opinion(p: np.ndarray, kappa: float) -> Tuple[np.ndarray, np.ndarray]:
-    """From a calibrated posterior, build a Dirichlet opinion.
-
-    λ(x)=κ/(H[p]+0.1) ties evidence to probe certainty; α_k=λ·p_k+1.
-    Returns (vacuity u=L/S, belief masses b_k=(α_k-1)/S).
-    """
+def _vacuity(p: np.ndarray, kappa: float) -> np.ndarray:
+    """Dirichlet vacuity from a posterior; λ=κ·L/(H+0.1), u=L/(λ+L)."""
     p = _norm_rows(p)
     L = p.shape[1]
-    lam = kappa / (_entropy(p) + 0.1)
-    S = lam + L
-    u = (L / S).astype(np.float32)
-    b = (lam[:, None] * p) / S[:, None]
-    return u, b.astype(np.float32)
+    lam = kappa * L / (_entropy(p) + 0.1)
+    return (L / (lam + L)).astype(np.float32)
 
 
-def _cross_conflict(u_m, b_m, u_s, b_s) -> np.ndarray:
-    """Dempster-Shafer conflict between two opinions: mass on contradictory classes.
+def _stain_instability(views: List[np.ndarray]) -> np.ndarray:
+    """BALD-style disagreement of the probe across stain-perturbed views.
 
-    C = Σ_{i≠j} b_m_i·b_s_j = (1-u_m)(1-u_s) − Σ_k b_m_k·b_s_k  ∈ [0,1).
-    High only when BOTH views are confident (low vacuity) and point to
-    DIFFERENT classes.
+    I = H[mean_v p_v] - mean_v H[p_v]  >= 0. High when each view is confident but
+    the prediction CHANGES across stain perturbations (stain-dependent decision).
     """
-    agree = (b_m * b_s).sum(axis=1)
-    conflict = (1.0 - u_m) * (1.0 - u_s) - agree
-    return np.clip(conflict, 0.0, None).astype(np.float32)
+    P = np.stack([_norm_rows(p) for p in views], axis=0)   # (V, N, L)
+    p_bar = P.mean(axis=0)                                  # (N, L)
+    h_bar = _entropy(p_bar)                                 # (N,)
+    h_mean = np.stack([_entropy(P[v]) for v in range(P.shape[0])], 0).mean(0)
+    return np.clip(h_bar - h_mean, 0.0, None).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -186,10 +180,7 @@ def _greedy_coverage_batch(
     features: torch.Tensor, W: torch.Tensor, K_n: torch.Tensor, sigma: float,
     n_select: int, selected_set: set, chunk_size: int,
 ) -> List[int]:
-    """Pick `n_select` points maximising Σ_n W_n·max(K(n,i) − K_n[n], 0).
-
-    Mutates K_n and selected_set in place; returns the new picks.
-    """
+    """Pick `n_select` points maximising Σ_n W_n·max(K(n,i) − K_n[n], 0)."""
     N = features.shape[0]
     picks: List[int] = []
     for _ in range(n_select):
@@ -226,13 +217,13 @@ def _greedy_coverage_batch(
 
 
 # ---------------------------------------------------------------------------
-# Main sampling function — iterative, round-based, cross-view conflict
+# Main sampling function — iterative, round-based, stain-instability
 # ---------------------------------------------------------------------------
 
 @register_sampler("scalpel")
 def scalpel_sampling(**kwargs) -> List[int]:
-    dino_np: np.ndarray   = kwargs["image_embeddings"]   # (N, 768) DINOv2 — morphology + coverage
-    stain_np: np.ndarray  = kwargs["stain_features"]     # (N, d_s) H&E stain descriptor
+    dino_np: np.ndarray   = kwargs["image_embeddings"]    # (N, 768) DINOv2 (morphology + coverage)
+    aug_np: np.ndarray    = kwargs["stain_aug_features"]  # (K, N, 768) stain-perturbed DINOv2
     oracle_labels         = np.asarray(kwargs["oracle_labels"])
     num_classes: int      = kwargs["num_classes"]
     max_budget: int       = kwargs["max_budget"]
@@ -242,7 +233,7 @@ def scalpel_sampling(**kwargs) -> List[int]:
     kappa: float          = kwargs.get("kappa", 1.0)
     probe_epochs: int     = kwargs.get("probe_epochs", 50)
     probe_lr: float       = kwargs.get("probe_lr", 1e-3)
-    use_conflict: bool    = kwargs.get("use_conflict", True)
+    use_instability: bool = kwargs.get("use_instability", True)
     diag: bool            = kwargs.get("diag", True)
     n_sigma: int          = kwargs.get("n_sigma", 2000)
 
@@ -256,7 +247,7 @@ def scalpel_sampling(**kwargs) -> List[int]:
     base, rem = divmod(B, T)
     sizes = [base + (1 if r < rem else 0) for r in range(T)]
 
-    # ---- DINOv2 morphology / coverage space ----
+    # ---- DINOv2 morphology / coverage space (L2-normalised) ----
     features = F.normalize(
         torch.tensor(dino_np, device=device, dtype=torch.float32), p=2, dim=1
     )
@@ -264,11 +255,12 @@ def scalpel_sampling(**kwargs) -> List[int]:
     sigma = _adaptive_sigma(features, n_ref=n_sigma)
     K_n = torch.zeros(N, device=device, dtype=torch.float32)
 
-    # ---- stain descriptor: z-score so the linear probe sees comparable scales ----
-    stain_z = stain_np.astype(np.float32)
-    mu = stain_z.mean(0, keepdims=True)
-    sd = stain_z.std(0, keepdims=True) + 1e-6
-    stain_z = (stain_z - mu) / sd
+    # stain-perturbed feature sets, normalised the same way as feat_np
+    K_aug = aug_np.shape[0]
+    aug_norm = [
+        (aug_np[k] / (np.linalg.norm(aug_np[k], axis=1, keepdims=True) + 1e-8)).astype(np.float32)
+        for k in range(K_aug)
+    ]
 
     selected_indices: List[int] = []
     selected_set: set = set()
@@ -282,34 +274,25 @@ def scalpel_sampling(**kwargs) -> List[int]:
             W = torch.ones(N, device=device, dtype=torch.float32)        # cold: pure coverage
         else:
             sel = selected_indices
-            y = oracle_labels[sel]
-
-            # Morphology view (eval space) — DINOv2 probe
-            probe_m = train_linear(feat_np[sel], y, L, probe_epochs, probe_lr, device)
-            p_m = probe_m.predict_proba(feat_np, device)
-            u_m, b_m = _opinion(p_m, kappa)
-            del probe_m
-
-            # Stain view — H&E colour-deconvolution probe
-            probe_s = train_linear(stain_z[sel], y, L, probe_epochs, probe_lr, device)
-            p_s = probe_s.predict_proba(stain_z, device)
-            u_s, b_s = _opinion(p_s, kappa)
-            del probe_s
+            probe = train_linear(feat_np[sel], oracle_labels[sel], L, probe_epochs, probe_lr, device)
+            p0 = probe.predict_proba(feat_np, device)                    # original prediction
+            p_views = [p0] + [probe.predict_proba(aug_norm[k], device) for k in range(K_aug)]
+            del probe
             clear_memory()
 
-            conflict = _cross_conflict(u_m, b_m, u_s, b_s)
+            vac = _vacuity(p0, kappa)                                    # explore (morphology)
+            instab = _stain_instability(p_views)                        # reconcile (stain-dependent)
 
             if diag:
-                acc_m = float((p_m.argmax(1) == oracle_labels).mean())
-                acc_s = float((p_s.argmax(1) == oracle_labels).mean())
-                print(f"[DIAG b={B} r={r}] probe_M acc={acc_m:.3f} | probe_S(stain) acc={acc_s:.3f} "
-                      f"| mean_conflict={conflict.mean():.4f} max={conflict.max():.4f}")
+                acc = float((p0.argmax(1) == oracle_labels).mean())
+                print(f"[DIAG b={B} r={r}] probe_M acc={acc:.3f} | u_M={vac.mean():.3f} "
+                      f"| stain-instab mean={instab.mean():.4f} max={instab.max():.4f}")
 
-            t = r / max(1, T - 1)                                         # explore -> reconcile
-            if use_conflict:
-                w_np = (1.0 - t) * _minmax(u_m) + t * _minmax(conflict)
+            t = r / max(1, T - 1)                                        # explore -> reconcile
+            if use_instability:
+                w_np = (1.0 - t) * _minmax(vac) + t * _minmax(instab)
             else:
-                w_np = _minmax(u_m)
+                w_np = _minmax(vac)
             W = torch.tensor(w_np, device=device, dtype=torch.float32)
             if float(W.max()) <= 0.0:
                 W = torch.ones(N, device=device, dtype=torch.float32)

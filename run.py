@@ -66,14 +66,26 @@ def main(
 
     vit_name      = model_cfg.get("vit", "facebook/dinov2-base")
     dinov2        = DINOv2Extractor(model_name=vit_name).to(device)
-    train_features = extract_image_features(train_loader, dinov2, device)  
-    test_features  = extract_image_features(test_loader,  dinov2, device)  
+    train_features = extract_image_features(train_loader, dinov2, device)
+    test_features  = extract_image_features(test_loader,  dinov2, device)
+
+    # SCALPEL needs DINOv2 features of stain-PERTURBED images (computed while the
+    # encoder is still loaded) to measure stain-instability of the morphology probe.
+    train_stain_aug_features = None
+    if sampler_name == "scalpel":
+        from sampling.scalpel import extract_stain_perturbed_features
+        train_stain_aug_features = extract_stain_perturbed_features(
+            train_loader, dinov2, device,
+            K=sampler_cfg.get("num_aug", 3),
+            sigma_alpha=sampler_cfg.get("sigma_alpha", 0.15),
+            sigma_beta=sampler_cfg.get("sigma_beta", 0.08),
+        )
+
     del dinov2
     clear_memory()
 
     train_vlm_features   = None
     text_embeddings      = None
-    train_stain_features = None
 
     if sampler_name == "codapath":
         from sampling.codapath import DualVLMExtractor, extract_text_features
@@ -91,10 +103,6 @@ def main(
             biomedbert_model=model_cfg.get("biomedbert",
                 "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"),
         )
-
-    if sampler_name == "scalpel":
-        from sampling.scalpel import extract_stain_features
-        train_stain_features = extract_stain_features(train_loader, device)
 
     master_selected = None
     if sampler_name in SLICEABLE_SAMPLERS:
@@ -122,7 +130,7 @@ def main(
             selected_indices = get_sampler(
                 name=sampler_name,
                 image_embeddings=train_features,
-                stain_features=train_stain_features,       # None unless scalpel
+                stain_aug_features=train_stain_aug_features,  # None unless scalpel
                 oracle_labels=train_labels,
                 max_budget=budget,
                 num_classes=num_classes,
