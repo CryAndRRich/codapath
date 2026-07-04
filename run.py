@@ -8,7 +8,7 @@ import torch
 
 from set_up import set_seed, clear_memory
 from load_data import get_data_loaders
-from model import DINOv2Extractor, extract_image_features
+from model import extract_image_features, get_or_extract_features
 from trainer import train_linear, save_model
 from sampling import get_sampler
 from evaluate import evaluate_model, palm_evaluate, format_palm_report
@@ -45,11 +45,13 @@ def main(
     save_dir: str,
     verbose: bool,
     model_cfg: Dict,
+    feature_cache_dir: str = "features",
 ) -> None:
 
     print(f"Device: {device}")
     set_seed(random_seed)
 
+    dataset_key = os.path.basename(save_dir)
     train_loader, test_loader, class_names = get_data_loaders(data_path, random_seed, verbose)
     train_dataset = train_loader.dataset
     test_dataset  = test_loader.dataset
@@ -65,11 +67,11 @@ def main(
         else np.array(test_dataset.dataset.targets)[test_dataset.indices]
     )
 
-    vit_name      = model_cfg.get("vit", "facebook/dinov2-base")
-    dinov2        = DINOv2Extractor(model_name=vit_name).to(device)
-    train_features = extract_image_features(train_loader, dinov2, device)
-    test_features  = extract_image_features(test_loader,  dinov2, device)
-    del dinov2
+    vit_name = model_cfg.get("vit", "facebook/dinov2-base")
+    train_features, test_features = get_or_extract_features(
+        train_loader, test_loader, dataset_key, random_seed, vit_name,
+        device, cache_dir=feature_cache_dir,
+    )
     clear_memory()
 
     train_vlm_features   = None
@@ -215,6 +217,7 @@ if __name__ == "__main__":
     parser.add_argument("--device",       type=str,  default=config.get("device", "cuda"))
     parser.add_argument("--probe_epochs", type=int,  default=training_cfg.get("probe_epochs", 100))
     parser.add_argument("--probe_lr",     type=float,default=training_cfg.get("probe_lr", 1e-3))
+    parser.add_argument("--feature_cache_dir", type=str, default=config.get("feature_cache_dir", "features"))
 
     args = parser.parse_args(remaining_argv)
 
@@ -246,4 +249,5 @@ if __name__ == "__main__":
         save_dir=os.path.join("checkpoints", dataset_key),
         verbose=args.verbose,
         model_cfg=model_cfg,
+        feature_cache_dir=args.feature_cache_dir,
     )
