@@ -82,17 +82,14 @@ samplers:
     chunk_size: 2000    
 
   scalpel:
-    num_rounds: 5         # iterative AL rounds (like SaE T=5)
-    chunk_size: 2000      # greedy coverage chunk size (DINOv2 space)
-    kappa: 1.0            # vacuity evidence scale λ=κ·L/(H+0.1)
-    probe_epochs: 50      # per-round morphology probe epochs
-    probe_lr: 0.001       # per-round morphology probe lr
-    num_aug: 3            # # stain-perturbed DINOv2 passes (precomputed once)
-    sigma_alpha: 0.15     # HED stain jitter — multiplicative (1±σ_α)
-    sigma_beta: 0.08      # HED stain jitter — additive (±σ_β)
-    use_instability: true # false → vacuity-only weighting (ablation)
-    diag: true            # print per-round probe acc + stain-instability stats
-    n_sigma: 2000         # subsample size for adaptive sigma
+    num_rounds: 5             # iterative AL rounds (like SaE T=5)
+    chunk_size: 2000          # greedy coverage chunk size (DINOv2 space)
+    kappa: 1.0                # vacuity evidence scale λ=κ·L/(H+0.1)
+    probe_epochs: 50          # per-round probe epochs (morphology + stain)
+    probe_lr: 0.001           # per-round probe lr
+    use_stain_discount: true  # false → plain margin uncertainty (ablation)
+    diag: true                # print probe acc + stain-shortcut hypothesis check
+    n_sigma: 2000             # subsample size for adaptive sigma
 
 prompt_templates:
   - "Photomicrograph showing {}."
