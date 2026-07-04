@@ -1,5 +1,4 @@
 import os
-from typing import List
 
 import numpy as np
 import torch
@@ -7,8 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-
-from set_up import clear_memory
 
 
 class LinearProbe(nn.Module):
@@ -64,57 +61,6 @@ def train_linear(features: np.ndarray,
             optimizer.step()
 
     return probe
-
-
-def train_knn_linear(all_features: np.ndarray,
-                     labeled_indices: List[int],
-                     labeled_labels: np.ndarray,
-                     num_classes: int,
-                     knn_k: int,
-                     knn_threshold: float,
-                     num_epochs: int,
-                     lr: float,
-                     device: torch.device) -> LinearProbe:
-    labeled_set = set(labeled_indices)
-    unlabeled_indices = [i for i in range(len(all_features)) if i not in labeled_set]
-
-    labeled_features = all_features[labeled_indices]
-    unlabeled_features = all_features[unlabeled_indices]
-
-    warm_probe = train_linear(labeled_features, labeled_labels, num_classes,
-                              max(1, num_epochs // 2), lr, device)
-
-    labeled_tensor = torch.tensor(labeled_features, device=device, dtype=torch.float32)
-    labeled_norm = F.normalize(labeled_tensor, p=2, dim=1)
-
-    unlabeled_tensor = torch.tensor(unlabeled_features, device=device, dtype=torch.float32)
-    unlabeled_norm = F.normalize(unlabeled_tensor, p=2, dim=1)
-
-    k = min(knn_k, len(labeled_indices))
-    sim = torch.matmul(unlabeled_norm, labeled_norm.T)            
-    _, topk_ids = torch.topk(sim, k=k, dim=1)                  
-    topk_ids_np = topk_ids.cpu().numpy()
-
-    pseudo_labels = np.array([
-        np.bincount(labeled_labels[topk_ids_np[i]], minlength=num_classes).argmax()
-        for i in range(len(unlabeled_indices))
-    ], dtype=np.int64)
-
-    del labeled_tensor, labeled_norm, unlabeled_tensor, unlabeled_norm, sim, topk_ids
-    clear_memory()
-
-    unlabeled_probs = warm_probe.predict_proba(unlabeled_features, device)
-    confident_mask = unlabeled_probs.max(axis=1) >= knn_threshold
-    del warm_probe
-
-    combined_features = np.vstack([labeled_features, unlabeled_features[confident_mask]])
-    combined_labels = np.concatenate([labeled_labels, pseudo_labels[confident_mask]])
-
-    final_probe = train_linear(combined_features, combined_labels, num_classes,
-                               num_epochs, lr, device)
-
-    clear_memory()
-    return final_probe
 
 
 def save_model(probe: LinearProbe, save_path: str) -> None:

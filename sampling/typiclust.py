@@ -75,7 +75,7 @@ def typiclust_sampling(**kwargs) -> List[int]:
 
     sort_keys = [(existing_count_per_cluster[c], -cluster_sizes[c]) for c in range(num_clusters)]
     sorted_clusters = sorted(range(num_clusters), key=lambda c: sort_keys[c])
-    valid_clusters = [c for c in sorted_clusters if cluster_sizes[c] > 1]
+    valid_clusters = [c for c in sorted_clusters if cluster_sizes[c] > 5]  # upstream MIN_CLUSTER_SIZE
 
     selected_indices = []
     selected_set = set(existing_labeled_indices)

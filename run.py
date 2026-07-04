@@ -9,16 +9,19 @@ import torch
 from set_up import set_seed, clear_memory
 from load_data import get_data_loaders
 from model import DINOv2Extractor, extract_image_features
-from trainer import train_linear, train_knn_linear
+from trainer import train_linear, save_model
 from sampling import get_sampler
 from evaluate import evaluate_model, palm_evaluate, format_palm_report
 
 
-SLICEABLE_SAMPLERS = {"random", "coreset", "codapath",
-                      "uncertainty_herding", "tcm", "refine"}
+# SLICEABLE: one greedy order at max_budget; smaller budgets are exact prefixes.
+SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm", "refine"}
 
-PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery"}
+# PER_BUDGET: selection depends on the budget (budget-scaled phase / #clusters /
+# centroids), so it must be re-run for every budget.
+PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding"}
 
+# ITERATIVE: re-run per budget with internal probe-refinement rounds.
 ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel"}
 
 
@@ -37,8 +40,6 @@ def main(
     sampler_cfg: Dict,
     probe_epochs: int,
     probe_lr: float,
-    knn_k: int,
-    knn_threshold: float,
     device: torch.device,
     random_seed: int,
     save_dir: str,
@@ -111,9 +112,8 @@ def main(
             kwargs["text_embeddings"] = text_embeddings
         master_selected = get_sampler(name=sampler_name, **kwargs)
 
-    palm_acc: Dict[str, Dict[int, float]] = {"linear": {}, "knn": {}}
-
-    results: Dict[str, Dict[int, Dict[str, float]]] = {"linear": {}, "knn": {}}
+    palm_acc: Dict[int, float] = {}
+    results: Dict[int, Dict[str, float]] = {}
 
     for budget in cumulative_budget:
         set_seed(random_seed)
@@ -154,64 +154,40 @@ def main(
         if verbose:
             print(f"\n── {sampler_name.upper()} | budget={budget} ──")
 
-        probe_linear = train_linear(
+        probe = train_linear(
             labeled_features, labeled_labels, num_classes,
             probe_epochs, probe_lr, device,
         )
-        if verbose:
-            print("  [linear]")
-        acc_l, pre_l, rec_l, f1_l = evaluate_model(probe_linear, test_features, test_labels, device)
-        palm_acc["linear"][budget] = acc_l
-        results["linear"][budget]  = {"acc": acc_l, "precision": pre_l, "recall": rec_l, "f1": f1_l}
+        acc, pre, rec, f1 = evaluate_model(probe, test_features, test_labels, device)
+        palm_acc[budget] = acc
+        results[budget]  = {"acc": acc, "precision": pre, "recall": rec, "f1": f1}
 
-        _save(
-            os.path.join(save_dir, f"{sampler_name}_probe_linear_budget_{budget}.pt"),
-            probe_linear,
-        )
-        del probe_linear
-        clear_memory()
-
-        probe_knn = train_knn_linear(
-            train_features, selected_indices, labeled_labels, num_classes,
-            knn_k, knn_threshold, probe_epochs, probe_lr, device,
-        )
-        if verbose:
-            print("  [knn_linear]")
-        acc_k, pre_k, rec_k, f1_k = evaluate_model(probe_knn, test_features, test_labels, device)
-        palm_acc["knn"][budget] = acc_k
-        results["knn"][budget]  = {"acc": acc_k, "precision": pre_k, "recall": rec_k, "f1": f1_k}
-
-        _save(
-            os.path.join(save_dir, f"{sampler_name}_probe_knn_budget_{budget}.pt"),
-            probe_knn,
-        )
-        del probe_knn
+        save_model(probe, os.path.join(save_dir, f"{sampler_name}_probe_budget_{budget}.pt"))
+        del probe
         clear_memory()
 
     _save(
         os.path.join(save_dir, f"{sampler_name}_results.pt"),
-        {"sampler": sampler_name, "budgets": cumulative_budget,
-         "linear": results["linear"], "knn": results["knn"]},
+        {"sampler": sampler_name, "budgets": cumulative_budget, "linear": results},
     )
 
     dataset_label = os.path.basename(save_dir)
 
-    for mode, acc_dict in palm_acc.items():
-        if len(acc_dict) < 4:
-            print(f"[PALM/{mode}] Skipped: need ≥ 4 budget points, got {len(acc_dict)}.")
-            continue
+    if len(palm_acc) < 4:
+        print(f"[PALM] Skipped: need ≥ 4 budget points, got {len(palm_acc)}.")
+    else:
         try:
             params = palm_evaluate(
-                budgets=list(acc_dict.keys()),
-                accuracies=list(acc_dict.values()),
+                budgets=list(palm_acc.keys()),
+                accuracies=list(palm_acc.values()),
             )
             if verbose:
                 print(format_palm_report(params, sampler_name, dataset_label))
-            palm_path = os.path.join(save_dir, f"{sampler_name}_palm_{mode}.pt")
+            palm_path = os.path.join(save_dir, f"{sampler_name}_palm.pt")
             _save(palm_path, params)
-            print(f"[PALM/{mode}] Saved → {palm_path}")
+            print(f"[PALM] Saved → {palm_path}")
         except Exception as e:
-            print(f"[PALM/{mode}] Fitting failed: {e}")
+            print(f"[PALM] Fitting failed: {e}")
 
 
 
@@ -239,8 +215,6 @@ if __name__ == "__main__":
     parser.add_argument("--device",       type=str,  default=config.get("device", "cuda"))
     parser.add_argument("--probe_epochs", type=int,  default=training_cfg.get("probe_epochs", 100))
     parser.add_argument("--probe_lr",     type=float,default=training_cfg.get("probe_lr", 1e-3))
-    parser.add_argument("--knn_k",        type=int,  default=training_cfg.get("knn_k", 5))
-    parser.add_argument("--knn_threshold",type=float,default=training_cfg.get("knn_threshold", 0.9))
 
     args = parser.parse_args(remaining_argv)
 
@@ -251,7 +225,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"Dataset      : {dataset_key.upper()} ({dataset_info['num_classes']} classes)")
     print(f"Sampler      : {args.sampler_name.upper()}")
-    print(f"Training     : linear + knn_linear (both modes)")
+    print(f"Training     : linear probe")
     print(f"Budget       : {config['cumulative_budget']}")
     print(f"ViT backbone : {model_cfg.get('vit', 'facebook/dinov2-base')}")
     print(f"Probe LR: {args.probe_lr} | Epochs: {args.probe_epochs}")
@@ -267,8 +241,6 @@ if __name__ == "__main__":
         sampler_cfg=sampler_cfg,
         probe_epochs=args.probe_epochs,
         probe_lr=args.probe_lr,
-        knn_k=args.knn_k,
-        knn_threshold=args.knn_threshold,
         device=torch.device(args.device),
         random_seed=args.seed,
         save_dir=os.path.join("checkpoints", dataset_key),

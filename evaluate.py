@@ -317,8 +317,8 @@ def palm_evaluate(
 
     B_min, B_max = float(budgets_arr[0]), float(budgets_arr[-1])
     p0           = [float(np.max(accs_arr)), 0.1, 1.0, 1.0]
-    lower_bounds = [0.0,  0.0, -100.0, 0.0]
-    upper_bounds = [1.0,  1.0,  100.0, 5.0]
+    lower_bounds = [0.0,  0.0, -100.0,  0.0]
+    upper_bounds = [1.0,  1.0,  100.0, 10.0]
 
     def _model_for_fit(B, Amax, delta, alpha, beta):
         return _palm_model(B, Amax, delta, alpha, beta, b=b)

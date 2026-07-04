@@ -12,11 +12,8 @@ models:
   biomedbert: "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
 
 training:
-  mode: "linear"       
-  probe_epochs: 100    
-  probe_lr: 0.001     
-  knn_k: 5             
-  knn_threshold: 0.9   
+  probe_epochs: 100
+  probe_lr: 0.001
 
 samplers:
   random: {}
@@ -29,7 +26,7 @@ samplers:
     chunk_size: 10000
 
   activeft:
-    lr: 0.01
+    lr: 0.001          # paper/official default (was 0.01 = 10× too high)
     temperature: 0.07
     iterations: 100
     balance: 1.0
@@ -55,12 +52,6 @@ samplers:
     probe_lr: 0.001
     chunk_size: 2000   
 
-  dcom:
-    probe_epochs: 50
-    probe_lr: 0.001
-    competence_midpoint: 0.9  
-    competence_steepness: 30.0  
-
   tcm:
     probe_epochs: 50
     probe_lr: 0.001
@@ -76,10 +67,11 @@ samplers:
   refine:
     probe_epochs: 30
     probe_lr: 0.001
-    filter_rounds: 3     
-    filter_alpha: 0.4    
-    filter_batches: 5   
-    chunk_size: 2000    
+    filter_rounds: 5       # progressive-filter rounds (paper)
+    filter_alpha: 0.4      # subsample ratio per round (paper)
+    filter_batches: 5      # queries per strategy per round (paper uses ~10; raise if compute allows)
+    init_subset_size: 5000 # round-1 fixed subsample (paper)
+    chunk_size: 2000       # stage-2 UncertaintyHerding coverage chunk
 
   scalpel:
     num_rounds: 5             # iterative AL rounds (like SaE T=5)
