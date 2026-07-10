@@ -138,6 +138,23 @@ def _minmax(x: np.ndarray) -> np.ndarray:
     return (x - lo) / (hi - lo)
 
 
+def _rank_normalize(x: np.ndarray) -> np.ndarray:
+    """Rank-normalize to [0,1] (ties broken by index order).
+
+    `mean unc` sits saturated near 0.9-0.99 across almost every round in the
+    logged diagnostics — minmax on a near-constant distribution amplifies
+    noise in the tiny remaining spread instead of preserving real ordering.
+    Rank-normalize is scale-invariant to that saturation. Same fix this
+    codebase already used once for the same reason (v2 EDL rank-normalize,
+    see .claude/scalpel_context.md). Ablation-gated via `use_rank_normalize`
+    (default False) — untested against real accuracy yet, test independently
+    of `use_adaptive_cap`.
+    """
+    order = np.argsort(np.argsort(x))
+    n = len(x)
+    return (order / max(1, n - 1)).astype(np.float32)
+
+
 def _norm_rows(p: np.ndarray) -> np.ndarray:
     p = np.clip(p, 1e-8, 1.0)
     return p / p.sum(axis=1, keepdims=True)
@@ -254,6 +271,7 @@ def scalpel_sampling(**kwargs) -> List[int]:
     diag: bool            = kwargs.get("diag", True)
     n_sigma: int          = kwargs.get("n_sigma", 2000)
     use_adaptive_cap: bool         = kwargs.get("use_adaptive_cap", True)
+    use_rank_normalize: bool       = kwargs.get("use_rank_normalize", False)
     gap_trend_thresh: float        = kwargs.get("gap_trend_thresh", 0.005)
     gap_abs_thresh: float          = kwargs.get("gap_abs_thresh", 0.03)
     t_cap_value: float             = kwargs.get("t_cap_value", 0.4)
@@ -338,7 +356,8 @@ def scalpel_sampling(**kwargs) -> List[int]:
                       f"| mean unc={unc.mean():.3f} reconcile={reconcile.mean():.3f} "
                       f"| t={t:.2f}{' [CAPPED]' if capped else ''}")
 
-            w_np = (1.0 - t) * _minmax(vac) + t * _minmax(reconcile)
+            normalize = _rank_normalize if use_rank_normalize else _minmax
+            w_np = (1.0 - t) * normalize(vac) + t * normalize(reconcile)
             W = torch.tensor(w_np, device=device, dtype=torch.float32)
             if float(W.max()) <= 0.0:
                 W = torch.ones(N, device=device, dtype=torch.float32)
