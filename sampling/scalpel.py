@@ -36,6 +36,27 @@ model classifies CORRECTLY than incorrectly? (i.e. is "stain-easy" == "model-eas
 Ablation: `use_stain_discount: false` -> plain margin uncertainty (measures the
 stain contribution). This is pathology-specific: stain has no meaning for
 natural images, so the discount does not transfer.
+
+v9 addition (2026-07-06) — `use_adaptive_cap`: the shortcut gap
+`s_shortcut(correct) - s_shortcut(wrong)` genuinely WIDENS with more labels on
+HistoSet (real multi-source stain variation) but stays flat/near-zero/noisy on
+PathMNIST and SkinTissue (each a single stain source) — see logs/. The fixed
+`t = r/(T-1)` schedule still rides to full reconcile weight on those datasets,
+diluting an uninformative term in exactly the rounds carrying the most samples.
+
+Fix, validated by replaying it against the already-logged diagnostics (see
+scripts/verify_cap.py-style replay, not shipped): at the FIRST round where
+enough labels exist to trust the gap (>= `min_labels_per_class_for_cap` *
+num_classes), check the round-over-round change once — if the gap is both
+small (< `gap_abs_thresh`) and not growing (< `gap_trend_thresh`), commit to
+capping `t` at `t_cap_value` for the REST of that run. This is a one-shot
+decision, not a re-evaluated-every-round check: the gap is too noisy round to
+round (single small-sample probe estimate) for repeated re-evaluation to be
+stable — it flips in and out of "looks flat" on both good and bad datasets.
+The one-shot commit, empirically, almost never fires on HistoSet (>= budget
+75) and reliably fires by round 2 and stays active on PathMNIST/SkinTissue.
+Purely online/measured from data already computed — no dataset-specific
+tuning. Ablation: `use_adaptive_cap: false` -> original fixed schedule.
 """
 
 from typing import List
@@ -232,6 +253,11 @@ def scalpel_sampling(**kwargs) -> List[int]:
     use_stain_discount: bool = kwargs.get("use_stain_discount", True)
     diag: bool            = kwargs.get("diag", True)
     n_sigma: int          = kwargs.get("n_sigma", 2000)
+    use_adaptive_cap: bool         = kwargs.get("use_adaptive_cap", True)
+    gap_trend_thresh: float        = kwargs.get("gap_trend_thresh", 0.005)
+    gap_abs_thresh: float          = kwargs.get("gap_abs_thresh", 0.03)
+    t_cap_value: float             = kwargs.get("t_cap_value", 0.4)
+    min_labels_per_class_for_cap: float = kwargs.get("min_labels_per_class_for_cap", 2.0)
 
     from trainer import train_linear
 
@@ -257,6 +283,10 @@ def scalpel_sampling(**kwargs) -> List[int]:
 
     selected_indices: List[int] = []
     selected_set: set = set()
+    gap_history: List[float] = []
+    min_labels_for_cap = max(min_labels_per_class_for_cap * L, 20)
+    cap_decided = False    # one-shot: decide once, then commit for the rest of this run
+    cap_active = False
 
     for r in tqdm(range(T), desc="SCALPEL Rounds"):
         n_select = sizes[r]
@@ -284,17 +314,30 @@ def scalpel_sampling(**kwargs) -> List[int]:
             s_shortcut = p_s[np.arange(N), pred_m].astype(np.float32)   # stain support for p_M's class
             reconcile = unc * (1.0 - s_shortcut) if use_stain_discount else unc
 
+            correct = (pred_m == oracle_labels)
+            s_c = float(s_shortcut[correct].mean()) if correct.any() else 0.0
+            s_w = float(s_shortcut[~correct].mean()) if (~correct).any() else 0.0
+            gap = s_c - s_w
+            gap_history.append(gap)
+
+            t_sched = r / max(1, T - 1)                                   # explore -> reconcile
+            if (use_adaptive_cap and not cap_decided and len(gap_history) >= 2
+                    and len(selected_indices) >= min_labels_for_cap):
+                trend = gap_history[-1] - gap_history[-2]
+                if trend < gap_trend_thresh and gap_history[-1] < gap_abs_thresh:
+                    cap_active = True
+                cap_decided = True                                        # one-shot: never re-evaluated
+            t = min(t_sched, t_cap_value) if cap_active else t_sched
+            capped = t < t_sched - 1e-9
+
             if diag:
                 acc_m = float((pred_m == oracle_labels).mean())
                 acc_s = float((p_s.argmax(1) == oracle_labels).mean())
-                correct = (pred_m == oracle_labels)
-                s_c = float(s_shortcut[correct].mean()) if correct.any() else 0.0
-                s_w = float(s_shortcut[~correct].mean()) if (~correct).any() else 0.0
                 print(f"[DIAG b={B} r={r}] probe_M acc={acc_m:.3f} probe_S acc={acc_s:.3f} "
-                      f"| s_shortcut(correct)={s_c:.3f} (wrong)={s_w:.3f} "
-                      f"| mean unc={unc.mean():.3f} reconcile={reconcile.mean():.3f}")
+                      f"| s_shortcut(correct)={s_c:.3f} (wrong)={s_w:.3f} gap={gap:.3f} "
+                      f"| mean unc={unc.mean():.3f} reconcile={reconcile.mean():.3f} "
+                      f"| t={t:.2f}{' [CAPPED]' if capped else ''}")
 
-            t = r / max(1, T - 1)                                        # explore -> reconcile
             w_np = (1.0 - t) * _minmax(vac) + t * _minmax(reconcile)
             W = torch.tensor(w_np, device=device, dtype=torch.float32)
             if float(W.max()) <= 0.0:

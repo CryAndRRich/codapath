@@ -82,6 +82,11 @@ samplers:
     use_stain_discount: true  # false → plain margin uncertainty (ablation)
     diag: true                # print probe acc + stain-shortcut hypothesis check
     n_sigma: 2000             # subsample size for adaptive sigma
+    use_adaptive_cap: true              # false → original fixed t=r/(T-1) schedule (ablation)
+    gap_trend_thresh: 0.005             # round-over-round gap growth below this = "not widening"
+    gap_abs_thresh: 0.03                # gap below this = "shortcut too weak to trust"
+    t_cap_value: 0.4                    # cap on t once adaptive cap triggers
+    min_labels_per_class_for_cap: 2.0   # min avg labels/class before trusting the gap estimate
 
 prompt_templates:
   - "Photomicrograph showing {}."
