@@ -22,7 +22,7 @@ SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm", "refine"}
 PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding"}
 
 # ITERATIVE: re-run per budget with internal probe-refinement rounds.
-ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel"}
+ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel", "scalpel_multiscale"}
 
 
 def _save(path: str, obj) -> None:
@@ -74,13 +74,22 @@ def main(
     )
     clear_memory()
 
-    train_vlm_features   = None
-    text_embeddings      = None
-    train_stain_features = None
+    train_vlm_features        = None
+    text_embeddings           = None
+    train_stain_features      = None
+    train_multiscale_features = None
 
     if sampler_name == "scalpel":
         from sampling.scalpel import extract_stain_features
         train_stain_features = extract_stain_features(train_loader, device)
+
+    if sampler_name == "scalpel_multiscale":
+        from sampling.scalpel_multiscale import get_or_extract_multiscale_features
+        scale_factors = sampler_cfg.get("scale_factors", [2, 4])
+        train_multiscale_features = get_or_extract_multiscale_features(
+            train_loader, dataset_key, random_seed, vit_name, scale_factors,
+            device, cache_dir=feature_cache_dir,
+        )
 
     if sampler_name == "codapath":
         from sampling.codapath import DualVLMExtractor, extract_text_features
@@ -124,7 +133,8 @@ def main(
             selected_indices = get_sampler(
                 name=sampler_name,
                 image_embeddings=train_features,
-                stain_features=train_stain_features,          # None unless scalpel
+                stain_features=train_stain_features,                    # None unless scalpel
+                multiscale_features=train_multiscale_features,          # None unless scalpel_multiscale
                 oracle_labels=train_labels,
                 max_budget=budget,
                 num_classes=num_classes,

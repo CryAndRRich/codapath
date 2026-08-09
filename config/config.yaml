@@ -89,6 +89,17 @@ samplers:
     min_labels_per_class_for_cap: 2.0   # min avg labels/class before trusting the gap estimate
     use_rank_normalize: true           # true → rank-normalize vac/reconcile instead of minmax (test independently of use_adaptive_cap)
 
+  scalpel_multiscale:
+    num_rounds: 5
+    chunk_size: 2000
+    probe_epochs: 50
+    probe_lr: 0.001
+    scale_factors: [2, 4]
+    fusion_mode: "disagreement"   # "disagreement" (Ver 1) | "concat" (Ver 2)
+    feature_fusion: "concat"      # only used when fusion_mode="concat": "concat" | "sum"
+    diag: true
+    n_sigma: 2000
+
 prompt_templates:
   - "Photomicrograph showing {}."
   - "Histopathology of {}."
