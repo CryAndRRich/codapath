@@ -97,6 +97,7 @@ samplers:
     scale_factors: [2, 4]
     fusion_mode: "disagreement"   # "disagreement" (Ver 1) | "concat" (Ver 2)
     feature_fusion: "concat"      # only used when fusion_mode="concat": "concat" | "sum"
+    coverage_space: "original"    # "original" (default, matches earlier runs) | "combined" (all 3 scales concatenated)
     diag: true
     n_sigma: 2000
 

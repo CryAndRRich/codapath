@@ -6,9 +6,13 @@ original, upscaled x2 then center-cropped back to the input size (zoomed into
 roughly the center half of the field of view), upscaled x4 then center-cropped
 (zoomed further in) — each re-encoded by the same frozen DINOv2 backbone. The
 agreement/disagreement (or a fused representation) across these 3 views drives
-uncertainty; Coverage always comes from the original-scale DINOv2 features
-only, using the same UHerding-style weighted-herding greedy already used by
-`scalpel.py` (`Sigma_n W_n * max(K(n,i) - K_n, 0)`), unchanged.
+uncertainty; Coverage uses the same UHerding-style weighted-herding greedy
+already used by `scalpel.py` (`Sigma_n W_n * max(K(n,i) - K_n, 0)`), unchanged,
+over one of two feature spaces selected via `coverage_space`:
+  - "original" (default): original-scale DINOv2 features only.
+  - "combined": all 3 scales' DINOv2 features concatenated (2304-dim) then
+    L2-normalized as a whole, before computing the same kernel/greedy.
+Either way, Coverage never touches the per-scale probes used for Uncertainty.
 
 Fixed contract for this experiment (locked, do not reintroduce v8/v9's
 explore->reconcile vacuity/`t` schedule here):
@@ -164,6 +168,7 @@ def scalpel_multiscale_sampling(**kwargs) -> List[int]:
     probe_lr: float = kwargs.get("probe_lr", 1e-3)
     fusion_mode: str = kwargs.get("fusion_mode", "disagreement")   # "disagreement" | "concat"
     feature_fusion: str = kwargs.get("feature_fusion", "concat")  # "concat" | "sum" (fusion_mode="concat" only)
+    coverage_space: str = kwargs.get("coverage_space", "original")  # "original" | "combined"
     diag: bool = kwargs.get("diag", True)
     n_sigma: int = kwargs.get("n_sigma", 2000)
 
@@ -177,16 +182,35 @@ def scalpel_multiscale_sampling(**kwargs) -> List[int]:
     base, rem = divmod(B, T)
     sizes = [base + (1 if r < rem else 0) for r in range(T)]
 
-    # ---- DINOv2 morphology / coverage space (original scale) ----
-    features = F.normalize(
+    # ---- original-scale DINOv2 features — always the "scale 1" view used by
+    # the uncertainty probes, independent of coverage_space ----
+    orig_feat_np = F.normalize(
         torch.tensor(dino_np, device=device, dtype=torch.float32), p=2, dim=1
+    ).cpu().numpy()
+
+    # ---- Coverage feature space: original-scale only, or all 3 scales
+    # concatenated (raw, then L2-normalized as a whole — NOT built from
+    # already-unit-norm sub-vectors, which would inflate the dot product and
+    # break the cosine-similarity assumption inside _k_gaussian) ----
+    if coverage_space == "combined":
+        cov_source = np.concatenate(
+            [dino_np] + [scale_feats[s] for s in sorted(scale_feats)], axis=1
+        )
+    else:
+        cov_source = dino_np
+    features = F.normalize(
+        torch.tensor(cov_source, device=device, dtype=torch.float32), p=2, dim=1
     )
-    feat_np = features.cpu().numpy()
     sigma = _adaptive_sigma(features, n_ref=n_sigma)
     K_n = torch.zeros(N, device=device, dtype=torch.float32)
 
-    # ---- per-scale L2-normalized feature dict (scale 1 = original) ----
-    scale_feat_np: Dict[int, np.ndarray] = {1: feat_np}
+    if diag:
+        print(f"[DIAG-MS setup] coverage_space={coverage_space} "
+              f"(feature dim={features.shape[1]}) fusion_mode={fusion_mode}")
+
+    # ---- per-scale L2-normalized feature dict (scale 1 = original) — used
+    # ONLY for the uncertainty probes, independent of coverage_space ----
+    scale_feat_np: Dict[int, np.ndarray] = {1: orig_feat_np}
     for s, arr in scale_feats.items():
         t = F.normalize(torch.tensor(arr, device=device, dtype=torch.float32), p=2, dim=1)
         scale_feat_np[s] = t.cpu().numpy()
