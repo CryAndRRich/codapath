@@ -9,8 +9,7 @@ from set_up import clear_memory
 from . import register_sampler
 
 
-@register_sampler("uncertainty_herding")
-def uncertainty_herding_sampling(**kwargs) -> List[int]:
+def _uherding_sampling_with_type(uncertainty_type: str, **kwargs) -> List[int]:
     image_embeddings = kwargs["image_embeddings"]
     oracle_labels = kwargs["oracle_labels"]
     max_budget = kwargs["max_budget"]
@@ -19,15 +18,23 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
     probe_lr = kwargs.get("probe_lr", 1e-3)
     device = kwargs["device"]
     chunk_size = kwargs.get("chunk_size", 2000)
+    
+    # CEC specific
+    cec_n = kwargs.get("cec_n", 30)
+    cec_k = kwargs.get("cec_k", 20)
+    cec_beta = kwargs.get("cec_beta", 1.0)
 
     from trainer import train_linear
 
     num_samples = image_embeddings.shape[0]
-    step_budget = max(num_classes, int(0.2 * max_budget))
+    
+    # 5 rounds -> train at 20%, 40%, 60%, 80% of max_budget
+    train_steps = [int((i + 1) * max_budget / 5) for i in range(4)]
 
     features = torch.tensor(image_embeddings, device=device, dtype=torch.float32)
     features = F.normalize(features, p=2, dim=1)
 
+    # Initial Sigma estimation
     n_ref = min(1000, num_samples)
     ref_idx = np.random.choice(num_samples, n_ref, replace=False)
     ref = features[ref_idx]                             
@@ -46,9 +53,10 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
     selected_indices: List[int] = []
     selected_set: set = set()
 
-    for step in tqdm(range(max_budget), desc="UHerding Selection"):
+    for step in tqdm(range(max_budget), desc=f"UHerding {uncertainty_type.upper()} Selection"):
 
-        if step == step_budget and len(selected_indices) >= 2:
+        if step in train_steps and len(selected_indices) >= 2:
+            # Update Sigma based on selected points
             sel_feats = features[selected_indices]     
             sel_sim = torch.matmul(sel_feats, sel_feats.T)
             sel_dist = torch.sqrt(torch.clamp(2.0 - 2.0 * sel_sim, min=0.0))
@@ -58,6 +66,7 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
             del sel_feats, sel_sim, sel_dist
             clear_memory()
 
+            # Recalculate k_running with new sigma
             k_running.zero_()
             for si in selected_indices:
                 si_feat = features[si].unsqueeze(0)     
@@ -71,6 +80,7 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
                     del chunk, sim_c, dist_sq_c, k_c
             clear_memory()
 
+            # Train linear probe and update U
             norm_embeddings = features.cpu().numpy()
             probe = train_linear(
                 norm_embeddings[selected_indices],
@@ -78,16 +88,61 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
                 num_classes, probe_epochs, probe_lr, device,
             )
             probs = probe.predict_proba(norm_embeddings, device)
-            s_probs = np.sort(probs, axis=1)
-            margin = s_probs[:, -1] - s_probs[:, -2]
-            U = torch.tensor(1.0 - margin, device=device, dtype=torch.float32)
+            
+            if uncertainty_type == "margin":
+                s_probs = np.sort(probs, axis=1)
+                margin = s_probs[:, -1] - s_probs[:, -2]
+                U = torch.tensor(1.0 - margin, device=device, dtype=torch.float32)
+                
+            elif uncertainty_type == "entropy":
+                entropy = -np.sum(probs * np.log(probs + 1e-9), axis=1) / np.log(num_classes)
+                U = torch.tensor(entropy, device=device, dtype=torch.float32)
+                
+            elif uncertainty_type == "cec":
+                probs_t = torch.tensor(probs, device=device, dtype=torch.float32)
+                
+                # Contextual Prior
+                P_c = torch.zeros(num_classes, device=device)
+                for c in range(num_classes):
+                    c_probs = probs_t[:, c]
+                    top_N = min(cec_n, num_samples)
+                    top_val, _ = torch.topk(c_probs, top_N)
+                    P_c[c] = top_val.mean()
+                P_c = torch.clamp(P_c, min=1e-6)
+                
+                # Calibrated Entropy
+                cal_probs = probs_t / P_c.unsqueeze(0)
+                cal_probs = cal_probs / cal_probs.sum(dim=1, keepdim=True)
+                H_cal = -torch.sum(cal_probs * torch.log(cal_probs + 1e-9), dim=1) / np.log(num_classes)
+                
+                # Neighbor uncertainty using cosine similarity
+                U_neighbor = torch.zeros(num_samples, device=device)
+                for cs in range(0, num_samples, chunk_size):
+                    ce = min(cs + chunk_size, num_samples)
+                    chunk = features[cs:ce]
+                    sim = torch.matmul(chunk, features.T)
+                    # Get top k+1 (including self), then exclude self
+                    top_k_sim, top_k_idx = torch.topk(sim, cec_k + 1, dim=1)
+                    for i in range(ce - cs):
+                        neighbors_idx = top_k_idx[i, 1:]
+                        weights = top_k_sim[i, 1:]
+                        weights = torch.clamp(weights, min=0.0)
+                        if weights.sum() > 0:
+                            weights = weights / weights.sum()
+                        else:
+                            weights = torch.ones_like(weights) / cec_k
+                        U_neighbor[cs + i] = torch.sum(H_cal[neighbors_idx] * weights)
+                
+                U = H_cal + cec_beta * U_neighbor
+            
+            else:
+                raise ValueError(f"Unknown uncertainty_type: {uncertainty_type}")
+
             del probe
             clear_memory()
 
-        best_idx = -1
-        best_score = -float("inf")
-        best_k_col = None
-
+        # Score = U * Coverage (both normalized)
+        coverage_gains = []
         for cs in range(0, num_samples, chunk_size):
             ce = min(cs + chunk_size, num_samples)
             cand = features[cs:ce]                     
@@ -96,20 +151,33 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
             dist_sq = torch.clamp(2.0 - 2.0 * sim, min=0.0)
             k_vals = torch.exp(-dist_sq / (sigma ** 2)) 
             gain = torch.clamp(k_vals - k_running.unsqueeze(1), min=0.0) 
-            scores = (U.unsqueeze(1) * gain).sum(dim=0) 
-
-            for si in selected_set:
-                if cs <= si < ce:
-                    scores[si - cs] = -float("inf")
-
-            local_best = torch.argmax(scores).item()
-            if scores[local_best].item() > best_score:
-                best_score = scores[local_best].item()
-                best_idx = cs + local_best
-                best_k_col = k_vals[:, local_best].clone()
-
-            del cand, sim, dist_sq, k_vals, gain, scores
+            coverage_gains.append(gain.sum(dim=0))
+            
+            del cand, sim, dist_sq, k_vals, gain
             clear_memory()
+            
+        C = torch.cat(coverage_gains) # shape: num_samples
+        
+        # Normalize U and C
+        U_min, U_max = U.min(), U.max()
+        U_norm = (U - U_min) / (U_max - U_min) if U_max > U_min else U - U_min
+        
+        C_min, C_max = C.min(), C.max()
+        C_norm = (C - C_min) / (C_max - C_min) if C_max > C_min else C - C_min
+        
+        scores = U_norm * C_norm
+
+        # Mask out selected
+        for si in selected_set:
+            scores[si] = -float("inf")
+
+        best_idx = torch.argmax(scores).item()
+        
+        # Recalculate k_col for best_idx to update k_running
+        cand = features[best_idx].unsqueeze(0)
+        sim = torch.matmul(features, cand.T)
+        dist_sq = torch.clamp(2.0 - 2.0 * sim, min=0.0)
+        best_k_col = torch.exp(-dist_sq / (sigma ** 2)).squeeze(1)
 
         if best_idx >= 0 and best_idx not in selected_set:
             selected_indices.append(best_idx)
@@ -123,3 +191,20 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
     del features, U, k_running
     clear_memory()
     return selected_indices
+
+
+@register_sampler("uncertainty_herding")
+def uncertainty_herding_sampling(**kwargs) -> List[int]:
+    return _uherding_sampling_with_type("margin", **kwargs)
+
+@register_sampler("uherding_margin")
+def uherding_margin_sampling(**kwargs) -> List[int]:
+    return _uherding_sampling_with_type("margin", **kwargs)
+
+@register_sampler("uherding_entropy")
+def uherding_entropy_sampling(**kwargs) -> List[int]:
+    return _uherding_sampling_with_type("entropy", **kwargs)
+
+@register_sampler("uherding_cec")
+def uherding_cec_sampling(**kwargs) -> List[int]:
+    return _uherding_sampling_with_type("cec", **kwargs)

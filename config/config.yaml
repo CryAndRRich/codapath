@@ -3,7 +3,7 @@ sampler_name: "codapath"
 random_seed: 42
 device: "cuda"
 
-cumulative_budget: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500]
+cumulative_budget: [25, 50, 75, 100, 125, 150, 175, 200]
 
 models:
   vit: "facebook/dinov2-base"              
@@ -51,6 +51,24 @@ samplers:
     probe_epochs: 50
     probe_lr: 0.001
     chunk_size: 2000   
+
+  uherding_margin:
+    probe_epochs: 50
+    probe_lr: 0.001
+    chunk_size: 2000   
+
+  uherding_entropy:
+    probe_epochs: 50
+    probe_lr: 0.001
+    chunk_size: 2000   
+
+  uherding_cec:
+    probe_epochs: 50
+    probe_lr: 0.001
+    chunk_size: 2000
+    cec_n: 30
+    cec_k: 20
+    cec_beta: 1.0
 
   tcm:
     probe_epochs: 50

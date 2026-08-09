@@ -19,7 +19,8 @@ SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm", "refine"}
 
 # PER_BUDGET: selection depends on the budget (budget-scaled phase / #clusters /
 # centroids), so it must be re-run for every budget.
-PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding"}
+PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding", 
+                       "uherding_margin", "uherding_entropy", "uherding_cec"}
 
 # ITERATIVE: re-run per budget with internal probe-refinement rounds.
 ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel"}
