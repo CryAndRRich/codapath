@@ -98,6 +98,9 @@ samplers:
     fusion_mode: "disagreement"   # "disagreement" (Ver 1) | "concat" (Ver 2)
     feature_fusion: "concat"      # only used when fusion_mode="concat": "concat" | "sum"
     coverage_space: "original"    # "original" (default, matches earlier runs) | "combined" (all 3 scales concatenated)
+    crop_mode: "center"           # "center" (default) | "random" | "informative" (local-entropy richest window)
+    crop_block: 16                # block size for "informative" local-entropy scoring
+    entropy_bins: 32              # histogram bins for local-entropy scoring
     diag: true
     n_sigma: 2000
 

@@ -2,11 +2,20 @@
 
 Replaces v8/v9's stain-shortcut branch with a different pathology-relevant
 signal: multi-scale morphology. Every image is viewed at 3 zoom levels —
-original, upscaled x2 then center-cropped back to the input size (zoomed into
-roughly the center half of the field of view), upscaled x4 then center-cropped
-(zoomed further in) — each re-encoded by the same frozen DINOv2 backbone. The
-agreement/disagreement (or a fused representation) across these 3 views drives
-uncertainty; Coverage uses the same UHerding-style weighted-herding greedy
+original, upscaled x2, upscaled x4 — each cropped back to the input size and
+re-encoded by the same frozen DINOv2 backbone. The crop position after
+upscaling is chosen via `crop_mode`:
+  - "center" (default): fixed geometric center of the upscaled image.
+  - "random": uniformly random valid position, independently per image/scale,
+    reproducible across runs/cache hits via a seeded RNG (loaders are
+    shuffle=False, so iteration order is deterministic).
+  - "informative": the position maximizing summed block-wise local entropy
+    (the H&E texture metric found to best separate homogeneous/empty regions,
+    e.g. adipocyte lumen, from texture-dense regions, e.g. nucleus-packed
+    areas — chosen over Sobel/Laplacian, which are near-redundant with each
+    other, and GLCM, which is unstable at small block sizes).
+The agreement/disagreement (or a fused representation) across these 3 views
+drives uncertainty; Coverage uses the same UHerding-style weighted-herding greedy
 already used by `scalpel.py` (`Sigma_n W_n * max(K(n,i) - K_n, 0)`), unchanged,
 over one of two feature spaces selected via `coverage_space`:
   - "original" (default): original-scale DINOv2 features only.
@@ -57,24 +66,86 @@ from .scalpel import (
 
 
 # ---------------------------------------------------------------------------
+# Crop strategies — where to crop after upscaling
+# ---------------------------------------------------------------------------
+
+def _random_crop_offset(rng: np.random.Generator, up_h: int, up_w: int,
+                         crop_h: int, crop_w: int):
+    """One uniformly random valid (top, left) pixel offset."""
+    top = int(rng.integers(0, up_h - crop_h + 1))
+    left = int(rng.integers(0, up_w - crop_w + 1))
+    return top, left
+
+
+def _local_entropy_crop(rgb_upscaled: torch.Tensor, crop_h: int, crop_w: int,
+                         block: int = 16, bins: int = 32):
+    """Per-image (top, left) pixel offset maximizing summed block-wise local
+    entropy within a crop_h x crop_w window, computed on luminance.
+
+    Local entropy (not Sobel/Laplacian, not GLCM) — chosen because it cleanly
+    separates homogeneous/empty tissue regions from texture-dense ones at
+    small block sizes, per empirical analysis on H&E patches.
+    """
+    B, _, Hu, Wu = rgb_upscaled.shape
+    gray = (0.299 * rgb_upscaled[:, 0] + 0.587 * rgb_upscaled[:, 1]
+            + 0.114 * rgb_upscaled[:, 2])                                # (B,Hu,Wu) in [0,1]
+
+    Hb, Wb = (Hu // block) * block, (Wu // block) * block
+    gray = gray[:, :Hb, :Wb]
+    nbh, nbw = Hb // block, Wb // block
+
+    quant = torch.clamp((gray * bins).long(), max=bins - 1)              # (B,Hb,Wb)
+    blocks = quant.unfold(1, block, block).unfold(2, block, block)       # (B,nbh,nbw,block,block)
+    blocks = blocks.reshape(B, nbh * nbw, block * block)
+
+    onehot = F.one_hot(blocks, num_classes=bins).float()                 # (B,nbh*nbw,block*block,bins)
+    counts = onehot.sum(dim=2)                                           # (B,nbh*nbw,bins)
+    p = counts / (block * block)
+    entropy = -(p * torch.log2(p.clamp(min=1e-9))).sum(dim=-1)           # (B,nbh*nbw)
+    score_map = entropy.reshape(B, 1, nbh, nbw)
+
+    win_h = max(1, min(nbh, crop_h // block))
+    win_w = max(1, min(nbw, crop_w // block))
+    pooled = F.avg_pool2d(score_map, kernel_size=(win_h, win_w), stride=1) * (win_h * win_w)
+    pooled = pooled.squeeze(1)                                           # (B, nbh-win_h+1, nbw-win_w+1)
+
+    flat_idx = pooled.reshape(B, -1).argmax(dim=1)
+    pw = pooled.shape[-1]
+    block_row = flat_idx // pw
+    block_col = flat_idx % pw
+    top = torch.clamp(block_row * block, max=Hu - crop_h)
+    left = torch.clamp(block_col * block, max=Wu - crop_w)
+    return top.cpu().tolist(), left.cpu().tolist()
+
+
+# ---------------------------------------------------------------------------
 # Multi-scale DINOv2 feature extraction (train pool only — used for sampling)
 # ---------------------------------------------------------------------------
 
 @torch.inference_mode()
 def extract_scaled_dino_features(loader, device: torch.device, vit_name: str,
-                                  scale_factors) -> Dict[int, np.ndarray]:
+                                  scale_factors, crop_mode: str = "center",
+                                  seed: int = 0, crop_block: int = 16,
+                                  entropy_bins: int = 32) -> Dict[int, np.ndarray]:
     """One DINOv2 pass per batch, producing features for each requested scale.
 
     Per batch: recover approx RGB (inverse ImageNet normalize, same pattern as
     scalpel.py's extract_stain_features) -> upscale by `scale_factor` (bilinear)
-    -> center-crop back to the batch's own H,W -> re-normalize (ImageNet) ->
-    encode with a single shared DINOv2Extractor instance. One model load, one
-    loader traversal produces every requested scale together.
+    -> crop back to the batch's own H,W (position per `crop_mode`) ->
+    re-normalize (ImageNet) -> encode with a single shared DINOv2Extractor
+    instance. One model load, one loader traversal produces every requested
+    scale together.
+
+    `crop_mode="random"` is reproducible: `loader` is shuffle=False (confirmed
+    in load_data.py), so a single `np.random.default_rng(seed)` consumed in
+    loader iteration order gives identical crops across repeated runs/cache
+    rebuilds with the same seed.
     """
     from model import DINOv2Extractor
 
     mean_t = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
     std_t = torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1)
+    rng = np.random.default_rng(seed)
 
     extractor = DINOv2Extractor(model_name=vit_name).to(device)
     extractor.eval()
@@ -85,12 +156,29 @@ def extract_scaled_dino_features(loader, device: torch.device, vit_name: str,
         imgs = imgs.to(device, non_blocking=True)
         rgb = (imgs * std_t + mean_t).clamp(0.0, 1.0)
         H, W = rgb.shape[-2], rgb.shape[-1]
+        B = rgb.shape[0]
 
         for s in scale_factors:
             up = F.interpolate(rgb, scale_factor=s, mode="bilinear", align_corners=False)
-            top = (up.shape[-2] - H) // 2
-            left = (up.shape[-1] - W) // 2
-            cropped = up[:, :, top:top + H, left:left + W]
+            up_h, up_w = up.shape[-2], up.shape[-1]
+
+            if crop_mode == "random":
+                tops, lefts = [], []
+                for _ in range(B):
+                    t, l = _random_crop_offset(rng, up_h, up_w, H, W)
+                    tops.append(t)
+                    lefts.append(l)
+            elif crop_mode == "informative":
+                tops, lefts = _local_entropy_crop(up, H, W, crop_block, entropy_bins)
+            else:  # "center"
+                t = (up_h - H) // 2
+                l = (up_w - W) // 2
+                tops, lefts = [t] * B, [l] * B
+
+            cropped = torch.stack([
+                up[b, :, tops[b]:tops[b] + H, lefts[b]:lefts[b] + W]
+                for b in range(B)
+            ], dim=0)
             normed = (cropped - mean_t) / std_t
             out = extractor(normed)
             feats[s].append(out.cpu().numpy().astype(np.float32))
@@ -104,35 +192,43 @@ def extract_scaled_dino_features(loader, device: torch.device, vit_name: str,
 
 
 def _multiscale_cache_paths(cache_dir: str, dataset_key: str, seed: int,
-                             vit_name: str, scale_factors) -> Dict[int, str]:
+                             vit_name: str, scale_factors, crop_mode: str) -> Dict[int, str]:
     safe_vit = vit_name.replace("/", "_")
     base = f"{dataset_key}_seed{seed}_{safe_vit}"
-    return {s: f"{cache_dir}/{base}_scale{s}_train.npy" for s in scale_factors}
+    return {s: f"{cache_dir}/{base}_scale{s}_{crop_mode}_train.npy" for s in scale_factors}
 
 
 def get_or_extract_multiscale_features(train_loader, dataset_key: str, seed: int,
                                         vit_name: str, scale_factors, device: torch.device,
-                                        cache_dir: str = "features") -> Dict[int, np.ndarray]:
+                                        cache_dir: str = "features", crop_mode: str = "center",
+                                        crop_block: int = 16, entropy_bins: int = 32) -> Dict[int, np.ndarray]:
     """Train-only cache for multi-scale DINOv2 features — mirrors
     `model.py::get_or_extract_features`'s cache-key convention (dataset+seed+
     backbone, scale-suffixed), but never needs the test split since only the
-    training pool is ever sampled from.
+    training pool is ever sampled from. `crop_mode` is part of the cache key —
+    switching it must never silently reuse a `.npy` extracted under a
+    different crop strategy.
     """
     import os
 
-    paths = _multiscale_cache_paths(cache_dir, dataset_key, seed, vit_name, scale_factors)
+    paths = _multiscale_cache_paths(cache_dir, dataset_key, seed, vit_name, scale_factors, crop_mode)
     n_train = len(train_loader.dataset)
 
     if all(os.path.exists(p) for p in paths.values()):
         loaded = {s: np.load(p) for s, p in paths.items()}
         if all(arr.shape[0] == n_train for arr in loaded.values()):
-            print(f"[multiscale-features] Loaded cache for scales {scale_factors} → {list(paths.values())}")
+            print(f"[multiscale-features] Loaded cache for scales {scale_factors} "
+                  f"(crop_mode={crop_mode}) → {list(paths.values())}")
             return loaded
         print("[multiscale-features] Cache size mismatch — re-extracting.")
 
     print(f"[multiscale-features] Cache miss — extracting DINOv2 features at scales "
-          f"{scale_factors} for '{dataset_key}' (seed={seed}, backbone={vit_name}).")
-    feats = extract_scaled_dino_features(train_loader, device, vit_name, scale_factors)
+          f"{scale_factors} (crop_mode={crop_mode}) for '{dataset_key}' "
+          f"(seed={seed}, backbone={vit_name}).")
+    feats = extract_scaled_dino_features(
+        train_loader, device, vit_name, scale_factors,
+        crop_mode=crop_mode, seed=seed, crop_block=crop_block, entropy_bins=entropy_bins,
+    )
 
     os.makedirs(cache_dir, exist_ok=True)
     for s, arr in feats.items():

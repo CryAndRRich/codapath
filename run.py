@@ -89,6 +89,9 @@ def main(
         train_multiscale_features = get_or_extract_multiscale_features(
             train_loader, dataset_key, random_seed, vit_name, scale_factors,
             device, cache_dir=feature_cache_dir,
+            crop_mode=sampler_cfg.get("crop_mode", "center"),
+            crop_block=sampler_cfg.get("crop_block", 16),
+            entropy_bins=sampler_cfg.get("entropy_bins", 32),
         )
 
     if sampler_name == "codapath":
