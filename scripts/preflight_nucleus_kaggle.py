@@ -51,7 +51,11 @@ def parse_args():
     parser.add_argument("--input_mpp", type=float, default=None)
     parser.add_argument("--model_mpp", type=float, default=None)
     parser.add_argument("--magnification", type=int, choices=[20, 40], default=None)
-    parser.add_argument("--smoke_samples", type=int, default=2)
+    parser.add_argument("--smoke_samples", type=int, default=8)
+    parser.add_argument("--cellvit_batch_size", type=int, default=2)
+    parser.add_argument("--dino_crop_batch_size", type=int, default=32)
+    parser.add_argument("--max_estimated_hours", type=float, default=None)
+    parser.add_argument("--max_cells_per_patch", type=int, default=None)
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
 
@@ -102,6 +106,14 @@ def main() -> None:
     args = parse_args()
     if args.smoke_samples < 1:
         raise ValueError("smoke_samples must be positive")
+    if args.cellvit_batch_size < 1:
+        raise ValueError("cellvit_batch_size must be positive")
+    if args.dino_crop_batch_size < 1:
+        raise ValueError("dino_crop_batch_size must be positive")
+    if args.max_estimated_hours is not None and args.max_estimated_hours <= 0:
+        raise ValueError("max_estimated_hours must be positive")
+    if args.max_cells_per_patch is not None and args.max_cells_per_patch < 1:
+        raise ValueError("max_cells_per_patch must be positive")
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     if args.dataset not in config["datasets"]:
@@ -156,10 +168,21 @@ def main() -> None:
     )
     raw_dataset = RawRGBDataset(train_loader.dataset)
     count = min(args.smoke_samples, len(raw_dataset))
-    images = [raw_dataset[idx][0] for idx in range(count)]
+    smoke_indices = np.linspace(
+        0, len(raw_dataset) - 1, num=count, dtype=np.int64
+    ).tolist()
+    images = [raw_dataset[idx][0] for idx in smoke_indices]
     if not images or not all(isinstance(image, Image.Image) for image in images):
         raise RuntimeError("Raw-RGB loader did not return PIL images")
-    print(f"[data] smoke raw sizes={[image.size for image in images]}")
+    if any(min(image.size) < 128 for image in images):
+        raise RuntimeError(
+            "Smoke data contains patches smaller than 128 px. For PathMNIST, "
+            "mount pathmnist_224.npz rather than the native 28 px release."
+        )
+    print(
+        f"[data] smoke indices={smoke_indices} "
+        f"raw sizes={[image.size for image in images]}"
+    )
 
     extraction = config["nucleus_extraction"]
     cellvit = CellViTPatchExtractor(
@@ -168,10 +191,20 @@ def main() -> None:
         model_mpp=model_mpp,
         magnification=magnification,
         min_cell_area=extraction.get("min_cell_area", 10),
-        max_cells_per_patch=extraction.get("max_cells_per_patch"),
+        max_cells_per_patch=(
+            args.max_cells_per_patch
+            if args.max_cells_per_patch is not None
+            else extraction.get("max_cells_per_patch")
+        ),
     )
+    # Warm up model kernels and post-processing, then benchmark the exact batch.
+    cellvit.extract_batch(images[:args.cellvit_batch_size])
     cellvit_start = time.perf_counter()
-    patches = cellvit.extract_batch(images)
+    patches = []
+    for start in range(0, count, args.cellvit_batch_size):
+        patches.extend(
+            cellvit.extract_batch(images[start:start + args.cellvit_batch_size])
+        )
     cellvit_seconds = time.perf_counter() - cellvit_start
     if len(patches) != count:
         raise RuntimeError("CellViT output batch length mismatch")
@@ -181,11 +214,14 @@ def main() -> None:
         if patch.embeddings.shape != (len(patch.instance_ids), cellvit.embedding_dim):
             raise RuntimeError("CellViT token rows do not align with instances")
     detected = sum(len(patch.instance_ids) for patch in patches)
-    print(f"[cellvit] smoke patches={count} detected_cells={detected}")
+    print(
+        f"[cellvit] smoke patches={count} detected_cells={detected} "
+        f"(configured batch={args.cellvit_batch_size})"
+    )
 
     crop_dino = DINOCellCropEncoder(
         args.vit_name,
-        device, batch_size=1,
+        device, batch_size=args.dino_crop_batch_size,
     )
     crops = []
     for patch in patches:
@@ -198,8 +234,14 @@ def main() -> None:
                 break
         if len(crops) >= 8:
             break
-    # Always execute one DINO forward even when CellViT detects no nucleus.
-    dino_inputs = crops or [Image.fromarray(patches[0].rgb)]
+    # Execute one full configured DINO batch even when the smoke patches contain
+    # fewer nuclei. Repeating a real crop is sufficient to test peak memory.
+    seed_inputs = crops or [Image.fromarray(patches[0].rgb)]
+    dino_inputs = [
+        seed_inputs[idx % len(seed_inputs)]
+        for idx in range(args.dino_crop_batch_size)
+    ]
+    crop_dino.encode(dino_inputs)  # warm-up
     dino_start = time.perf_counter()
     dino_features = crop_dino.encode(dino_inputs)
     dino_seconds = time.perf_counter() - dino_start
@@ -207,7 +249,10 @@ def main() -> None:
         raise RuntimeError("DINO crop feature shape mismatch")
     if not np.all(np.isfinite(dino_features)):
         raise RuntimeError("DINO crop features contain non-finite values")
-    print(f"[dino] smoke feature shape={dino_features.shape}")
+    print(
+        f"[dino] smoke feature shape={dino_features.shape} "
+        f"(configured batch={args.dino_crop_batch_size})"
+    )
 
     mean_cells = detected / count
     bytes_per_cell = 2 * (cellvit.embedding_dim + crop_dino.feature_dim) + 20
@@ -224,12 +269,23 @@ def main() -> None:
         seconds_per_patch + mean_cells * seconds_per_crop
     ) / 3600
     print(
-        f"[estimate] cold-start runtime upper estimate≈{estimated_hours:.1f} h "
-        "(preflight batch=1 and first-call JIT make this deliberately pessimistic)"
+        f"[estimate] warmed pilot runtime≈{estimated_hours:.1f} h "
+        f"at CellViT/DINO batches={args.cellvit_batch_size}/"
+        f"{args.dino_crop_batch_size}"
     )
     if peak_bytes > free_disk:
         raise RuntimeError(
             "Estimated peak extraction storage exceeds free Kaggle disk"
+        )
+    if (
+        args.max_estimated_hours is not None
+        and estimated_hours > args.max_estimated_hours
+    ):
+        raise RuntimeError(
+            f"Estimated extraction time {estimated_hours:.1f} h exceeds the "
+            f"configured safety limit {args.max_estimated_hours:.1f} h. "
+            "Reduce max_cells_per_patch, raise the limit knowingly, or use a "
+            "longer-running GPU environment."
         )
     if detected == 0:
         print(

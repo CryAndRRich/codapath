@@ -76,6 +76,7 @@ def parse_args():
     )
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--dino_crop_batch_size", type=int, default=None)
+    parser.add_argument("--max_cells_per_patch", type=int, default=None)
     parser.add_argument("--qc_count", type=int, default=16)
     parser.add_argument(
         "--overwrite", action="store_true",
@@ -128,6 +129,8 @@ def main() -> None:
         )
     if args.qc_count < 0:
         raise ValueError("qc_count must be non-negative")
+    if args.max_cells_per_patch is not None and args.max_cells_per_patch < 1:
+        raise ValueError("max_cells_per_patch must be positive")
     device = torch.device(args.device or config.get("device", "cuda"))
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but no Kaggle GPU is attached")
@@ -146,13 +149,18 @@ def main() -> None:
     sample_fingerprint = sample_order_fingerprint(sample_ids)
     checkpoint_hash = sha256_file(checkpoint)
 
+    max_cells_per_patch = (
+        args.max_cells_per_patch
+        if args.max_cells_per_patch is not None
+        else extraction.get("max_cells_per_patch")
+    )
     cellvit = CellViTPatchExtractor(
         checkpoint, device,
         input_mpp=input_mpp,
         model_mpp=model_mpp,
         magnification=magnification,
         min_cell_area=extraction.get("min_cell_area", 10),
-        max_cells_per_patch=extraction.get("max_cells_per_patch"),
+        max_cells_per_patch=max_cells_per_patch,
     )
     vit_name = args.vit_name or config.get("models", {}).get(
         "vit", "facebook/dinov2-base"
@@ -196,7 +204,7 @@ def main() -> None:
             "batch_size": batch_size,
             "crop_padding": float(extraction.get("crop_padding", 0.25)),
             "min_cell_area": int(extraction.get("min_cell_area", 10)),
-            "max_cells_per_patch": extraction.get("max_cells_per_patch"),
+            "max_cells_per_patch": max_cells_per_patch,
         }
         state_path = os.path.join(build_dir, "state.json")
         if os.path.exists(state_path):
@@ -337,7 +345,7 @@ def main() -> None:
                 "magnification": int(magnification),
                 "dino_backbone": vit_name,
                 "crop_padding": float(extraction.get("crop_padding", 0.25)),
-                "max_cells_per_patch": extraction.get("max_cells_per_patch"),
+                "max_cells_per_patch": max_cells_per_patch,
                 "feature_dtype": "float16",
             },
         )

@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import importlib.metadata
 import math
+import os
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -66,6 +67,17 @@ class CellViTPatchExtractor:
             raise ValueError("input_mpp and model_mpp must be positive")
         if magnification not in {20, 40}:
             raise ValueError("magnification must be 20 or 40")
+        expected_model_mpp = {20: 0.5, 40: 0.25}[magnification]
+        if abs(float(model_mpp) - expected_model_mpp) > 0.035:
+            raise ValueError(
+                f"CellViT {magnification}x expects model_mpp≈"
+                f"{expected_model_mpp}, got {model_mpp}"
+            )
+        checkpoint_name = os.path.basename(checkpoint_path).lower()
+        if "x20" in checkpoint_name and magnification != 20:
+            raise ValueError("An x20 checkpoint must use magnification=20")
+        if "x40" in checkpoint_name and magnification != 40:
+            raise ValueError("An x40 checkpoint must use magnification=40")
         try:
             installed_version = importlib.metadata.version("cellvit")
         except importlib.metadata.PackageNotFoundError as exc:
