@@ -17,6 +17,8 @@ Use [extract_nucleus_features.ipynb](scripts/extract_nucleus_features.ipynb). Th
 
 Scale is guarded in code: an x20 checkpoint must use 20× and approximately 0.5 MPP; an x40 checkpoint must use 40× and approximately 0.25 MPP. Use a current official checkpoint—the CellViT authors explicitly warn that older checkpoints predate a corrected training release.
 
+For PathMNIST (`input_mpp=0.5`), the preferred native-scale choice is an x20 checkpoint (`model_mpp=0.5`, `magnification=20`). If only the official x40 AMP checkpoint is available, set `model_mpp=0.25`, `magnification=40`; the adapter then upsamples by 2×. This is executable and scale-consistent, but interpolation cannot recreate detail missing from the 0.5-MPP source, so record the checkpoint choice as an experimental limitation.
+
 The official documentation recommends at least 24 GB VRAM for the complete WSI pipeline. This project uses only CellViT256 patch inference and defaults conservatively to CellViT batch 2 plus DINO crop batch 32 for Kaggle T4/P100. Preflight now executes both configured batch sizes, so an OOM occurs before the full job. If it OOMs, lower both to 1/8.
 
 After extraction succeeds, save `/kaggle/working/nucleus_features` as notebook output, publish/attach it as a Kaggle Dataset, and set `NUCLEUS_FEATURE_DIR` in `run_al.ipynb` to `/kaggle/input/<output-slug>/nucleus_features`. Active-learning checkpoints are written to `/kaggle/working/checkpoints`.

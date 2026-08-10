@@ -163,6 +163,18 @@ def main() -> None:
     del checkpoint_obj
 
     input_mpp, model_mpp, magnification = _resolve_scale(args, config)
+    scale_factor = input_mpp / model_mpp
+    print(
+        f"[scale] input={input_mpp:.4f} MPP -> CellViT {magnification}x "
+        f"at {model_mpp:.4f} MPP (resize={scale_factor:.3f}x)"
+    )
+    if scale_factor > 1.5:
+        print(
+            "[scale warning] Input is being upsampled substantially. This "
+            "matches the checkpoint pixel scale but cannot recover spatial "
+            "detail absent from the source image. Prefer a matching x20 "
+            "checkpoint for native 0.5-MPP data when available."
+        )
     train_loader, _, _ = get_data_loaders(
         str(data_path), args.seed, verbose=True
     )

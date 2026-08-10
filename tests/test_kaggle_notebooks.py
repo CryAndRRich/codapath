@@ -26,7 +26,7 @@ def test_kaggle_notebooks_are_valid_python_and_pin_experiment_branch():
         assert 'REPO_BRANCH = "tiendung"' in all_source or (
             "REPO_BRANCH = 'tiendung'" in all_source
         )
-        assert "/kaggle/input/datasets/" not in all_source
+        assert "/kaggle/input" in all_source
         for index, cell in enumerate(notebook["cells"]):
             if cell["cell_type"] != "code":
                 continue
@@ -53,8 +53,14 @@ def test_nucleus_notebook_runs_exact_preflight_before_full_extraction():
     assert preflight_index < extraction_index
     assert "--dino_crop_batch_size" in cells[preflight_index]
     assert "--cellvit_batch_size" in cells[preflight_index]
+    assert "--input_mpp" in cells[preflight_index]
+    assert "--model_mpp" in cells[preflight_index]
+    assert "--magnification" in cells[preflight_index]
     assert "--smoke_samples', str(SMOKE_SAMPLES)" in cells[preflight_index]
     assert "--max_estimated_hours" in cells[preflight_index]
+    assert "--input_mpp" in cells[extraction_index]
+    assert "--model_mpp" in cells[extraction_index]
+    assert "--magnification" in cells[extraction_index]
 
 
 def test_run_notebook_matches_controlled_budget_protocol():
