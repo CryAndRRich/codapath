@@ -143,6 +143,7 @@ def main() -> None:
         f"[env] python={sys.version.split()[0]} torch={torch.__version__} "
         f"cellvit={CELLVIT_VERSION}"
     )
+    print("[compat] CellViT prediction-map stack: NumPy float32 (Numba JIT bypass)")
     print(
         f"[gpu] {gpu.name} total={total_vram / 2**30:.1f} GiB "
         f"free={free_vram / 2**30:.1f} GiB"

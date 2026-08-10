@@ -19,6 +19,8 @@ import torch
 import torch.nn.functional as F
 from torchvision.transforms import functional as TF
 
+from .postprocessing import stack_prediction_maps_numpy
+
 
 SUPPORTED_CELLVIT_VERSION = "1.0.9"
 
@@ -188,6 +190,32 @@ class CellViTPatchExtractor:
             "hv_map": outputs["hv_map"].permute(0, 2, 3, 1),
         }
 
+    @staticmethod
+    def _post_process_without_numba_stack(postprocessor, predictions):
+        """Use official per-image CellViT processing after NumPy map stacking.
+
+        ``DetectionCellPostProcessor.post_process_batch`` delegates only its
+        initial argmax/stack operation to a Numba function that is incompatible
+        with the current Kaggle Python 3.12 image. Everything after this small
+        compatibility boundary remains the official CellViT implementation.
+        """
+        prediction_arrays = {
+            key: value.detach().cpu().numpy()
+            for key, value in predictions.items()
+        }
+        pred_maps = stack_prediction_maps_numpy(
+            prediction_arrays["nuclei_type_map"],
+            prediction_arrays["nuclei_binary_map"],
+            prediction_arrays["hv_map"],
+        )
+        instance_maps = []
+        cell_dicts = []
+        for pred_map in pred_maps:
+            pred_inst, cells = postprocessor.post_process_single_image(pred_map)
+            instance_maps.append(pred_inst)
+            cell_dicts.append(cells)
+        return np.stack(instance_maps).astype(np.int32, copy=False), cell_dicts
+
     @torch.inference_mode()
     def extract_batch(self, images: Sequence[Image.Image]) -> List[PatchCells]:
         if not images:
@@ -201,17 +229,15 @@ class CellViTPatchExtractor:
         ):
             outputs = self.model(batch, retrieve_tokens=True)
         predictions = self._prepare_predictions(outputs)
-        instance_maps, cell_dicts = self.postprocessor.post_process_batch(predictions)
+        instance_maps, cell_dicts = self._post_process_without_numba_stack(
+            self.postprocessor, predictions
+        )
         tokens = outputs["tokens"].detach().cpu()
         if tokens.ndim != 4:
             raise ValueError(
                 f"Expected CellViT tokens with shape (B,C,H,W), got {tokens.shape}"
             )
-        if torch.is_tensor(instance_maps):
-            instance_maps = instance_maps.detach().cpu().numpy()
-        else:
-            instance_maps = np.asarray(instance_maps)
-        instance_maps = instance_maps.astype(np.int32, copy=False)
+        instance_maps = np.asarray(instance_maps, dtype=np.int32)
 
         results: List[PatchCells] = []
         for batch_idx, (height, width) in enumerate(valid_shapes):
