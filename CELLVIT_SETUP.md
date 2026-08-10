@@ -25,4 +25,6 @@ The official documentation recommends at least 24 GB VRAM for the complete WSI p
 
 After extraction succeeds, save `/kaggle/working/nucleus_features` as notebook output, publish/attach it as a Kaggle Dataset, and set `NUCLEUS_FEATURE_DIR` in `run_al.ipynb` to `/kaggle/input/<output-slug>/nucleus_features`. Active-learning checkpoints are written to `/kaggle/working/checkpoints`.
 
+On a Kaggle T4, the uncapped PathMNIST pilot detected about 67.9 nuclei/patch and estimated 14.7 GiB final cache, 44.1 GiB resumable peak storage, and 30 hours for CellViT plus crop-DINO. The notebook therefore defaults to `MAX_CELLS_PER_PATCH=16`; keep this fixed across all four controlled variants. Preflight reports CellViT and crop-DINO time separately and recommends a smaller cap when needed. A cap changes the experimental protocol and must be recorded in results/manifests.
+
 Normal `run.py` jobs consume the portable cache and do not import CellViT.

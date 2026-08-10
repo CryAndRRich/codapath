@@ -278,14 +278,43 @@ def main() -> None:
     )
     seconds_per_patch = cellvit_seconds / count
     seconds_per_crop = dino_seconds / len(dino_inputs)
-    estimated_hours = len(raw_dataset) * (
-        seconds_per_patch + mean_cells * seconds_per_crop
-    ) / 3600
+    cellvit_hours = len(raw_dataset) * seconds_per_patch / 3600
+    crop_dino_hours = (
+        len(raw_dataset) * mean_cells * seconds_per_crop / 3600
+    )
+    estimated_hours = cellvit_hours + crop_dino_hours
     print(
         f"[estimate] warmed pilot runtime≈{estimated_hours:.1f} h "
         f"at CellViT/DINO batches={args.cellvit_batch_size}/"
         f"{args.dino_crop_batch_size}"
     )
+    print(
+        f"[estimate] runtime breakdown: CellViT≈{cellvit_hours:.1f} h + "
+        f"crop-DINO≈{crop_dino_hours:.1f} h"
+    )
+    disk_cap = max(
+        1,
+        int(0.8 * free_disk / (3 * len(raw_dataset) * bytes_per_cell)),
+    )
+    cap_candidates = [disk_cap]
+    if (
+        args.max_estimated_hours is not None
+        and args.max_estimated_hours > cellvit_hours
+        and seconds_per_crop > 0
+    ):
+        time_cap = int(
+            (args.max_estimated_hours - cellvit_hours)
+            * 3600
+            / (len(raw_dataset) * seconds_per_crop)
+        )
+        cap_candidates.append(max(1, time_cap))
+    recommended_cap = min(cap_candidates)
+    if mean_cells > recommended_cap:
+        print(
+            f"[recommend] set MAX_CELLS_PER_PATCH <= {recommended_cap} "
+            "to satisfy the current disk/time safety margins; rerun preflight "
+            "because the smoke estimate is dataset- and GPU-specific."
+        )
     if peak_bytes > free_disk:
         raise RuntimeError(
             "Estimated peak extraction storage exceeds free Kaggle disk"
