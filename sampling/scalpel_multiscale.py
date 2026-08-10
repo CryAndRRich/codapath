@@ -98,8 +98,12 @@ def _local_entropy_crop(rgb_upscaled: torch.Tensor, crop_h: int, crop_w: int,
     blocks = quant.unfold(1, block, block).unfold(2, block, block)       # (B,nbh,nbw,block,block)
     blocks = blocks.reshape(B, nbh * nbw, block * block)
 
-    onehot = F.one_hot(blocks, num_classes=bins).float()                 # (B,nbh*nbw,block*block,bins)
-    counts = onehot.sum(dim=2)                                           # (B,nbh*nbw,bins)
+    # Histogram via scatter_add instead of one_hot — one_hot would materialize
+    # a (B, n_blocks, block*block, bins) tensor (e.g. 256 x 784 x 256 x 32
+    # int64 =~ 12 GiB at batch_size=256, scale x2 — the OOM this replaced).
+    # scatter_add only needs a (B, n_blocks, bins) accumulator.
+    counts = torch.zeros(B, nbh * nbw, bins, device=blocks.device, dtype=torch.float32)
+    counts.scatter_add_(2, blocks, torch.ones_like(blocks, dtype=torch.float32))
     p = counts / (block * block)
     entropy = -(p * torch.log2(p.clamp(min=1e-9))).sum(dim=-1)           # (B,nbh*nbw)
     score_map = entropy.reshape(B, 1, nbh, nbw)
