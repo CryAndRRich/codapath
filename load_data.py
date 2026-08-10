@@ -1,12 +1,15 @@
-from typing import List, Tuple
+import os
+from typing import List, Sequence, Tuple
 
 from PIL import Image
 import numpy as np 
 
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset, random_split
 import torchvision.transforms as transforms
 from torchvision.datasets import ImageFolder
+
+from identity import sample_order_fingerprint
 
 class NPZDataset(Dataset):
     def __init__(self, 
@@ -43,22 +46,80 @@ class NPZDataset(Dataset):
         return self.total_len
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        img = self.get_raw_image(idx)
+        label = self.lbl[idx]
+
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+    def get_raw_image(self, idx: int) -> Image.Image:
+        """Return an RGB PIL image before any DINO/CellViT transform."""
         if self.split == "train":
             if idx < self.len_train:
                 img = self.train_img[idx]
-                label = self.lbl[idx]
             else:
                 val_idx = idx - self.len_train
                 img = self.val_img[val_idx]
-                label = self.lbl[idx]
         else:
             img = self.img[idx]
-            label = self.lbl[idx]
-            
-        img = Image.fromarray(img)
-        if self.transform: 
-            img = self.transform(img)
-        return img, label
+
+        return Image.fromarray(img).convert("RGB")
+
+    def sample_id(self, idx: int) -> str:
+        if self.split == "train":
+            prefix = "train" if idx < self.len_train else "val"
+            source_idx = idx if idx < self.len_train else idx - self.len_train
+        else:
+            prefix = "test"
+            source_idx = idx
+        return f"{prefix}:{source_idx}"
+
+
+class RawRGBDataset(Dataset):
+    """Raw-RGB view preserving the exact order of an existing split.
+
+    This view deliberately bypasses the 224x224 ImageNet transform used by
+    DINOv2. It is the only dataset view that CellViT extraction should consume.
+    """
+
+    def __init__(self, dataset: Dataset) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def _resolve(self, idx: int):
+        if isinstance(self.dataset, Subset):
+            return self.dataset.dataset, int(self.dataset.indices[idx])
+        return self.dataset, idx
+
+    def sample_id(self, idx: int) -> str:
+        base, source_idx = self._resolve(idx)
+        if isinstance(base, NPZDataset):
+            return base.sample_id(source_idx)
+        if isinstance(base, ImageFolder):
+            path, _ = base.samples[source_idx]
+            return os.path.relpath(path, base.root).replace(os.sep, "/")
+        raise TypeError(f"Unsupported dataset type for raw view: {type(base)!r}")
+
+    def __getitem__(self, idx: int):
+        base, source_idx = self._resolve(idx)
+        if isinstance(base, NPZDataset):
+            image = base.get_raw_image(source_idx)
+            label = int(base.lbl[source_idx])
+        elif isinstance(base, ImageFolder):
+            path, label = base.samples[source_idx]
+            image = base.loader(path).convert("RGB")
+        else:
+            raise TypeError(f"Unsupported dataset type for raw view: {type(base)!r}")
+        return image, int(label), self.sample_id(idx)
+
+
+def get_sample_ids(dataset: Dataset) -> List[str]:
+    raw = RawRGBDataset(dataset)
+    return [raw.sample_id(i) for i in range(len(raw))]
+
 
 class ActiveLearningDataset(Dataset):
     def __init__(self, 

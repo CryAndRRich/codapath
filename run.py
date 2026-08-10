@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from set_up import set_seed, clear_memory
-from load_data import get_data_loaders
+from load_data import get_data_loaders, get_sample_ids, sample_order_fingerprint
 from model import extract_image_features, get_or_extract_features
 from trainer import train_linear, save_model
 from sampling import get_sampler
@@ -22,12 +22,20 @@ SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm", "refine"}
 PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding"}
 
 # ITERATIVE: re-run per budget with internal probe-refinement rounds.
-ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel"}
+ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel", "nucleus_al"}
 
 
 def _save(path: str, obj) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(obj, path)
+
+
+def _safe_run_name(name: str) -> str:
+    if not name or name in {".", ".."}:
+        raise ValueError("run_name must be a non-empty filename-safe identifier")
+    if any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in name):
+        raise ValueError("run_name may contain only letters, numbers, '_' and '-'")
+    return name
 
 
 def main(
@@ -46,6 +54,8 @@ def main(
     verbose: bool,
     model_cfg: Dict,
     feature_cache_dir: str = "features",
+    nucleus_cache_dir: str = "nucleus_features",
+    run_name: str = None,
 ) -> None:
 
     print(f"Device: {device}")
@@ -55,6 +65,15 @@ def main(
     train_loader, test_loader, class_names = get_data_loaders(data_path, random_seed, verbose)
     train_dataset = train_loader.dataset
     test_dataset  = test_loader.dataset
+    train_sample_ids = get_sample_ids(train_dataset)
+    test_sample_ids = get_sample_ids(test_dataset)
+    train_fingerprint = sample_order_fingerprint(train_sample_ids)
+    test_fingerprint = sample_order_fingerprint(test_sample_ids)
+    if sampler_name == "nucleus_al" and run_name is None:
+        source = sampler_cfg.get("cell_source", "cellvit_embedding")
+        uncertainty = sampler_cfg.get("uncertainty_mode", "disagreement")
+        run_name = f"nucleus_{source}_{uncertainty}"
+    output_name = _safe_run_name(run_name or sampler_name)
 
     train_labels = (
         train_dataset.lbl
@@ -71,12 +90,17 @@ def main(
     train_features, test_features = get_or_extract_features(
         train_loader, test_loader, dataset_key, random_seed, vit_name,
         device, cache_dir=feature_cache_dir,
+        train_fingerprint=train_fingerprint,
+        test_fingerprint=test_fingerprint,
     )
     clear_memory()
 
     train_vlm_features   = None
     text_embeddings      = None
     train_stain_features = None
+    nucleus_embeddings    = None
+    nucleus_reliability   = None
+    nucleus_manifest      = None
 
     if sampler_name == "scalpel":
         from sampling.scalpel import extract_stain_features
@@ -97,6 +121,44 @@ def main(
             plip_model=model_cfg.get("vlm_secondary", "vinid/plip"),
             biomedbert_model=model_cfg.get("biomedbert",
                 "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"),
+        )
+
+    if sampler_name == "nucleus_al":
+        from nucleus.cache import load_nucleus_cache
+        from nucleus.ragged import pool_ragged_features
+
+        cache_path = os.path.join(
+            nucleus_cache_dir, f"{dataset_key}_seed{random_seed}"
+        )
+        nucleus_cache = load_nucleus_cache(
+            cache_path, expected_sample_ids=train_sample_ids
+        )
+        cell_source = sampler_cfg.get("cell_source", "cellvit_embedding")
+        if nucleus_cache.manifest.get("dataset") != dataset_key:
+            raise ValueError("Nucleus cache dataset does not match the current run")
+        if nucleus_cache.manifest.get("seed") != random_seed:
+            raise ValueError("Nucleus cache seed does not match the current split")
+        if (
+            cell_source == "crop_dino"
+            and nucleus_cache.manifest.get("dino_backbone") != vit_name
+        ):
+            raise ValueError(
+                "Crop-DINO cache backbone does not match the run backbone"
+            )
+        cell_features = nucleus_cache.features(cell_source)
+        nucleus_view = pool_ragged_features(
+            cell_features,
+            nucleus_cache.offsets,
+            nucleus_cache.confidence,
+            reliability_mode=sampler_cfg.get("reliability_mode", "valid"),
+        )
+        nucleus_embeddings = nucleus_view.patch_features
+        nucleus_reliability = nucleus_view.reliability
+        nucleus_manifest = nucleus_cache.manifest
+        print(
+            f"[nucleus] Loaded {cache_path}: "
+            f"patches={nucleus_cache.num_patches}, cells={nucleus_cache.num_cells}, "
+            f"source={cell_source}"
         )
 
     master_selected = None
@@ -121,8 +183,7 @@ def main(
         set_seed(random_seed)
 
         if sampler_name in ITERATIVE_SAMPLERS:
-            selected_indices = get_sampler(
-                name=sampler_name,
+            iterative_kwargs = dict(
                 image_embeddings=train_features,
                 stain_features=train_stain_features,          # None unless scalpel
                 oracle_labels=train_labels,
@@ -130,6 +191,14 @@ def main(
                 num_classes=num_classes,
                 device=device,
                 **sampler_cfg,
+            )
+            if sampler_name == "nucleus_al":
+                iterative_kwargs.update(
+                    nucleus_embeddings=nucleus_embeddings,
+                    nucleus_reliability=nucleus_reliability,
+                )
+            selected_indices = get_sampler(
+                name=sampler_name, **iterative_kwargs
             )
         elif sampler_name in PER_BUDGET_SAMPLERS:
             selected_indices = get_sampler(
@@ -148,13 +217,18 @@ def main(
         labeled_labels   = train_labels[selected_indices]
 
         _save(
-            os.path.join(save_dir, f"{sampler_name}_selected_budget_{budget}.pt"),
+            os.path.join(save_dir, f"{output_name}_selected_budget_{budget}.pt"),
             {"selected_indices": list(selected_indices),
-             "selected_labels":  labeled_labels.tolist()},
+             "selected_labels":  labeled_labels.tolist(),
+             "sampler": sampler_name,
+             "run_name": output_name,
+             "sampler_config": sampler_cfg,
+             "train_fingerprint": train_fingerprint,
+             "nucleus_manifest": nucleus_manifest},
         )
 
         if verbose:
-            print(f"\n── {sampler_name.upper()} | budget={budget} ──")
+            print(f"\n── {output_name.upper()} | budget={budget} ──")
 
         probe = train_linear(
             labeled_features, labeled_labels, num_classes,
@@ -164,13 +238,17 @@ def main(
         palm_acc[budget] = acc
         results[budget]  = {"acc": acc, "precision": pre, "recall": rec, "f1": f1}
 
-        save_model(probe, os.path.join(save_dir, f"{sampler_name}_probe_budget_{budget}.pt"))
+        save_model(probe, os.path.join(save_dir, f"{output_name}_probe_budget_{budget}.pt"))
         del probe
         clear_memory()
 
     _save(
-        os.path.join(save_dir, f"{sampler_name}_results.pt"),
-        {"sampler": sampler_name, "budgets": cumulative_budget, "linear": results},
+        os.path.join(save_dir, f"{output_name}_results.pt"),
+        {"sampler": sampler_name, "run_name": output_name,
+         "sampler_config": sampler_cfg, "budgets": cumulative_budget,
+         "linear": results, "train_fingerprint": train_fingerprint,
+         "test_fingerprint": test_fingerprint,
+         "nucleus_manifest": nucleus_manifest},
     )
 
     dataset_label = os.path.basename(save_dir)
@@ -184,8 +262,8 @@ def main(
                 accuracies=list(palm_acc.values()),
             )
             if verbose:
-                print(format_palm_report(params, sampler_name, dataset_label))
-            palm_path = os.path.join(save_dir, f"{sampler_name}_palm.pt")
+                print(format_palm_report(params, output_name, dataset_label))
+            palm_path = os.path.join(save_dir, f"{output_name}_palm.pt")
             _save(palm_path, params)
             print(f"[PALM] Saved → {palm_path}")
         except Exception as e:
@@ -218,12 +296,33 @@ if __name__ == "__main__":
     parser.add_argument("--probe_epochs", type=int,  default=training_cfg.get("probe_epochs", 100))
     parser.add_argument("--probe_lr",     type=float,default=training_cfg.get("probe_lr", 1e-3))
     parser.add_argument("--feature_cache_dir", type=str, default=config.get("feature_cache_dir", "features"))
+    parser.add_argument("--nucleus_cache_dir", type=str, default=config.get("nucleus_cache_dir", "nucleus_features"))
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument(
+        "--cell_source", choices=["cellvit_embedding", "crop_dino"],
+        default=None, help="Override nucleus_al.cell_source.",
+    )
+    parser.add_argument(
+        "--uncertainty_mode",
+        choices=["cell_margin", "disagreement", "fusion_concat", "fusion_add"],
+        default=None, help="Override nucleus_al.uncertainty_mode.",
+    )
 
     args = parser.parse_args(remaining_argv)
 
     dataset_key  = args.dataset
     dataset_info = config["datasets"][dataset_key]
     sampler_cfg  = config.get("samplers", {}).get(args.sampler_name, {})
+    sampler_cfg = dict(sampler_cfg)
+    if args.cell_source is not None or args.uncertainty_mode is not None:
+        if args.sampler_name != "nucleus_al":
+            raise ValueError(
+                "--cell_source/--uncertainty_mode are valid only for nucleus_al"
+            )
+        if args.cell_source is not None:
+            sampler_cfg["cell_source"] = args.cell_source
+        if args.uncertainty_mode is not None:
+            sampler_cfg["uncertainty_mode"] = args.uncertainty_mode
 
     print("=" * 60)
     print(f"Dataset      : {dataset_key.upper()} ({dataset_info['num_classes']} classes)")
@@ -250,4 +349,6 @@ if __name__ == "__main__":
         verbose=args.verbose,
         model_cfg=model_cfg,
         feature_cache_dir=args.feature_cache_dir,
+        nucleus_cache_dir=args.nucleus_cache_dir,
+        run_name=args.run_name,
     )

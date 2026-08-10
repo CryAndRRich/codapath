@@ -1,4 +1,5 @@
 import os
+import json
 
 import numpy as np
 import torch
@@ -49,7 +50,8 @@ def _feature_cache_paths(cache_dir: str,
     base = f"{dataset_key}_seed{seed}_{safe_vit}"
     train_path = os.path.join(cache_dir, f"{base}_train.npy")
     test_path  = os.path.join(cache_dir, f"{base}_test.npy")
-    return train_path, test_path
+    manifest_path = os.path.join(cache_dir, f"{base}_manifest.json")
+    return train_path, test_path, manifest_path
 
 
 def get_or_extract_features(train_loader: DataLoader,
@@ -58,7 +60,9 @@ def get_or_extract_features(train_loader: DataLoader,
                             seed: int,
                             vit_name: str,
                             device: torch.device,
-                            cache_dir: str = "features"):
+                            cache_dir: str = "features",
+                            train_fingerprint: str = None,
+                            test_fingerprint: str = None):
     """Return (train_features, test_features) for the frozen DINOv2 backbone.
 
     Loads them from `cache_dir` when a valid cache exists (matching dataset,
@@ -67,7 +71,9 @@ def get_or_extract_features(train_loader: DataLoader,
     only instantiated on a cache miss, so cached runs never pay download/GPU
     cost.
     """
-    train_path, test_path = _feature_cache_paths(cache_dir, dataset_key, seed, vit_name)
+    train_path, test_path, manifest_path = _feature_cache_paths(
+        cache_dir, dataset_key, seed, vit_name
+    )
 
     n_train = len(train_loader.dataset)
     n_test  = len(test_loader.dataset)
@@ -75,13 +81,38 @@ def get_or_extract_features(train_loader: DataLoader,
     if os.path.exists(train_path) and os.path.exists(test_path):
         train_features = np.load(train_path)
         test_features  = np.load(test_path)
-        if train_features.shape[0] == n_train and test_features.shape[0] == n_test:
+        cache_valid = (
+            train_features.shape[0] == n_train
+            and test_features.shape[0] == n_test
+        )
+        if cache_valid and os.path.exists(manifest_path):
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            cache_valid = (
+                manifest.get("dataset") == dataset_key
+                and manifest.get("seed") == seed
+                and manifest.get("backbone") == vit_name
+                and (
+                    train_fingerprint is None
+                    or manifest.get("train_fingerprint") == train_fingerprint
+                )
+                and (
+                    test_fingerprint is None
+                    or manifest.get("test_fingerprint") == test_fingerprint
+                )
+            )
+        elif cache_valid and (train_fingerprint is not None or test_fingerprint is not None):
+            cache_valid = False
+            print(
+                "[features] Legacy cache has no sample-order manifest; "
+                "re-extracting to guarantee exact row/sample alignment."
+            )
+
+        if cache_valid:
             print(f"[features] Loaded cache → {train_path} "
                   f"({train_features.shape}) + {test_path} ({test_features.shape})")
             return train_features, test_features
-        print(f"[features] Cache size mismatch "
-              f"(train {train_features.shape[0]} vs {n_train}, "
-              f"test {test_features.shape[0]} vs {n_test}) — re-extracting.")
+        print("[features] Cache metadata/order mismatch — re-extracting.")
 
     print(f"[features] Cache miss — extracting DINOv2 features for '{dataset_key}' "
           f"(seed={seed}, backbone={vit_name}).")
@@ -95,6 +126,17 @@ def get_or_extract_features(train_loader: DataLoader,
     os.makedirs(cache_dir, exist_ok=True)
     np.save(train_path, train_features)
     np.save(test_path,  test_features)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "schema_version": 1,
+            "dataset": dataset_key,
+            "seed": seed,
+            "backbone": vit_name,
+            "train_fingerprint": train_fingerprint,
+            "test_fingerprint": test_fingerprint,
+            "train_shape": list(train_features.shape),
+            "test_shape": list(test_features.shape),
+        }, f, indent=2, sort_keys=True)
     print(f"[features] Saved cache → {train_path} + {test_path}")
 
     return train_features, test_features

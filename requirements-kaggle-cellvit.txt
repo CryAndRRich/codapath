@@ -1,0 +1,2 @@
+# Official PyPI wheel audited against nucleus/cellvit_extractor.py.
+cellvit==1.0.9 --hash=sha256:0dc07a8cb5dd4318882f5200d60170d3326de6de8514cae6f6dafe0a8230b699

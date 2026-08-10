@@ -3,7 +3,9 @@ sampler_name: "codapath"
 random_seed: 42
 device: "cuda"
 
-cumulative_budget: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500]
+cumulative_budget: [25, 50, 75, 100, 125, 150, 175, 200]
+feature_cache_dir: "features"
+nucleus_cache_dir: "nucleus_features"
 
 models:
   vit: "facebook/dinov2-base"              
@@ -88,6 +90,53 @@ samplers:
     t_cap_value: 0.4                    # cap on t once adaptive cap triggers
     min_labels_per_class_for_cap: 2.0   # min avg labels/class before trusting the gap estimate
     use_rank_normalize: true           # true → rank-normalize vac/reconcile instead of minmax (test independently of use_adaptive_cap)
+
+  nucleus_al:
+    num_rounds: 5
+    chunk_size: 2000
+    n_sigma: 2000
+    probe_epochs: 50
+    probe_lr: 0.001
+    probe_weight_decay: 0.0001
+    cell_source: "cellvit_embedding"   # cellvit_embedding | crop_dino
+    uncertainty_mode: "disagreement"  # cell_margin | disagreement | fusion_concat | fusion_add
+    reliability_mode: "valid"         # valid | mean_confidence
+    fusion_min_labels_per_class: 2.0
+    fusion_normalize_logits: false     # true = row-LN ablation before concat/add
+    diag: true
+
+nucleus_extraction:
+  # Do not silently reuse one scale/checkpoint for all datasets. Override these
+  # fields only after confirming the source slide/patch resolution metadata.
+  checkpoint: null
+  architecture: "CellViT256"
+  batch_size: 2                 # conservative for Kaggle T4/P100 16 GB
+  magnification: null
+  input_mpp: null
+  model_mpp: null
+  crop_padding: 0.25
+  min_cell_area: 10
+  max_cells_per_patch: null
+  dino_crop_batch_size: 32      # DINO and CellViT coexist on the GPU
+  datasets:
+    pathmnist:
+      # NCT-CRC-HE-100K patches are published at 0.5 microns/pixel (20x).
+      checkpoint: null
+      magnification: 20
+      input_mpp: 0.5
+      model_mpp: 0.5
+    histoset:
+      # Composite dataset: fill from the provenance of each source before use.
+      checkpoint: null
+      magnification: null
+      input_mpp: null
+      model_mpp: null
+    skintissue:
+      # Published tiles cover 100 x 100 microns at about 395 x 395 pixels.
+      checkpoint: null
+      magnification: 40
+      input_mpp: 0.2531646
+      model_mpp: 0.25
 
 prompt_templates:
   - "Photomicrograph showing {}."
