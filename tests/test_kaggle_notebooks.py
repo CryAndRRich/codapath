@@ -23,8 +23,8 @@ def test_kaggle_notebooks_are_valid_python_and_pin_experiment_branch():
     for path in NOTEBOOKS:
         notebook = json.loads(path.read_text(encoding="utf-8"))
         all_source = "\n".join(_source(cell) for cell in notebook["cells"])
-        assert 'REPO_BRANCH = "tiendung"' in all_source or (
-            "REPO_BRANCH = 'tiendung'" in all_source
+        assert 'REPO_BRANCH = "namhai"' in all_source or (
+            "REPO_BRANCH = 'namhai'" in all_source
         )
         assert "/kaggle/input" in all_source
         for index, cell in enumerate(notebook["cells"]):
@@ -72,6 +72,24 @@ def test_run_notebook_matches_controlled_budget_protocol():
         (PROJECT / "scripts" / "run_al.ipynb").read_text(encoding="utf-8")
     )
     source = "\n".join(_source(cell) for cell in notebook["cells"])
-    assert 'SAMPLER_NAME = "nucleus_al"' in source
+    assert 'SAMPLER_NAME = "nucleus_coverage"' in source
     assert "Missing nucleus cache" in source
     assert "OUTPUT_DIR = \"/kaggle/working/checkpoints\"" in source
+    # All three coverage feature spaces run back to back in one session.
+    for coverage_source in ("dino", "cellvit", "concat"):
+        assert f'{{"coverage_source": "{coverage_source}"}}' in source
+    assert "SAMPLER_VARIANTS" in source
+
+
+def test_run_notebook_reuses_a_persistent_dino_feature_cache():
+    """/kaggle/working is wiped between sessions, so pointing FEATURE_DIR there
+    re-extracts DINOv2 over the whole train split on every run. The notebook
+    must consume a mounted cache and fail fast when it is absent, because a
+    cache miss under a read-only FEATURE_DIR only surfaces after extraction."""
+    notebook = json.loads(
+        (PROJECT / "scripts" / "run_al.ipynb").read_text(encoding="utf-8")
+    )
+    source = "\n".join(_source(cell) for cell in notebook["cells"])
+    assert 'FEATURE_DIR = "/kaggle/working/features"' not in source
+    assert 'FEATURE_DIR = "/kaggle/input' in source
+    assert "Missing DINOv2 feature cache" in source

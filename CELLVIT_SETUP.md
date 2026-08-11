@@ -15,7 +15,7 @@ Kaggle normally already provides PyTorch, torchvision, NumPy, pandas, SciPy, sci
 
 Kaggle's Python 3.12 image cannot JIT-compile the mixed-dtype `stack_pred_maps` helper shipped in `cellvit==1.0.9`. The adapter bypasses only that four-channel `argmax + stack` helper with an equivalent NumPy float32 buffer. It still calls the official CellViT per-image HoVer/morphology/watershed post-processing unchanged; do not downgrade the whole Kaggle NumPy/PyTorch stack for this issue.
 
-Use [extract_nucleus_features.ipynb](scripts/extract_nucleus_features.ipynb). The Kaggle notebooks clone and verify the `tiendung` branch. Mount the `nckh2026` dataset and matching CellViT256 x20/x40 checkpoint under `/kaggle/input`, write caches only under `/kaggle/working`, and do not continue unless the preflight prints `[PREFLIGHT PASS]`. The default PathMNIST mount is `/kaggle/input/nckh2026/pathmnist_224.npz`; edit the single configuration cell if Kaggle assigns a different slug.
+Use [extract_nucleus_features.ipynb](scripts/extract_nucleus_features.ipynb). The Kaggle notebooks clone and verify the `namhai` branch. Mount the `nckh2026` dataset and matching CellViT256 x20/x40 checkpoint under `/kaggle/input`, write caches only under `/kaggle/working`, and do not continue unless the preflight prints `[PREFLIGHT PASS]`. The default PathMNIST mount is `/kaggle/input/nckh2026/pathmnist_224.npz`; edit the single configuration cell if Kaggle assigns a different slug.
 
 Scale is guarded in code: an x20 checkpoint must use 20× and approximately 0.5 MPP; an x40 checkpoint must use 40× and approximately 0.25 MPP. Use a current official checkpoint—the CellViT authors explicitly warn that older checkpoints predate a corrected training release.
 

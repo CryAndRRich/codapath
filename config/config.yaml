@@ -105,6 +105,20 @@ samplers:
     fusion_normalize_logits: false     # true = row-LN ablation before concat/add
     diag: true
 
+  nucleus_coverage:
+    cell_source: "cellvit_embedding"   # cache field read in run.py; this sampler always uses CellViT tokens, never crop_dino
+    coverage_source: "dino"            # dino | cellvit | concat — the 3 controlled experiments (override via SAMPLER_OVERRIDES on Kaggle)
+    missing_impute: "mean"             # mean | zero — patches with no detected nucleus. "zero" leaves them orthogonal to
+                                       # everything (never covered by an earlier pick) so the greedy over-selects them; ablation only.
+    num_rounds: 5
+    chunk_size: 2000
+    n_sigma: 2000                      # pool-subsample size for the round-1 sigma bootstrap and the sigma floor reference
+    sigma_floor_ratio: 0.25            # sigma >= this * bootstrap sigma; min-pairwise collapses to ~0 on near-duplicate tiles
+    probe_epochs: 50
+    probe_lr: 0.001
+    probe_weight_decay: 0.0001
+    diag: true
+
 nucleus_extraction:
   # Do not silently reuse one scale/checkpoint for all datasets. Override these
   # fields only after confirming the source slide/patch resolution metadata.
