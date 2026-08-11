@@ -73,7 +73,7 @@ def test_run_notebook_matches_controlled_budget_protocol():
     )
     source = "\n".join(_source(cell) for cell in notebook["cells"])
     assert 'SAMPLER_NAME = "nucleus_coverage"' in source
-    assert "Missing nucleus cache" in source
+    assert "No nucleus cache found" in source
     assert "OUTPUT_DIR = \"/kaggle/working/checkpoints\"" in source
     # All three coverage feature spaces run back to back in one session.
     for coverage_source in ("dino", "cellvit", "concat"):
@@ -81,15 +81,18 @@ def test_run_notebook_matches_controlled_budget_protocol():
     assert "SAMPLER_VARIANTS" in source
 
 
-def test_run_notebook_reuses_a_persistent_dino_feature_cache():
-    """/kaggle/working is wiped between sessions, so pointing FEATURE_DIR there
-    re-extracts DINOv2 over the whole train split on every run. The notebook
-    must consume a mounted cache and fail fast when it is absent, because a
-    cache miss under a read-only FEATURE_DIR only surfaces after extraction."""
+def test_run_notebook_resolves_caches_instead_of_hardcoding_paths():
+    """Publishing /kaggle/working/<name> as a Kaggle Dataset remounts it as
+    .../<name>/<name>, so a hard-coded cache path breaks with a bare
+    AssertionError. Both caches must be located by search, and a DINOv2 cache
+    miss must fall back to a writable directory: re-extracting into a read-only
+    /kaggle/input only fails after the full extraction has already run."""
     notebook = json.loads(
         (PROJECT / "scripts" / "run_al.ipynb").read_text(encoding="utf-8")
     )
     source = "\n".join(_source(cell) for cell in notebook["cells"])
-    assert 'FEATURE_DIR = "/kaggle/working/features"' not in source
     assert 'FEATURE_DIR = "/kaggle/input' in source
-    assert "Missing DINOv2 feature cache" in source
+    assert "def dir_containing(" in source
+    assert "dir_containing(f\"{DATASET}_seed{SEED}/manifest.json\"" in source
+    assert 'startswith("/kaggle/input")' in source
+    assert "will extract this session" in source
