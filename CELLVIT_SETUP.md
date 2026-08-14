@@ -45,3 +45,5 @@ python scripts/evaluate_nucleus_alignment.py \
 ```
 
 The representations are DINO original/normalized, cell mean, DINO+cell mean, DINO+cell moments, and DINO+conditional-cell residual. Cell moments add weighted standard deviation, cell count, and detection confidence before an unlabeled PCA. Three probe initializations are averaged by default. Omit `--selection_run` to auto-select disagreement; pass `--all_runs` only when all four acquisition variants should be audited.
+
+For the guided Kaggle workflow, use [evaluate_nucleus_alignment.ipynb](scripts/evaluate_nucleus_alignment.ipynb). It auto-detects common Kaggle mounts, validates all marker files before training, displays the learning curves and nAUC deltas, and writes the JSON artifact under `/kaggle/working`.

@@ -11,6 +11,7 @@ NOTEBOOKS = [
     PROJECT / "scripts" / "extract_features.ipynb",
     PROJECT / "scripts" / "run_al.ipynb",
     PROJECT / "scripts" / "evaluate.ipynb",
+    PROJECT / "scripts" / "evaluate_nucleus_alignment.ipynb",
 ]
 
 
@@ -75,3 +76,18 @@ def test_run_notebook_matches_controlled_budget_protocol():
     assert 'SAMPLER_NAME = "nucleus_al"' in source
     assert "Missing nucleus cache" in source
     assert "OUTPUT_DIR = \"/kaggle/working/checkpoints\"" in source
+
+
+def test_alignment_notebook_is_diagnostic_and_writes_to_working():
+    notebook = json.loads(
+        (PROJECT / "scripts" / "evaluate_nucleus_alignment.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    source = "\n".join(_source(cell) for cell in notebook["cells"])
+    assert "evaluate_nucleus_alignment.py" in source
+    assert "nucleus_cellvit_embedding_disagreement" in source
+    assert "--probe_repeats" in source
+    assert "--budgets" in source
+    assert "/kaggle/working/nucleus_alignment_" in source
+    assert "unselected training pool" in source
