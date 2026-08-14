@@ -28,3 +28,20 @@ After extraction succeeds, save `/kaggle/working/nucleus_features` as notebook o
 On a Kaggle T4, the uncapped PathMNIST pilot detected about 67.9 nuclei/patch and estimated 14.7 GiB final cache, 44.1 GiB resumable peak storage, and 30 hours for CellViT plus crop-DINO. The notebook therefore defaults to `MAX_CELLS_PER_PATCH=16`; keep this fixed across all four controlled variants. Preflight reports CellViT and crop-DINO time separately and recommends a smaller cap when needed. A cap changes the experimental protocol and must be recorded in results/manifests.
 
 Normal `run.py` jobs consume the portable cache and do not import CellViT.
+
+## Final-Learner Alignment Diagnostic
+
+After the four controlled acquisition variants finish, run the cheap diagnostic below before extracting a separate nucleus test cache or implementing another sampler. It reuses the aligned train caches and saved selected indices, trains the same linear probe on each selected set, and evaluates on the unselected train pool. The output is explicitly diagnostic—not official test accuracy.
+
+```bash
+python scripts/evaluate_nucleus_alignment.py \
+  --dataset pathmnist \
+  --data_path /kaggle/input/datasets/cryandrrich/nckh2026/pathmnist_224.npz \
+  --feature_cache_dir /kaggle/input/datasets/cryandrrich/nckh2026/features \
+  --nucleus_cache_dir /kaggle/input/<nucleus-output-slug>/nucleus_features \
+  --checkpoint_dir /kaggle/input/<al-output-slug>/checkpoints/pathmnist \
+  --selection_run nucleus_cellvit_embedding_disagreement \
+  --output /kaggle/working/nucleus_alignment_pathmnist_seed42.json
+```
+
+The representations are DINO original/normalized, cell mean, DINO+cell mean, DINO+cell moments, and DINO+conditional-cell residual. Cell moments add weighted standard deviation, cell count, and detection confidence before an unlabeled PCA. Three probe initializations are averaged by default. Omit `--selection_run` to auto-select disagreement; pass `--all_runs` only when all four acquisition variants should be audited.

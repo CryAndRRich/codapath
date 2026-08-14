@@ -73,3 +73,63 @@ def pool_ragged_features(
     else:
         raise ValueError("reliability_mode must be 'valid' or 'mean_confidence'")
     return NucleusView(pooled, reliability, counts)
+
+
+def pool_ragged_moments(
+    cell_features: np.ndarray,
+    offsets: np.ndarray,
+    confidence: Optional[np.ndarray] = None,
+) -> NucleusView:
+    """Summarize each cell set by weighted first/second moments and QC.
+
+    The output for a ``d``-dimensional cell embedding has ``2*d + 2``
+    columns: weighted mean, weighted standard deviation, ``log1p`` cell
+    count, and mean detection confidence. Empty patches are exactly zero and
+    have zero reliability. This is intentionally a cheap diagnostic between
+    the current mean pooling and a future distribution/set encoder.
+    """
+    features = np.asarray(cell_features)
+    offsets = np.asarray(offsets, dtype=np.int64)
+    if features.ndim != 2:
+        raise ValueError("cell_features must have shape (num_cells, feature_dim)")
+    if offsets.ndim != 1 or len(offsets) == 0:
+        raise ValueError("offsets must be a non-empty one-dimensional array")
+    if offsets[0] != 0 or offsets[-1] != len(features):
+        raise ValueError("Invalid ragged offsets")
+    if np.any(np.diff(offsets) < 0):
+        raise ValueError("offsets must be non-decreasing")
+
+    if confidence is None:
+        weights = np.ones(len(features), dtype=np.float32)
+    else:
+        weights = np.clip(np.asarray(confidence, dtype=np.float32), 0.0, 1.0)
+        if len(weights) != len(features):
+            raise ValueError("confidence length must match cell_features")
+
+    num_patches = len(offsets) - 1
+    feature_dim = features.shape[1]
+    pooled = np.zeros((num_patches, 2 * feature_dim + 2), dtype=np.float32)
+    counts = np.diff(offsets).astype(np.int64)
+    for patch_idx, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        if start == end:
+            continue
+        patch_features = np.asarray(features[start:end], dtype=np.float32)
+        patch_weights = weights[start:end]
+        weight_sum = float(patch_weights.sum())
+        if weight_sum <= 1e-12:
+            patch_weights = np.ones(end - start, dtype=np.float32)
+            weight_sum = float(end - start)
+        normalized_weights = patch_weights / weight_sum
+        mean = (patch_features * normalized_weights[:, None]).sum(axis=0)
+        variance = (
+            (patch_features - mean) ** 2 * normalized_weights[:, None]
+        ).sum(axis=0)
+        pooled[patch_idx, :feature_dim] = mean
+        pooled[patch_idx, feature_dim:2 * feature_dim] = np.sqrt(
+            np.maximum(variance, 0.0)
+        )
+        pooled[patch_idx, -2] = np.log1p(end - start)
+        pooled[patch_idx, -1] = float(weights[start:end].mean())
+
+    reliability = (counts > 0).astype(np.float32)
+    return NucleusView(pooled, reliability, counts)
