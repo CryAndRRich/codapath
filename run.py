@@ -15,11 +15,15 @@ from evaluate import evaluate_model, palm_evaluate, format_palm_report
 
 
 # SLICEABLE: one greedy order at max_budget; smaller budgets are exact prefixes.
-SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm", "refine"}
+SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm"}
 
 # PER_BUDGET: selection depends on the budget (budget-scaled phase / #clusters /
 # centroids), so it must be re-run for every budget.
-PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding"}
+# `refine` is here (not SLICEABLE) because its stage-2 head is uncertainty_herding,
+# whose internal phase-switch point scales with `max_budget` — slicing a single
+# max-budget run would freeze every smaller budget inside phase-1 pure coverage,
+# silently never applying the uncertainty-weighted stage-2 objective.
+PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding", "refine"}
 
 # ITERATIVE: re-run per budget with internal probe-refinement rounds.
 ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel", "nucleus_al", "nucleus_coverage"}
@@ -218,7 +222,22 @@ def main(
                 device=device,
                 **sampler_cfg,
             )
-        else:  
+        elif sampler_name == "tcm" and budget < 2 * num_classes:
+            # tcm's greedy order is only prefix-exact once budget >= 2*num_classes
+            # (below that, transition_budget = min(2*num_classes, budget) shrinks
+            # the phase-1 cluster count itself, producing a DIFFERENT clustering,
+            # not a subset of the master run) — slicing master_selected here would
+            # silently report a non-prefix result. Recompute directly instead.
+            selected_indices = get_sampler(
+                name=sampler_name,
+                image_embeddings=train_features,
+                oracle_labels=train_labels,
+                num_classes=num_classes,
+                max_budget=budget,
+                device=device,
+                **sampler_cfg,
+            )
+        else:
             selected_indices = master_selected[:budget]
 
         labeled_features = train_features[selected_indices]

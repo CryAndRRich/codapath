@@ -40,10 +40,11 @@ def activeft_sampling(**kwargs) -> List[int]:
         max_sim_vals, argmax_cols = torch.max(sim_matrix, dim=1)     
         max_exp_sim = torch.exp(max_sim_vals)                        
 
-        theta_sim = torch.matmul(theta_norm, theta_norm.t()) / tau   
-        mask_self = torch.eye(max_budget, device=device, dtype=torch.bool)
-        theta_sim_no_self = theta_sim.masked_fill(mask_self, float("-inf"))
-        cent_exp_sum = torch.sum(torch.exp(theta_sim_no_self), dim=1)
+        theta_sim = torch.matmul(theta_norm, theta_norm.t()) / tau
+        # upstream ActiveFT keeps the self-similarity term (diagonal) in this sum —
+        # it acts as an anti-collapse anchor in the partition function, not noise
+        # to be masked out; removing it changes the strength of the diversity term.
+        cent_exp_sum = torch.sum(torch.exp(theta_sim), dim=1)
 
         cent_term = cent_exp_sum[argmax_cols]                        
 
@@ -71,7 +72,7 @@ def activeft_sampling(**kwargs) -> List[int]:
                     selected_set.add(candidate_idx)
                     break
 
-    del features, theta, sim_matrix, theta_sim, mask_self, dist_to_real, ids_sort
+    del features, theta, sim_matrix, theta_sim, dist_to_real, ids_sort
     clear_memory()
 
     return selected_indices
