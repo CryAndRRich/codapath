@@ -19,8 +19,8 @@ SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm", "refine"}
 
 # PER_BUDGET: selection depends on the budget (budget-scaled phase / #clusters /
 # centroids), so it must be re-run for every budget.
-PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding", 
-                       "uherding_margin", "uherding_entropy", "uherding_cec"}
+PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding",
+                       "seq_cell_dino_mean", "seq_cell_dino_kde"}
 
 # ITERATIVE: re-run per budget with internal probe-refinement rounds.
 ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel"}
@@ -78,10 +78,17 @@ def main(
     train_vlm_features   = None
     text_embeddings      = None
     train_stain_features = None
+    train_cell_features  = None
 
     if sampler_name == "scalpel":
         from sampling.scalpel import extract_stain_features
         train_stain_features = extract_stain_features(train_loader, device)
+
+    if sampler_name in {"seq_cell_dino_mean", "seq_cell_dino_kde"}:
+        from cell_utils import load_and_aggregate_cell_embeddings
+        cell_dir = sampler_cfg.pop("cell_features_dir", "nucleus_features")
+        agg = "mean" if sampler_name == "seq_cell_dino_mean" else "kde"
+        train_cell_features = load_and_aggregate_cell_embeddings(cell_dir, aggregation=agg)
 
     if sampler_name == "codapath":
         from sampling.codapath import DualVLMExtractor, extract_text_features
@@ -133,6 +140,9 @@ def main(
                 **sampler_cfg,
             )
         elif sampler_name in PER_BUDGET_SAMPLERS:
+            extra_kwargs = {}
+            if train_cell_features is not None:
+                extra_kwargs["cell_embeddings"] = train_cell_features
             selected_indices = get_sampler(
                 name=sampler_name,
                 image_embeddings=train_features,
@@ -141,6 +151,7 @@ def main(
                 max_budget=budget,
                 device=device,
                 **sampler_cfg,
+                **extra_kwargs,
             )
         else:  
             selected_indices = master_selected[:budget]

@@ -24,6 +24,13 @@ class LinearProbe(nn.Module):
         probs = F.softmax(logits, dim=1)
         return probs.cpu().numpy().astype(np.float32)
 
+    @torch.inference_mode()
+    def predict_logits(self, features_np: np.ndarray, device: torch.device) -> np.ndarray:
+        self.eval()
+        x = torch.tensor(features_np, device=device, dtype=torch.float32)
+        logits = self(x)
+        return logits.cpu().numpy().astype(np.float32)
+
 
 def _class_weights(labels: np.ndarray, num_classes: int) -> np.ndarray:
     counts = np.bincount(labels, minlength=num_classes).astype(np.float32)

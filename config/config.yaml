@@ -52,23 +52,19 @@ samplers:
     probe_lr: 0.001
     chunk_size: 2000   
 
-  uherding_margin:
-    probe_epochs: 50
-    probe_lr: 0.001
-    chunk_size: 2000   
-
-  uherding_entropy:
-    probe_epochs: 50
-    probe_lr: 0.001
-    chunk_size: 2000   
-
-  uherding_cec:
+  seq_cell_dino_mean:
     probe_epochs: 50
     probe_lr: 0.001
     chunk_size: 2000
-    cec_n: 30
-    cec_k: 20
-    cec_beta: 1.0
+    num_rounds: 5
+    cell_features_dir: "nucleus_features/nucleus_features/pathmnist_seed42"
+
+  seq_cell_dino_kde:
+    probe_epochs: 50
+    probe_lr: 0.001
+    chunk_size: 2000
+    num_rounds: 5
+    cell_features_dir: "nucleus_features/nucleus_features/pathmnist_seed42"
 
   tcm:
     probe_epochs: 50

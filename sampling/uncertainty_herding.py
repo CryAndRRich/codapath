@@ -9,7 +9,86 @@ from set_up import clear_memory
 from . import register_sampler
 
 
-def _uherding_sampling_with_type(uncertainty_type: str, **kwargs) -> List[int]:
+def _ece(logits: np.ndarray, labels: np.ndarray, n_bins: int) -> float:
+    """Expected Calibration Error (Naeini et al., AAAI 2015), matching the
+    official ECELoss (repos/uherding/deep-al/pycls/calibration/metrics.py):
+    equal-width confidence bins over [0,1], weighted avg |confidence-accuracy|."""
+    probs = F.softmax(torch.as_tensor(logits, dtype=torch.float32), dim=1)
+    confidences, predictions = torch.max(probs, dim=1)
+    accuracies = predictions.eq(torch.as_tensor(labels, dtype=torch.long))
+
+    bin_boundaries = torch.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for lo, hi in zip(bin_boundaries[:-1], bin_boundaries[1:]):
+        in_bin = confidences.gt(lo.item()) & confidences.le(hi.item())
+        prop_in_bin = in_bin.float().mean().item()
+        if prop_in_bin > 0:
+            acc_in_bin = accuracies[in_bin].float().mean().item()
+            conf_in_bin = confidences[in_bin].mean().item()
+            ece += abs(conf_in_bin - acc_in_bin) * prop_in_bin
+    return ece
+
+
+def _calibrate_temperature(
+    features_np: np.ndarray,
+    labels: np.ndarray,
+    selected_indices: List[int],
+    num_classes: int,
+    probe_epochs: int,
+    probe_lr: float,
+    device,
+) -> float:
+    """Paper Sec. 3.2 / Proposition 3: split L into train/val, train a
+    THROWAWAY probe on train only, search temperatures minimizing ECE on val,
+    return the best one. Matches official obtain_temperature()
+    (repos/uherding/.../temperature_scaling.py): 70/30 split, grid
+    np.arange(1.0, 20, 0.1), n_bins=num_classes. This calibration probe is
+    separate from the "real" probe trained on the FULL selected set below —
+    only the resulting temperature is reused, to rescale the real probe's
+    logits before computing margin.
+    """
+    from trainer import train_linear
+
+    n_val = max(1, int(len(selected_indices) * 0.3))
+    if len(selected_indices) - n_val < 2:
+        return 1.0
+    temp_train = selected_indices[:-n_val]
+    temp_val = selected_indices[-n_val:]
+    train_labels = labels[temp_train]
+    val_labels = labels[temp_val]
+    if len(np.unique(train_labels)) < 2 or len(temp_val) < 2:
+        return 1.0
+
+    calib_probe = train_linear(
+        features_np[temp_train], train_labels, num_classes, probe_epochs, probe_lr, device,
+    )
+    val_logits = calib_probe.predict_logits(features_np[temp_val], device)
+    del calib_probe
+
+    best_temp, best_ece = 1.0, float("inf")
+    for temp in np.arange(1.0, 20.0, 0.1):
+        ece = _ece(val_logits / temp, val_labels, n_bins=num_classes)
+        if ece < best_ece:
+            best_ece = ece
+            best_temp = float(temp)
+    return best_temp
+
+
+@register_sampler("uncertainty_herding")
+def uncertainty_herding_sampling(**kwargs) -> List[int]:
+    """Uncertainty Herding (Bae, Oliveira, Sutherland — arXiv:2412.20644).
+
+    The official implementation (repos/uherding/deep-al/pycls/al/uherding.py)
+    re-instantiates UHerding at the START OF EVERY AL round: the classifier is
+    retrained on the current labeled set, sigma is recomputed as the min
+    pairwise distance on that same labeled set, and only THEN does the round's
+    batch get selected via the greedy weighted-coverage rule. The official
+    config default is 5 rounds (MAX_ITER=5). This function reproduces that:
+    round 0 has no labels yet (U=1, bootstrap sigma -> pure MaxHerding, exactly
+    Proposition 3's limit), rounds 1..num_rounds-1 each retrain the probe and
+    sigma from scratch on ALL labels revealed so far before greedily picking
+    that round's share of the budget.
+    """
     image_embeddings = kwargs["image_embeddings"]
     oracle_labels = kwargs["oracle_labels"]
     max_budget = kwargs["max_budget"]
@@ -18,32 +97,28 @@ def _uherding_sampling_with_type(uncertainty_type: str, **kwargs) -> List[int]:
     probe_lr = kwargs.get("probe_lr", 1e-3)
     device = kwargs["device"]
     chunk_size = kwargs.get("chunk_size", 2000)
-    
-    # CEC specific
-    cec_n = kwargs.get("cec_n", 30)
-    cec_k = kwargs.get("cec_k", 20)
-    cec_beta = kwargs.get("cec_beta", 1.0)
+    num_rounds = kwargs.get("num_rounds", 5)
 
     from trainer import train_linear
 
     num_samples = image_embeddings.shape[0]
-    
-    # 5 rounds -> train at 20%, 40%, 60%, 80% of max_budget
-    train_steps = [int((i + 1) * max_budget / 5) for i in range(4)]
+    rounds = max(1, min(num_rounds, max_budget))
+    base, remainder = divmod(max_budget, rounds)
+    round_sizes = [base + (1 if r < remainder else 0) for r in range(rounds)]
 
     features = torch.tensor(image_embeddings, device=device, dtype=torch.float32)
     features = F.normalize(features, p=2, dim=1)
 
-    # Initial Sigma estimation
+    # Round-0 bootstrap sigma: no labeled set exists yet, so there is no
+    # min-pairwise-distance to compute (paper doesn't define this case either).
     n_ref = min(1000, num_samples)
     ref_idx = np.random.choice(num_samples, n_ref, replace=False)
-    ref = features[ref_idx]                             
-    sim_ref = torch.matmul(ref, features.T)           
+    ref = features[ref_idx]
+    sim_ref = torch.matmul(ref, features.T)
     for i, gi in enumerate(ref_idx):
         sim_ref[i, gi] = -2.0
     nn_dist = torch.sqrt(torch.clamp(2.0 - 2.0 * sim_ref.max(dim=1).values, min=0.0))
-    sigma = nn_dist.mean().item()
-    sigma = max(sigma, 1e-3)
+    sigma = max(nn_dist.mean().item(), 1e-3)
     del ref, sim_ref, nn_dist
     clear_memory()
 
@@ -53,23 +128,33 @@ def _uherding_sampling_with_type(uncertainty_type: str, **kwargs) -> List[int]:
     selected_indices: List[int] = []
     selected_set: set = set()
 
-    for step in tqdm(range(max_budget), desc=f"UHerding {uncertainty_type.upper()} Selection"):
+    for round_idx in range(rounds):
+        n_select = round_sizes[round_idx]
+        if n_select <= 0:
+            continue
 
-        if step in train_steps and len(selected_indices) >= 2:
-            # Update Sigma based on selected points
-            sel_feats = features[selected_indices]     
+        if round_idx > 0 and len(selected_indices) >= 2:
+            sel_feats = features[selected_indices]
             sel_sim = torch.matmul(sel_feats, sel_feats.T)
             sel_dist = torch.sqrt(torch.clamp(2.0 - 2.0 * sel_sim, min=0.0))
             sel_dist.fill_diagonal_(float("inf"))
-            new_sigma = sel_dist.min().item()
-            sigma = max(new_sigma, 1e-3)
+            # Guard against near-duplicate selected points: if the closest PAIR
+            # happens to be (near-)identical, flooring sigma to 1e-3 would collapse
+            # the kernel to an indicator-of-duplicates for every other pair. Only
+            # take a genuinely positive distance as the new bandwidth; otherwise
+            # keep the previous round's sigma.
+            valid_dist = sel_dist[sel_dist > 1e-6]
+            if valid_dist.numel() > 0:
+                sigma = max(valid_dist.min().item(), 1e-3)
             del sel_feats, sel_sim, sel_dist
             clear_memory()
 
-            # Recalculate k_running with new sigma
+            # Sigma changed -> the running-max coverage k_n must be rebuilt from
+            # scratch against every previously selected point (not just carried
+            # forward), since it was computed with the OLD bandwidth.
             k_running.zero_()
             for si in selected_indices:
-                si_feat = features[si].unsqueeze(0)     
+                si_feat = features[si].unsqueeze(0)
                 for cs in range(0, num_samples, chunk_size):
                     ce = min(cs + chunk_size, num_samples)
                     chunk = features[cs:ce]
@@ -80,131 +165,61 @@ def _uherding_sampling_with_type(uncertainty_type: str, **kwargs) -> List[int]:
                     del chunk, sim_c, dist_sq_c, k_c
             clear_memory()
 
-            # Train linear probe and update U
             norm_embeddings = features.cpu().numpy()
+            tau = _calibrate_temperature(
+                norm_embeddings, oracle_labels, selected_indices, num_classes,
+                probe_epochs, probe_lr, device,
+            )
             probe = train_linear(
                 norm_embeddings[selected_indices],
                 oracle_labels[selected_indices],
                 num_classes, probe_epochs, probe_lr, device,
             )
-            probs = probe.predict_proba(norm_embeddings, device)
-            
-            if uncertainty_type == "margin":
-                s_probs = np.sort(probs, axis=1)
-                margin = s_probs[:, -1] - s_probs[:, -2]
-                U = torch.tensor(1.0 - margin, device=device, dtype=torch.float32)
-                
-            elif uncertainty_type == "entropy":
-                entropy = -np.sum(probs * np.log(probs + 1e-9), axis=1) / np.log(num_classes)
-                U = torch.tensor(entropy, device=device, dtype=torch.float32)
-                
-            elif uncertainty_type == "cec":
-                probs_t = torch.tensor(probs, device=device, dtype=torch.float32)
-                
-                # Contextual Prior
-                P_c = torch.zeros(num_classes, device=device)
-                for c in range(num_classes):
-                    c_probs = probs_t[:, c]
-                    top_N = min(cec_n, num_samples)
-                    top_val, _ = torch.topk(c_probs, top_N)
-                    P_c[c] = top_val.mean()
-                P_c = torch.clamp(P_c, min=1e-6)
-                
-                # Calibrated Entropy
-                cal_probs = probs_t / P_c.unsqueeze(0)
-                cal_probs = cal_probs / cal_probs.sum(dim=1, keepdim=True)
-                H_cal = -torch.sum(cal_probs * torch.log(cal_probs + 1e-9), dim=1) / np.log(num_classes)
-                
-                # Neighbor uncertainty using cosine similarity
-                U_neighbor = torch.zeros(num_samples, device=device)
-                for cs in range(0, num_samples, chunk_size):
-                    ce = min(cs + chunk_size, num_samples)
-                    chunk = features[cs:ce]
-                    sim = torch.matmul(chunk, features.T)
-                    # Get top k+1 (including self), then exclude self
-                    top_k_sim, top_k_idx = torch.topk(sim, cec_k + 1, dim=1)
-                    for i in range(ce - cs):
-                        neighbors_idx = top_k_idx[i, 1:]
-                        weights = top_k_sim[i, 1:]
-                        weights = torch.clamp(weights, min=0.0)
-                        if weights.sum() > 0:
-                            weights = weights / weights.sum()
-                        else:
-                            weights = torch.ones_like(weights) / cec_k
-                        U_neighbor[cs + i] = torch.sum(H_cal[neighbors_idx] * weights)
-                
-                U = H_cal + cec_beta * U_neighbor
-            
-            else:
-                raise ValueError(f"Unknown uncertainty_type: {uncertainty_type}")
-
+            logits = probe.predict_logits(norm_embeddings, device)
+            probs = F.softmax(torch.as_tensor(logits / tau, dtype=torch.float32), dim=1).numpy()
+            s_probs = np.sort(probs, axis=1)
+            margin = s_probs[:, -1] - s_probs[:, -2]
+            U = torch.tensor(1.0 - margin, device=device, dtype=torch.float32)
             del probe
             clear_memory()
 
-        # Score = U * Coverage (both normalized)
-        coverage_gains = []
-        for cs in range(0, num_samples, chunk_size):
-            ce = min(cs + chunk_size, num_samples)
-            cand = features[cs:ce]                     
+        for _ in tqdm(range(n_select), desc=f"UHerding Round {round_idx + 1}/{rounds}"):
+            best_idx = -1
+            best_score = -float("inf")
+            best_k_col = None
 
-            sim = torch.matmul(features, cand.T)      
-            dist_sq = torch.clamp(2.0 - 2.0 * sim, min=0.0)
-            k_vals = torch.exp(-dist_sq / (sigma ** 2)) 
-            gain = torch.clamp(k_vals - k_running.unsqueeze(1), min=0.0) 
-            coverage_gains.append(gain.sum(dim=0))
-            
-            del cand, sim, dist_sq, k_vals, gain
-            clear_memory()
-            
-        C = torch.cat(coverage_gains) # shape: num_samples
-        
-        # Normalize U and C
-        U_min, U_max = U.min(), U.max()
-        U_norm = (U - U_min) / (U_max - U_min) if U_max > U_min else U - U_min
-        
-        C_min, C_max = C.min(), C.max()
-        C_norm = (C - C_min) / (C_max - C_min) if C_max > C_min else C - C_min
-        
-        scores = U_norm * C_norm
+            for cs in range(0, num_samples, chunk_size):
+                ce = min(cs + chunk_size, num_samples)
+                cand = features[cs:ce]
 
-        # Mask out selected
-        for si in selected_set:
-            scores[si] = -float("inf")
+                sim = torch.matmul(features, cand.T)
+                dist_sq = torch.clamp(2.0 - 2.0 * sim, min=0.0)
+                k_vals = torch.exp(-dist_sq / (sigma ** 2))
+                gain = torch.clamp(k_vals - k_running.unsqueeze(1), min=0.0)
+                scores = (U.unsqueeze(1) * gain).sum(dim=0)
 
-        best_idx = torch.argmax(scores).item()
-        
-        # Recalculate k_col for best_idx to update k_running
-        cand = features[best_idx].unsqueeze(0)
-        sim = torch.matmul(features, cand.T)
-        dist_sq = torch.clamp(2.0 - 2.0 * sim, min=0.0)
-        best_k_col = torch.exp(-dist_sq / (sigma ** 2)).squeeze(1)
+                for si in selected_set:
+                    if cs <= si < ce:
+                        scores[si - cs] = -float("inf")
 
-        if best_idx >= 0 and best_idx not in selected_set:
-            selected_indices.append(best_idx)
-            selected_set.add(best_idx)
-            k_running = torch.maximum(k_running, best_k_col)
-            del best_k_col
-            clear_memory()
-        else:
-            break
+                local_best = torch.argmax(scores).item()
+                if scores[local_best].item() > best_score:
+                    best_score = scores[local_best].item()
+                    best_idx = cs + local_best
+                    best_k_col = k_vals[:, local_best].clone()
+
+                del cand, sim, dist_sq, k_vals, gain, scores
+                clear_memory()
+
+            if best_idx >= 0 and best_idx not in selected_set:
+                selected_indices.append(best_idx)
+                selected_set.add(best_idx)
+                k_running = torch.maximum(k_running, best_k_col)
+                del best_k_col
+                clear_memory()
+            else:
+                break
 
     del features, U, k_running
     clear_memory()
     return selected_indices
-
-
-@register_sampler("uncertainty_herding")
-def uncertainty_herding_sampling(**kwargs) -> List[int]:
-    return _uherding_sampling_with_type("margin", **kwargs)
-
-@register_sampler("uherding_margin")
-def uherding_margin_sampling(**kwargs) -> List[int]:
-    return _uherding_sampling_with_type("margin", **kwargs)
-
-@register_sampler("uherding_entropy")
-def uherding_entropy_sampling(**kwargs) -> List[int]:
-    return _uherding_sampling_with_type("entropy", **kwargs)
-
-@register_sampler("uherding_cec")
-def uherding_cec_sampling(**kwargs) -> List[int]:
-    return _uherding_sampling_with_type("cec", **kwargs)
