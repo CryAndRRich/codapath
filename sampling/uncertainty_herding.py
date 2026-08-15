@@ -9,6 +9,71 @@ from set_up import clear_memory
 from . import register_sampler
 
 
+def _ece(logits: np.ndarray, labels: np.ndarray, n_bins: int) -> float:
+    """Expected Calibration Error (Naeini et al., AAAI 2015), matching the
+    official ECELoss (repos/uherding/deep-al/pycls/calibration/metrics.py):
+    equal-width confidence bins over [0,1], weighted avg |confidence-accuracy|."""
+    probs = F.softmax(torch.as_tensor(logits, dtype=torch.float32), dim=1)
+    confidences, predictions = torch.max(probs, dim=1)
+    accuracies = predictions.eq(torch.as_tensor(labels, dtype=torch.long))
+
+    bin_boundaries = torch.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for lo, hi in zip(bin_boundaries[:-1], bin_boundaries[1:]):
+        in_bin = confidences.gt(lo.item()) & confidences.le(hi.item())
+        prop_in_bin = in_bin.float().mean().item()
+        if prop_in_bin > 0:
+            acc_in_bin = accuracies[in_bin].float().mean().item()
+            conf_in_bin = confidences[in_bin].mean().item()
+            ece += abs(conf_in_bin - acc_in_bin) * prop_in_bin
+    return ece
+
+
+def _calibrate_temperature(
+    features_np: np.ndarray,
+    labels: np.ndarray,
+    selected_indices: List[int],
+    num_classes: int,
+    probe_epochs: int,
+    probe_lr: float,
+    device,
+) -> float:
+    """Paper Sec. 3.2 / Proposition 3: split L into train/val, train a
+    THROWAWAY probe on train only, search temperatures minimizing ECE on val,
+    return the best one. Matches official obtain_temperature()
+    (repos/uherding/.../temperature_scaling.py): 70/30 split, grid
+    np.arange(1.0, 20, 0.1), n_bins=num_classes. This calibration probe is
+    separate from the "real" probe trained on the FULL selected set below —
+    only the resulting temperature is reused, to rescale the real probe's
+    logits before computing margin.
+    """
+    from trainer import train_linear
+
+    n_val = max(1, int(len(selected_indices) * 0.3))
+    if len(selected_indices) - n_val < 2:
+        return 1.0
+    temp_train = selected_indices[:-n_val]
+    temp_val = selected_indices[-n_val:]
+    train_labels = labels[temp_train]
+    val_labels = labels[temp_val]
+    if len(np.unique(train_labels)) < 2 or len(temp_val) < 2:
+        return 1.0
+
+    calib_probe = train_linear(
+        features_np[temp_train], train_labels, num_classes, probe_epochs, probe_lr, device,
+    )
+    val_logits = calib_probe.predict_logits(features_np[temp_val], device)
+    del calib_probe
+
+    best_temp, best_ece = 1.0, float("inf")
+    for temp in np.arange(1.0, 20.0, 0.1):
+        ece = _ece(val_logits / temp, val_labels, n_bins=num_classes)
+        if ece < best_ece:
+            best_ece = ece
+            best_temp = float(temp)
+    return best_temp
+
+
 @register_sampler("uncertainty_herding")
 def uncertainty_herding_sampling(**kwargs) -> List[int]:
     """Uncertainty Herding (Bae, Oliveira, Sutherland — arXiv:2412.20644).
@@ -101,12 +166,17 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
             clear_memory()
 
             norm_embeddings = features.cpu().numpy()
+            tau = _calibrate_temperature(
+                norm_embeddings, oracle_labels, selected_indices, num_classes,
+                probe_epochs, probe_lr, device,
+            )
             probe = train_linear(
                 norm_embeddings[selected_indices],
                 oracle_labels[selected_indices],
                 num_classes, probe_epochs, probe_lr, device,
             )
-            probs = probe.predict_proba(norm_embeddings, device)
+            logits = probe.predict_logits(norm_embeddings, device)
+            probs = F.softmax(torch.as_tensor(logits / tau, dtype=torch.float32), dim=1).numpy()
             s_probs = np.sort(probs, axis=1)
             margin = s_probs[:, -1] - s_probs[:, -2]
             U = torch.tensor(1.0 - margin, device=device, dtype=torch.float32)

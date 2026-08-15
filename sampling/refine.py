@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from set_up import clear_memory
 from . import register_sampler, get_sampler
+from .uncertainty_herding import _calibrate_temperature
 
 
 def _stage2_coverage_select(
@@ -45,12 +46,17 @@ def _stage2_coverage_select(
         del sel_feats, sel_sim, sel_dist
 
         norm_embeddings = features.cpu().numpy()
+        tau = _calibrate_temperature(
+            norm_embeddings, oracle_labels, labeled_indices, num_classes,
+            probe_epochs, probe_lr, device,
+        )
         probe = train_linear(
             norm_embeddings[labeled_indices],
             oracle_labels[labeled_indices],
             num_classes, probe_epochs, probe_lr, device,
         )
-        probs = probe.predict_proba(norm_embeddings[candidate_indices], device)
+        logits = probe.predict_logits(norm_embeddings[candidate_indices], device)
+        probs = F.softmax(torch.as_tensor(logits / tau, dtype=torch.float32), dim=1).numpy()
         s_probs = np.sort(probs, axis=1)
         margin = s_probs[:, -1] - s_probs[:, -2]
         U = torch.tensor(1.0 - margin, device=device, dtype=torch.float32)
