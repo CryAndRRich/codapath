@@ -119,6 +119,24 @@ samplers:
     probe_weight_decay: 0.0001
     diag: true
 
+  graph_deuce:
+    cell_source: "cellvit_embedding"    # cache field read in run.py; this sampler always uses CellViT tokens, never crop_dino
+    acquisition_variant: "laplace_margin"  # laplace_margin | uherding_swap_uncertainty | uherding_swap_coverage | laplace_plus_ppr
+                                            # override via SAMPLER_OVERRIDES on Kaggle to run all 4, one session each — same
+                                            # pattern as nucleus_coverage's coverage_source (see EXPERIMENT.md Hướng 3 mục 7.10)
+    k: 20                               # kNN neighbors for both W_visual/W_cell (mượn SARGraphAL's k, not DEUCE's k=500 which is for text pools)
+    chunk_size: 2000
+    vae_epochs: 100
+    vae_lr: 0.001
+    vae_visual_hidden: [256, 128]
+    vae_cell_hidden: [128, 64]
+    vae_latent_dim: 32                  # mượn nguyên latent_dim của CVAE gốc SARGraphAL
+    gamma: 1.0                          # DEUCE merge threshold — KHÔNG phải hyperparameter cần tune (xem EXPERIMENT.md mục 0)
+    probe_epochs: 50                    # chỉ dùng bởi uherding_swap_coverage (LinearProbe+ECE trên DINO)
+    probe_lr: 0.001
+    ppr_damping: 0.85                   # chỉ dùng bởi laplace_plus_ppr
+    ppr_alpha: 0.5                      # chỉ dùng bởi laplace_plus_ppr — trộn (1-alpha)*uncertainty + alpha*coverage, CHƯA TUNE
+
 nucleus_extraction:
   # Do not silently reuse one scale/checkpoint for all datasets. Override these
   # fields only after confirming the source slide/patch resolution metadata.

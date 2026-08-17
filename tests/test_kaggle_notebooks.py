@@ -81,6 +81,20 @@ def test_run_notebook_matches_controlled_budget_protocol():
     assert "SAMPLER_VARIANTS" in source
 
 
+def test_run_notebook_loads_nucleus_cache_for_graph_deuce_too():
+    """graph_deuce reads the CellViT nucleus cache exactly like nucleus_al/
+    nucleus_coverage (EXPERIMENT.md Hướng 3 mục 7.1/7.4) — if this condition
+    in run_al.ipynb ever drops "graph_deuce" again, NUCLEUS_FEATURE_DIR stays
+    an unresolved placeholder and load_nucleus_cache fails deep inside main()
+    instead of with a clear assert here."""
+    notebook = json.loads(
+        (PROJECT / "scripts" / "run_al.ipynb").read_text(encoding="utf-8")
+    )
+    source = "\n".join(_source(cell) for cell in notebook["cells"])
+    assert 'SAMPLER_NAME in ("nucleus_al", "nucleus_coverage", "graph_deuce")' in source
+    assert '"graph_deuce"' in source  # SAMPLER_NAME comment / variant docs mention it
+
+
 def test_run_notebook_resolves_caches_instead_of_hardcoding_paths():
     """Publishing /kaggle/working/<name> as a Kaggle Dataset remounts it as
     .../<name>/<name>, so a hard-coded cache path breaks with a bare

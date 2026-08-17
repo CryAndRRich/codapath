@@ -26,7 +26,7 @@ SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm"}
 PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding", "refine"}
 
 # ITERATIVE: re-run per budget with internal probe-refinement rounds.
-ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel", "nucleus_al", "nucleus_coverage"}
+ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel", "nucleus_al", "nucleus_coverage", "graph_deuce"}
 
 
 def _save(path: str, obj) -> None:
@@ -85,6 +85,9 @@ def main(
             if missing_impute != "mean":
                 # Keep the ablation from overwriting the main run's checkpoints.
                 run_name = f"{run_name}_{missing_impute}"
+        elif sampler_name == "graph_deuce":
+            acquisition_variant = sampler_cfg.get("acquisition_variant", "laplace_margin")
+            run_name = f"graph_deuce_{acquisition_variant}"
     output_name = _safe_run_name(run_name or sampler_name)
 
     train_labels = (
@@ -135,7 +138,7 @@ def main(
                 "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"),
         )
 
-    if sampler_name in {"nucleus_al", "nucleus_coverage"}:
+    if sampler_name in {"nucleus_al", "nucleus_coverage", "graph_deuce"}:
         from nucleus.cache import load_nucleus_cache
         from nucleus.ragged import pool_ragged_features
 
@@ -204,7 +207,7 @@ def main(
                 device=device,
                 **sampler_cfg,
             )
-            if sampler_name in {"nucleus_al", "nucleus_coverage"}:
+            if sampler_name in {"nucleus_al", "nucleus_coverage", "graph_deuce"}:
                 iterative_kwargs.update(
                     nucleus_embeddings=nucleus_embeddings,
                     nucleus_reliability=nucleus_reliability,
@@ -342,6 +345,11 @@ if __name__ == "__main__":
         "--missing_impute", choices=["mean", "zero"],
         default=None, help="Override nucleus_coverage.missing_impute.",
     )
+    parser.add_argument(
+        "--acquisition_variant",
+        choices=["laplace_margin", "uherding_swap_uncertainty", "uherding_swap_coverage", "laplace_plus_ppr"],
+        default=None, help="Override graph_deuce.acquisition_variant.",
+    )
 
     args = parser.parse_args(remaining_argv)
 
@@ -367,6 +375,10 @@ if __name__ == "__main__":
             sampler_cfg["coverage_source"] = args.coverage_source
         if args.missing_impute is not None:
             sampler_cfg["missing_impute"] = args.missing_impute
+    if args.acquisition_variant is not None:
+        if args.sampler_name != "graph_deuce":
+            raise ValueError("--acquisition_variant is valid only for graph_deuce")
+        sampler_cfg["acquisition_variant"] = args.acquisition_variant
 
     print("=" * 60)
     print(f"Dataset      : {dataset_key.upper()} ({dataset_info['num_classes']} classes)")

@@ -35,3 +35,4 @@ from . import codapath
 from . import scalpel
 from . import nucleus_al
 from . import nucleus_coverage
+from . import graph_deuce

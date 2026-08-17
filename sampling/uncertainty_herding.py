@@ -88,6 +88,29 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
     Proposition 3's limit), rounds 1..num_rounds-1 each retrain the probe and
     sigma from scratch on ALL labels revealed so far before greedily picking
     that round's share of the budget.
+
+    Verified 2026-08-17 against the paper PDF directly (Definition 5,
+    Algorithm 1, Propositions 3/4) and `uherding.py::UHerding.select_samples`
+    line-by-line: the greedy update here (`k_running = torch.maximum(k_running,
+    best_k_col)`) and the official code's (`max_embedding = updated_max_embedding
+    [selected_index] + max_embedding`) are algebraically IDENTICAL
+    (`max(a-b,0)+b == max(a,b)`), just written differently. One REAL,
+    deliberate difference found and confirmed with the user: the official
+    code subsamples the unlabeled pool to `compute_cand_size(...) <= 35000`
+    candidates per round (`deep-al/pycls/utils/io.py`) — a GPU-memory
+    optimization for their ImageNet-scale experiments (up to ~1.2M images),
+    NOT part of Algorithm 1 itself (which defines the argmax over the FULL
+    U_t, no subsampling). This function considers the FULL pool every round
+    (chunked via `chunk_size` for memory, not subsampled) — arguably MORE
+    faithful to Algorithm 1's literal definition than the official code's own
+    scalability compromise, at the cost of being slower per round on pools
+    larger than ~35k (e.g. PathMNIST). Kept as full-pool by explicit user
+    decision (2026-08-17) rather than adding a matching subsample, to avoid
+    introducing a new source of randomness for no fidelity gain at this
+    project's pool sizes. This also applies to `refine.py`'s stage-2 (reuses
+    `_calibrate_temperature` from this file) and `sampling/graph_deuce.py`'s
+    `uherding_swap_uncertainty`/`uherding_swap_coverage` variants, which
+    mirror this same per-point loop.
     """
     image_embeddings = kwargs["image_embeddings"]
     oracle_labels = kwargs["oracle_labels"]
