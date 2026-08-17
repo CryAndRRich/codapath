@@ -80,6 +80,7 @@ def _build_dual_graph(
     vae_cell_hidden,
     vae_latent_dim: int,
     gamma: float,
+    vae_batch_size: int = 512,
 ) -> sps.csr_matrix:
     N = dino_np.shape[0]
     x_visual = F.normalize(
@@ -100,7 +101,10 @@ def _build_dual_graph(
     vae_visual = MLPVAE(
         input_dim=x_visual.shape[1], hidden_dims=vae_visual_hidden, latent_dim=vae_latent_dim
     ).to(device)
-    train_vae(vae_visual, x_visual, epochs=vae_epochs, lr=vae_lr, device=device)
+    train_vae(
+        vae_visual, x_visual, epochs=vae_epochs, lr=vae_lr, batch_size=vae_batch_size,
+        device=device, desc="graph_deuce VAE_visual",
+    )
     z_visual = vae_visual.latent(x_visual)
     del vae_visual, x_visual
     clear_memory()
@@ -108,7 +112,10 @@ def _build_dual_graph(
     vae_cell = MLPVAE(
         input_dim=x_cell_reliable.shape[1], hidden_dims=vae_cell_hidden, latent_dim=vae_latent_dim
     ).to(device)
-    train_vae(vae_cell, x_cell_reliable, epochs=vae_epochs, lr=vae_lr, device=device)
+    train_vae(
+        vae_cell, x_cell_reliable, epochs=vae_epochs, lr=vae_lr, batch_size=vae_batch_size,
+        device=device, desc="graph_deuce VAE_cell",
+    )
     z_cell_reliable = vae_cell.latent(x_cell_reliable)
     del vae_cell, x_cell_reliable
     clear_memory()
@@ -119,6 +126,63 @@ def _build_dual_graph(
 
     del z_visual, z_cell_reliable
     clear_memory()
+    return W_dual
+
+
+# Process-lifetime cache: VAE training + graph construction is fully
+# unsupervised (mục 7.1 EXPERIMENT.md) — it does not depend on the AL budget
+# or on `acquisition_variant`. `run.py`'s per-budget loop calls
+# `graph_deuce_sampling` once per entry in `cumulative_budget` (e.g. 8x for
+# [25..200]) and the SAME `train_features`/`nucleus_embeddings` numpy arrays
+# are passed every time (never reassigned/copied across that loop) — so
+# without this cache, both VAEs get retrained and both graphs rebuilt from
+# scratch 8 times per run, and again for every acquisition_variant tried in
+# the same session, for zero benefit. Keyed on `id()` of the input arrays
+# (valid within one process's lifetime, per the argument above) plus every
+# hyperparameter that changes the resulting graph.
+_GRAPH_CACHE: Dict[tuple, sps.csr_matrix] = {}
+
+
+def _build_dual_graph_cached(
+    dino_np: np.ndarray,
+    cell_np: np.ndarray,
+    reliability: np.ndarray,
+    device: torch.device,
+    k: int,
+    chunk_size: int,
+    vae_epochs: int,
+    vae_lr: float,
+    vae_visual_hidden,
+    vae_cell_hidden,
+    vae_latent_dim: int,
+    gamma: float,
+    vae_batch_size: int,
+) -> sps.csr_matrix:
+    key = (
+        id(dino_np), id(cell_np), id(reliability), k, vae_epochs, vae_lr,
+        tuple(vae_visual_hidden), tuple(vae_cell_hidden), vae_latent_dim, gamma,
+        vae_batch_size,
+    )
+    cached = _GRAPH_CACHE.get(key)
+    if cached is not None:
+        print(
+            "[graph_deuce] Reusing cached VAE+graph build from earlier this "
+            "session (same pool + hyperparams) — skipping VAE retrain/graph rebuild."
+        )
+        return cached
+
+    print(
+        "[graph_deuce] No cached graph yet for this pool/hyperparams — training "
+        "VAE_visual + VAE_cell and building W_dual now. This happens ONCE per "
+        "session and is reused for every budget and every acquisition_variant "
+        "after this."
+    )
+    W_dual = _build_dual_graph(
+        dino_np, cell_np, reliability, device, k, chunk_size,
+        vae_epochs, vae_lr, vae_visual_hidden, vae_cell_hidden, vae_latent_dim, gamma,
+        vae_batch_size,
+    )
+    _GRAPH_CACHE[key] = W_dual
     return W_dual
 
 
@@ -212,6 +276,73 @@ def _round_scores_laplace_plus_ppr(
     coverage = -pi  # LOW pi (far from labeled set) -> HIGH coverage priority
     score = (1.0 - alpha) * _rank_normalize(uncertainty) + alpha * _rank_normalize(coverage)
     return torch.as_tensor(score, device=device, dtype=torch.float32)
+
+
+def _unlabeled_array(N: int, selected_set: Set[int]) -> np.ndarray:
+    return np.setdiff1d(
+        np.arange(N), np.fromiter(selected_set, dtype=np.int64, count=len(selected_set)),
+        assume_unique=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# per_point=True: giải lại Laplace learning sau MỖI điểm chọn — đúng vòng lặp
+# tuần tự thật của bài gốc SARGraphAL (`active_learning.py::active_learning_loop`,
+# xem docstring `graph_al/laplace.py`), thay vì 1 lần/vòng (mặc định,
+# `_select_batch_with_discount`). Chỉ áp dụng cho laplace_margin/laplace_plus_ppr
+# — 2 biến thể uherding_swap_* KHÔNG dùng cơ chế này (uncertainty của chúng cố
+# ý giữ nguyên round-based như chính uncertainty_herding.py gốc, xem 7.10.1/7.10.2).
+# Chi phí: ~budget lần giải CG thay vì ~num_rounds lần — mỗi lần đã song song
+# hoá theo lớp (graph_al/laplace.py) nhưng số lần gọi tăng đáng kể.
+# ---------------------------------------------------------------------------
+
+def _select_points_per_point_laplace_margin(
+    W_dual: sps.spmatrix,
+    selected_indices: List[int],
+    selected_set: Set[int],
+    oracle_labels: np.ndarray,
+    num_classes: int,
+    N: int,
+    device: torch.device,
+    n_select: int,
+) -> List[int]:
+    picks: List[int] = []
+    for _ in tqdm(range(n_select), desc="graph_deuce laplace_margin (per_point)"):
+        scores = _round_scores_laplace_margin(
+            W_dual, selected_indices + picks, oracle_labels, num_classes, N, device,
+        )
+        unlabeled = _unlabeled_array(N, selected_set)
+        unlabeled_t = torch.as_tensor(unlabeled, device=device, dtype=torch.long)
+        best_idx = int(unlabeled[int(torch.argmax(scores[unlabeled_t]).item())])
+        picks.append(best_idx)
+        selected_set.add(best_idx)
+    return picks
+
+
+def _select_points_per_point_laplace_plus_ppr(
+    W_dual: sps.spmatrix,
+    selected_indices: List[int],
+    selected_set: Set[int],
+    oracle_labels: np.ndarray,
+    num_classes: int,
+    N: int,
+    device: torch.device,
+    n_select: int,
+    ppr_damping: float,
+    ppr_alpha: float,
+) -> List[int]:
+    picks: List[int] = []
+    for _ in tqdm(range(n_select), desc="graph_deuce laplace_plus_ppr (per_point)"):
+        scores = _round_scores_laplace_plus_ppr(
+            W_dual, selected_indices + picks, oracle_labels, num_classes, N, device,
+            ppr_damping, ppr_alpha,
+        )
+        unlabeled = _unlabeled_array(N, selected_set)
+        unlabeled_t = torch.as_tensor(unlabeled, device=device, dtype=torch.long)
+        best_idx = int(unlabeled[int(torch.argmax(scores[unlabeled_t]).item())])
+        picks.append(best_idx)
+        selected_set.add(best_idx)
+    return picks
 
 
 # ---------------------------------------------------------------------------
@@ -396,14 +527,17 @@ def graph_deuce_sampling(**kwargs) -> List[int]:
     probe_lr = float(kwargs.get("probe_lr", 1e-3))
     ppr_damping = float(kwargs.get("ppr_damping", 0.85))
     ppr_alpha = float(kwargs.get("ppr_alpha", 0.5))
+    vae_batch_size = int(kwargs.get("vae_batch_size", 512))
+    per_point = bool(kwargs.get("per_point", False))
 
     N = dino_np.shape[0]
     B = min(max_budget, N)
     step_budget = max(1, int(0.2 * B))
 
-    W_dual = _build_dual_graph(
+    W_dual = _build_dual_graph_cached(
         dino_np, cell_np, reliability, device, k, chunk_size,
         vae_epochs, vae_lr, vae_visual_hidden, vae_cell_hidden, vae_latent_dim, gamma,
+        vae_batch_size,
     )
 
     dino_features_norm = F.normalize(
@@ -423,15 +557,45 @@ def graph_deuce_sampling(**kwargs) -> List[int]:
     while len(selected_indices) < B:
         current_need = min(step_budget, B - len(selected_indices))
 
-        if acquisition_variant == "laplace_margin":
-            unlabeled_indices = [i for i in range(N) if i not in selected_set]
+        if acquisition_variant in ("laplace_margin", "laplace_plus_ppr") and not _has_two_classes(
+            oracle_labels, selected_indices
+        ):
+            # Cold start: Laplace learning needs >=2 labeled classes, so there is
+            # no real uncertainty signal yet. Previously this branch fed a
+            # uniform `scores=ones(N)` into `_select_batch_with_discount`, whose
+            # very first pick is `argmax` over an all-tied array — torch breaks
+            # ties by LOWEST INDEX, so the "coverage" round-1 pick was really
+            # just pool-index-0 (or whichever index survives ties), unrelated to
+            # any coverage/diversity property, unlike the coverage-only-round-1
+            # convention every other sampler in this project follows (see
+            # CLAUDE.md 2×2 sampler table). Use the SAME genuine facility-location
+            # greedy the uherding_swap_coverage variant uses for its own round 1
+            # (U=ones over the real graph structure) instead — a real, data-
+            # dependent representative pick. Found + fixed 2026-08-17 while
+            # investigating low budget=25 accuracy.
+            ones = torch.ones(N, device=device, dtype=torch.float32)
+            chosen = greedy_coverage_sparse(W_dual, ones, current_need, selected_set, device)
+
+        elif acquisition_variant == "laplace_margin" and per_point:
+            chosen = _select_points_per_point_laplace_margin(
+                W_dual, selected_indices, selected_set, oracle_labels, num_classes, N, device, current_need,
+            )
+
+        elif acquisition_variant == "laplace_margin":
+            unlabeled_indices = _unlabeled_array(N, selected_set).tolist()
             scores = _round_scores_laplace_margin(
                 W_dual, selected_indices, oracle_labels, num_classes, N, device,
             )
             chosen = _select_batch_with_discount(scores, unlabeled_indices, current_need, W_dual, device)
 
+        elif acquisition_variant == "laplace_plus_ppr" and per_point:
+            chosen = _select_points_per_point_laplace_plus_ppr(
+                W_dual, selected_indices, selected_set, oracle_labels, num_classes, N, device,
+                current_need, ppr_damping, ppr_alpha,
+            )
+
         elif acquisition_variant == "laplace_plus_ppr":
-            unlabeled_indices = [i for i in range(N) if i not in selected_set]
+            unlabeled_indices = _unlabeled_array(N, selected_set).tolist()
             scores = _round_scores_laplace_plus_ppr(
                 W_dual, selected_indices, oracle_labels, num_classes, N, device,
                 ppr_damping, ppr_alpha,

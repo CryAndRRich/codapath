@@ -28,6 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
 
 def _mlp_stack(dims: Sequence[int]) -> nn.Sequential:
@@ -204,15 +205,23 @@ def train_vae(
     weight_decay: float = 0.0,
     beta: float = 1.0,
     device: torch.device = torch.device("cpu"),
+    verbose: bool = True,
+    desc: str = "VAE",
 ) -> List[float]:
-    """Trains `model` in place on `data` (N, input_dim). Returns per-epoch mean loss."""
+    """Trains `model` in place on `data` (N, input_dim). Returns per-epoch mean loss.
+
+    `verbose=True` (default) shows a tqdm bar over epochs with the running
+    loss as postfix — this model has no other progress signal (no accuracy,
+    no eval split), so without this a 100-epoch run prints nothing until it
+    finishes, easy to mistake for a hang."""
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     loader = DataLoader(TensorDataset(data), batch_size=min(batch_size, len(data)), shuffle=True)
 
     history: List[float] = []
     model.train()
-    for _ in range(epochs):
+    progress = tqdm(range(epochs), desc=desc, disable=not verbose)
+    for _ in progress:
         running = 0.0
         for (xb,) in loader:
             xb = xb.to(device)
@@ -223,6 +232,8 @@ def train_vae(
             optimizer.step()
             running += loss.item()
         history.append(running / len(data))
+        if verbose:
+            progress.set_postfix(loss=f"{history[-1]:.3f}")
     return history
 
 
@@ -262,6 +273,8 @@ def train_dual_branch_vae(
     align_weight_max: float = 1.0,
     align_anneal_epochs: int = 20,
     device: torch.device = torch.device("cpu"),
+    verbose: bool = True,
+    desc: str = "DualBranchVAE",
 ) -> List[float]:
     """Trains `model` in place. `align_weight` ramps linearly from 0 to
     `align_weight_max` over the first `align_anneal_epochs` epochs (posterior
@@ -277,7 +290,8 @@ def train_dual_branch_vae(
 
     history: List[float] = []
     model.train()
-    for epoch in range(epochs):
+    progress = tqdm(range(epochs), desc=desc, disable=not verbose)
+    for epoch in progress:
         align_weight = align_weight_max * min(1.0, (epoch + 1) / max(1, align_anneal_epochs))
         running = 0.0
         for vb, cb, rb in loader:
@@ -288,4 +302,6 @@ def train_dual_branch_vae(
             optimizer.step()
             running += loss.item()
         history.append(running / len(visual))
+        if verbose:
+            progress.set_postfix(loss=f"{history[-1]:.3f}", align_w=f"{align_weight:.2f}")
     return history

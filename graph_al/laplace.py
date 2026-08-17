@@ -24,6 +24,8 @@ than MSTAR's few thousand points — profile before running many sequential
 iterations on a large pool.
 """
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
@@ -92,12 +94,24 @@ def laplace_learning(
     A_precond = (precond @ A @ precond).tocsr()
     b_precond = precond @ b
 
-    v = np.zeros_like(b)
-    for c in range(num_classes):
+    def _solve_class(c: int):
         sol, info = _cg_solve(A_precond, np.asarray(b_precond[:, c]).ravel(), tol)
         if info != 0:
             raise RuntimeError(f"Conjugate gradient did not converge for class {c} (info={info})")
-        v[:, c] = sol
+        return c, sol
+
+    # One CG solve per class, each fully independent (same A_precond, different
+    # RHS) — dispatched across threads instead of a sequential Python loop.
+    # scipy's sparse matvec (inside `spla.cg`) is a compiled C extension that
+    # releases the GIL, so this actually uses multiple CPU cores rather than
+    # just adding thread overhead — meaningful on Kaggle's multi-core CPU
+    # since this whole solve runs on CPU regardless of GPU availability
+    # (see module docstring / CLAUDE.md 2026-08-17 GPU-utilization note).
+    v = np.zeros_like(b)
+    max_workers = min(num_classes, os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for c, sol in pool.map(_solve_class, range(num_classes)):
+            v[:, c] = sol
     v = precond @ v
 
     u = np.zeros((N, num_classes), dtype=np.float64)

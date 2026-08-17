@@ -88,6 +88,10 @@ def main(
         elif sampler_name == "graph_deuce":
             acquisition_variant = sampler_cfg.get("acquisition_variant", "laplace_margin")
             run_name = f"graph_deuce_{acquisition_variant}"
+            if sampler_cfg.get("per_point", False):
+                # Keep per_point=True runs from overwriting the round-based
+                # (per_point=False) checkpoints of the same acquisition_variant.
+                run_name = f"{run_name}_perpoint"
     output_name = _safe_run_name(run_name or sampler_name)
 
     train_labels = (

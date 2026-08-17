@@ -124,10 +124,16 @@ samplers:
     acquisition_variant: "laplace_margin"  # laplace_margin | uherding_swap_uncertainty | uherding_swap_coverage | laplace_plus_ppr
                                             # override via SAMPLER_OVERRIDES on Kaggle to run all 4, one session each — same
                                             # pattern as nucleus_coverage's coverage_source (see EXPERIMENT.md Hướng 3 mục 7.10)
+    per_point: false                       # true = giải lại Laplace learning sau MỖI điểm chọn (đúng vòng lặp tuần tự thật
+                                            # của SARGraphAL gốc), chỉ có tác dụng với laplace_margin/laplace_plus_ppr — 2
+                                            # biến thể uherding_swap_* bỏ qua tham số này (giữ nguyên round-based của UHerding
+                                            # gốc). false (mặc định) = discount-batch 1 lần/vòng, rẻ hơn ~5x nhưng kém trung
+                                            # thành hơn — xem chat 2026-08-17 (per-point fidelity).
     k: 20                               # kNN neighbors for both W_visual/W_cell (mượn SARGraphAL's k, not DEUCE's k=500 which is for text pools)
     chunk_size: 2000
     vae_epochs: 100
     vae_lr: 0.001
+    vae_batch_size: 512                 # bigger batches keep the GPU busier for this small MLP-VAE (see chat 2026-08-17 GPU-utilization note)
     vae_visual_hidden: [256, 128]
     vae_cell_hidden: [128, 64]
     vae_latent_dim: 32                  # mượn nguyên latent_dim của CVAE gốc SARGraphAL
