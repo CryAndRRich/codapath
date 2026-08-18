@@ -92,6 +92,12 @@ def main(
                 # Keep per_point=True runs from overwriting the round-based
                 # (per_point=False) checkpoints of the same acquisition_variant.
                 run_name = f"{run_name}_perpoint"
+            deuce_uncertainty_source = sampler_cfg.get("deuce_uncertainty_source", "laplace_margin")
+            if acquisition_variant == "deuce_native" and deuce_uncertainty_source != "laplace_margin":
+                # Otherwise BOTH deuce_uncertainty_source runs share the exact
+                # same run_name ("graph_deuce_deuce_native") and silently
+                # overwrite each other's checkpoints (2026-08-18).
+                run_name = f"{run_name}_{deuce_uncertainty_source}"
             embedding_reduction = sampler_cfg.get("embedding_reduction", "vae")
             if embedding_reduction != "vae":
                 # Otherwise a "pca" sweep silently overwrites the "vae" run's
