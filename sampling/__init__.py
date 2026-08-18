@@ -34,3 +34,6 @@ from . import refine
 from . import codapath
 from . import scalpel
 from . import scalpel_multiscale
+from . import nucleus_al
+from . import nucleus_coverage
+from . import graph_deuce

@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from set_up import set_seed, clear_memory
-from load_data import get_data_loaders
+from load_data import get_data_loaders, get_sample_ids, sample_order_fingerprint
 from model import extract_image_features, get_or_extract_features
 from trainer import train_linear, save_model
 from sampling import get_sampler
@@ -15,19 +15,32 @@ from evaluate import evaluate_model, palm_evaluate, format_palm_report
 
 
 # SLICEABLE: one greedy order at max_budget; smaller budgets are exact prefixes.
-SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm", "refine"}
+SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm"}
 
 # PER_BUDGET: selection depends on the budget (budget-scaled phase / #clusters /
 # centroids), so it must be re-run for every budget.
-PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding"}
+# `refine` is here (not SLICEABLE) because its stage-2 head is uncertainty_herding,
+# whose internal phase-switch point scales with `max_budget` — slicing a single
+# max-budget run would freeze every smaller budget inside phase-1 pure coverage,
+# silently never applying the uncertainty-weighted stage-2 objective.
+PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding", "refine"}
 
 # ITERATIVE: re-run per budget with internal probe-refinement rounds.
-ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel", "scalpel_multiscale"}
+ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel", "scalpel_multiscale",
+                      "nucleus_al", "nucleus_coverage", "graph_deuce"}
 
 
 def _save(path: str, obj) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(obj, path)
+
+
+def _safe_run_name(name: str) -> str:
+    if not name or name in {".", ".."}:
+        raise ValueError("run_name must be a non-empty filename-safe identifier")
+    if any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in name):
+        raise ValueError("run_name may contain only letters, numbers, '_' and '-'")
+    return name
 
 
 def main(
@@ -46,6 +59,8 @@ def main(
     verbose: bool,
     model_cfg: Dict,
     feature_cache_dir: str = "features",
+    nucleus_cache_dir: str = "nucleus_features",
+    run_name: str = None,
 ) -> None:
 
     print(f"Device: {device}")
@@ -55,6 +70,30 @@ def main(
     train_loader, test_loader, class_names = get_data_loaders(data_path, random_seed, verbose)
     train_dataset = train_loader.dataset
     test_dataset  = test_loader.dataset
+    train_sample_ids = get_sample_ids(train_dataset)
+    test_sample_ids = get_sample_ids(test_dataset)
+    train_fingerprint = sample_order_fingerprint(train_sample_ids)
+    test_fingerprint = sample_order_fingerprint(test_sample_ids)
+    if run_name is None:
+        if sampler_name == "nucleus_al":
+            source = sampler_cfg.get("cell_source", "cellvit_embedding")
+            uncertainty = sampler_cfg.get("uncertainty_mode", "disagreement")
+            run_name = f"nucleus_{source}_{uncertainty}"
+        elif sampler_name == "nucleus_coverage":
+            coverage_source = sampler_cfg.get("coverage_source", "dino")
+            run_name = f"nucleus_coverage_{coverage_source}"
+            missing_impute = sampler_cfg.get("missing_impute", "mean")
+            if missing_impute != "mean":
+                # Keep the ablation from overwriting the main run's checkpoints.
+                run_name = f"{run_name}_{missing_impute}"
+        elif sampler_name == "graph_deuce":
+            acquisition_variant = sampler_cfg.get("acquisition_variant", "laplace_margin")
+            run_name = f"graph_deuce_{acquisition_variant}"
+            if sampler_cfg.get("per_point", False):
+                # Keep per_point=True runs from overwriting the round-based
+                # (per_point=False) checkpoints of the same acquisition_variant.
+                run_name = f"{run_name}_perpoint"
+    output_name = _safe_run_name(run_name or sampler_name)
 
     train_labels = (
         train_dataset.lbl
@@ -71,13 +110,18 @@ def main(
     train_features, test_features = get_or_extract_features(
         train_loader, test_loader, dataset_key, random_seed, vit_name,
         device, cache_dir=feature_cache_dir,
+        train_fingerprint=train_fingerprint,
+        test_fingerprint=test_fingerprint,
     )
     clear_memory()
 
-    train_vlm_features        = None
-    text_embeddings           = None
-    train_stain_features      = None
+    train_vlm_features   = None
+    text_embeddings      = None
+    train_stain_features = None
     train_multiscale_features = None
+    nucleus_embeddings    = None
+    nucleus_reliability   = None
+    nucleus_manifest      = None
 
     if sampler_name == "scalpel":
         from sampling.scalpel import extract_stain_features
@@ -111,6 +155,44 @@ def main(
                 "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"),
         )
 
+    if sampler_name in {"nucleus_al", "nucleus_coverage", "graph_deuce"}:
+        from nucleus.cache import load_nucleus_cache
+        from nucleus.ragged import pool_ragged_features
+
+        cache_path = os.path.join(
+            nucleus_cache_dir, f"{dataset_key}_seed{random_seed}"
+        )
+        nucleus_cache = load_nucleus_cache(
+            cache_path, expected_sample_ids=train_sample_ids
+        )
+        cell_source = sampler_cfg.get("cell_source", "cellvit_embedding")
+        if nucleus_cache.manifest.get("dataset") != dataset_key:
+            raise ValueError("Nucleus cache dataset does not match the current run")
+        if nucleus_cache.manifest.get("seed") != random_seed:
+            raise ValueError("Nucleus cache seed does not match the current split")
+        if (
+            cell_source == "crop_dino"
+            and nucleus_cache.manifest.get("dino_backbone") != vit_name
+        ):
+            raise ValueError(
+                "Crop-DINO cache backbone does not match the run backbone"
+            )
+        cell_features = nucleus_cache.features(cell_source)
+        nucleus_view = pool_ragged_features(
+            cell_features,
+            nucleus_cache.offsets,
+            nucleus_cache.confidence,
+            reliability_mode=sampler_cfg.get("reliability_mode", "valid"),
+        )
+        nucleus_embeddings = nucleus_view.patch_features
+        nucleus_reliability = nucleus_view.reliability
+        nucleus_manifest = nucleus_cache.manifest
+        print(
+            f"[nucleus] Loaded {cache_path}: "
+            f"patches={nucleus_cache.num_patches}, cells={nucleus_cache.num_cells}, "
+            f"source={cell_source}"
+        )
+
     master_selected = None
     if sampler_name in SLICEABLE_SAMPLERS:
         samp_features = train_vlm_features if sampler_name == "codapath" else train_features
@@ -133,16 +215,23 @@ def main(
         set_seed(random_seed)
 
         if sampler_name in ITERATIVE_SAMPLERS:
-            selected_indices = get_sampler(
-                name=sampler_name,
+            iterative_kwargs = dict(
                 image_embeddings=train_features,
-                stain_features=train_stain_features,                    # None unless scalpel
-                multiscale_features=train_multiscale_features,          # None unless scalpel_multiscale
+                stain_features=train_stain_features,          # None unless scalpel
+                multiscale_features=train_multiscale_features, # None unless scalpel_multiscale
                 oracle_labels=train_labels,
                 max_budget=budget,
                 num_classes=num_classes,
                 device=device,
                 **sampler_cfg,
+            )
+            if sampler_name in {"nucleus_al", "nucleus_coverage", "graph_deuce"}:
+                iterative_kwargs.update(
+                    nucleus_embeddings=nucleus_embeddings,
+                    nucleus_reliability=nucleus_reliability,
+                )
+            selected_indices = get_sampler(
+                name=sampler_name, **iterative_kwargs
             )
         elif sampler_name in PER_BUDGET_SAMPLERS:
             selected_indices = get_sampler(
@@ -154,20 +243,40 @@ def main(
                 device=device,
                 **sampler_cfg,
             )
-        else:  
+        elif sampler_name == "tcm" and budget < 2 * num_classes:
+            # tcm's greedy order is only prefix-exact once budget >= 2*num_classes
+            # (below that, transition_budget = min(2*num_classes, budget) shrinks
+            # the phase-1 cluster count itself, producing a DIFFERENT clustering,
+            # not a subset of the master run) — slicing master_selected here would
+            # silently report a non-prefix result. Recompute directly instead.
+            selected_indices = get_sampler(
+                name=sampler_name,
+                image_embeddings=train_features,
+                oracle_labels=train_labels,
+                num_classes=num_classes,
+                max_budget=budget,
+                device=device,
+                **sampler_cfg,
+            )
+        else:
             selected_indices = master_selected[:budget]
 
         labeled_features = train_features[selected_indices]
         labeled_labels   = train_labels[selected_indices]
 
         _save(
-            os.path.join(save_dir, f"{sampler_name}_selected_budget_{budget}.pt"),
+            os.path.join(save_dir, f"{output_name}_selected_budget_{budget}.pt"),
             {"selected_indices": list(selected_indices),
-             "selected_labels":  labeled_labels.tolist()},
+             "selected_labels":  labeled_labels.tolist(),
+             "sampler": sampler_name,
+             "run_name": output_name,
+             "sampler_config": sampler_cfg,
+             "train_fingerprint": train_fingerprint,
+             "nucleus_manifest": nucleus_manifest},
         )
 
         if verbose:
-            print(f"\n── {sampler_name.upper()} | budget={budget} ──")
+            print(f"\n── {output_name.upper()} | budget={budget} ──")
 
         probe = train_linear(
             labeled_features, labeled_labels, num_classes,
@@ -177,13 +286,17 @@ def main(
         palm_acc[budget] = acc
         results[budget]  = {"acc": acc, "precision": pre, "recall": rec, "f1": f1}
 
-        save_model(probe, os.path.join(save_dir, f"{sampler_name}_probe_budget_{budget}.pt"))
+        save_model(probe, os.path.join(save_dir, f"{output_name}_probe_budget_{budget}.pt"))
         del probe
         clear_memory()
 
     _save(
-        os.path.join(save_dir, f"{sampler_name}_results.pt"),
-        {"sampler": sampler_name, "budgets": cumulative_budget, "linear": results},
+        os.path.join(save_dir, f"{output_name}_results.pt"),
+        {"sampler": sampler_name, "run_name": output_name,
+         "sampler_config": sampler_cfg, "budgets": cumulative_budget,
+         "linear": results, "train_fingerprint": train_fingerprint,
+         "test_fingerprint": test_fingerprint,
+         "nucleus_manifest": nucleus_manifest},
     )
 
     dataset_label = os.path.basename(save_dir)
@@ -197,8 +310,8 @@ def main(
                 accuracies=list(palm_acc.values()),
             )
             if verbose:
-                print(format_palm_report(params, sampler_name, dataset_label))
-            palm_path = os.path.join(save_dir, f"{sampler_name}_palm.pt")
+                print(format_palm_report(params, output_name, dataset_label))
+            palm_path = os.path.join(save_dir, f"{output_name}_palm.pt")
             _save(palm_path, params)
             print(f"[PALM] Saved → {palm_path}")
         except Exception as e:
@@ -231,12 +344,59 @@ if __name__ == "__main__":
     parser.add_argument("--probe_epochs", type=int,  default=training_cfg.get("probe_epochs", 100))
     parser.add_argument("--probe_lr",     type=float,default=training_cfg.get("probe_lr", 1e-3))
     parser.add_argument("--feature_cache_dir", type=str, default=config.get("feature_cache_dir", "features"))
+    parser.add_argument("--nucleus_cache_dir", type=str, default=config.get("nucleus_cache_dir", "nucleus_features"))
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument(
+        "--cell_source", choices=["cellvit_embedding", "crop_dino"],
+        default=None, help="Override nucleus_al.cell_source.",
+    )
+    parser.add_argument(
+        "--uncertainty_mode",
+        choices=["cell_margin", "disagreement", "fusion_concat", "fusion_add"],
+        default=None, help="Override nucleus_al.uncertainty_mode.",
+    )
+    parser.add_argument(
+        "--coverage_source", choices=["dino", "cellvit", "concat"],
+        default=None, help="Override nucleus_coverage.coverage_source.",
+    )
+    parser.add_argument(
+        "--missing_impute", choices=["mean", "zero"],
+        default=None, help="Override nucleus_coverage.missing_impute.",
+    )
+    parser.add_argument(
+        "--acquisition_variant",
+        choices=["laplace_margin", "uherding_swap_uncertainty", "uherding_swap_coverage", "laplace_plus_ppr"],
+        default=None, help="Override graph_deuce.acquisition_variant.",
+    )
 
     args = parser.parse_args(remaining_argv)
 
     dataset_key  = args.dataset
     dataset_info = config["datasets"][dataset_key]
     sampler_cfg  = config.get("samplers", {}).get(args.sampler_name, {})
+    sampler_cfg = dict(sampler_cfg)
+    if args.cell_source is not None or args.uncertainty_mode is not None:
+        if args.sampler_name != "nucleus_al":
+            raise ValueError(
+                "--cell_source/--uncertainty_mode are valid only for nucleus_al"
+            )
+        if args.cell_source is not None:
+            sampler_cfg["cell_source"] = args.cell_source
+        if args.uncertainty_mode is not None:
+            sampler_cfg["uncertainty_mode"] = args.uncertainty_mode
+    if args.coverage_source is not None or args.missing_impute is not None:
+        if args.sampler_name != "nucleus_coverage":
+            raise ValueError(
+                "--coverage_source/--missing_impute are valid only for nucleus_coverage"
+            )
+        if args.coverage_source is not None:
+            sampler_cfg["coverage_source"] = args.coverage_source
+        if args.missing_impute is not None:
+            sampler_cfg["missing_impute"] = args.missing_impute
+    if args.acquisition_variant is not None:
+        if args.sampler_name != "graph_deuce":
+            raise ValueError("--acquisition_variant is valid only for graph_deuce")
+        sampler_cfg["acquisition_variant"] = args.acquisition_variant
 
     print("=" * 60)
     print(f"Dataset      : {dataset_key.upper()} ({dataset_info['num_classes']} classes)")
@@ -263,4 +423,6 @@ if __name__ == "__main__":
         verbose=args.verbose,
         model_cfg=model_cfg,
         feature_cache_dir=args.feature_cache_dir,
+        nucleus_cache_dir=args.nucleus_cache_dir,
+        run_name=args.run_name,
     )

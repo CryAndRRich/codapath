@@ -17,12 +17,33 @@ class LinearProbe(nn.Module):
         return self.fc(x)
 
     @torch.inference_mode()
-    def predict_proba(self, features_np: np.ndarray, device: torch.device) -> np.ndarray:
+    def predict_logits(self,
+                       features_np: np.ndarray,
+                       device: torch.device,
+                       batch_size: int = 8192) -> np.ndarray:
         self.eval()
-        x = torch.tensor(features_np, device=device, dtype=torch.float32)
-        logits = self(x)
-        probs = F.softmax(logits, dim=1)
-        return probs.cpu().numpy().astype(np.float32)
+        outputs = []
+        for start in range(0, len(features_np), batch_size):
+            x = torch.as_tensor(
+                features_np[start:start + batch_size],
+                device=device,
+                dtype=torch.float32,
+            )
+            outputs.append(self(x).cpu().numpy().astype(np.float32))
+        if not outputs:
+            return np.empty((0, self.fc.out_features), dtype=np.float32)
+        return np.concatenate(outputs, axis=0)
+
+    @torch.inference_mode()
+    def predict_proba(self,
+                      features_np: np.ndarray,
+                      device: torch.device,
+                      batch_size: int = 8192) -> np.ndarray:
+        logits = self.predict_logits(features_np, device, batch_size=batch_size)
+        if len(logits) == 0:
+            return logits
+        logits_t = torch.from_numpy(logits)
+        return F.softmax(logits_t, dim=1).numpy().astype(np.float32)
 
 
 def _class_weights(labels: np.ndarray, num_classes: int) -> np.ndarray:
@@ -37,14 +58,17 @@ def train_linear(features: np.ndarray,
                  num_classes: int,
                  num_epochs: int,
                  lr: float,
-                 device: torch.device) -> LinearProbe:
+                 device: torch.device,
+                 weight_decay: float = 0.0) -> LinearProbe:
+    if len(labels) == 0:
+        raise ValueError("Cannot train a linear probe with zero labeled samples")
     feat_dim = features.shape[1]
     probe = LinearProbe(feat_dim, num_classes).to(device)
 
     weights = _class_weights(labels, num_classes)
     weight_tensor = torch.tensor(weights, device=device)
     criterion = nn.CrossEntropyLoss(weight=weight_tensor)
-    optimizer = optim.Adam(probe.parameters(), lr=lr)
+    optimizer = optim.Adam(probe.parameters(), lr=lr, weight_decay=weight_decay)
 
     X = torch.tensor(features, dtype=torch.float32)
     y = torch.tensor(labels, dtype=torch.long)

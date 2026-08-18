@@ -3,7 +3,9 @@ sampler_name: "codapath"
 random_seed: 42
 device: "cuda"
 
-cumulative_budget: [25, 50, 75, 100, 125, 150, 175, 200, 225, 250, 275, 300, 325, 350, 375, 400, 425, 450, 475, 500]
+cumulative_budget: [25, 50, 75, 100, 125, 150, 175, 200]
+feature_cache_dir: "features"
+nucleus_cache_dir: "nucleus_features"
 
 models:
   vit: "facebook/dinov2-base"              
@@ -28,7 +30,7 @@ samplers:
   activeft:
     lr: 0.001          # paper/official default (was 0.01 = 10× too high)
     temperature: 0.07
-    iterations: 100
+    iterations: 300    # official default max_iter (was 100 = 1/3 official)
     balance: 1.0
 
   codapath:
@@ -103,6 +105,91 @@ samplers:
     entropy_bins: 32              # histogram bins for local-entropy scoring
     diag: true
     n_sigma: 2000
+
+  nucleus_al:
+    num_rounds: 5
+    chunk_size: 2000
+    n_sigma: 2000
+    probe_epochs: 50
+    probe_lr: 0.001
+    probe_weight_decay: 0.0001
+    cell_source: "cellvit_embedding"   # cellvit_embedding | crop_dino
+    uncertainty_mode: "disagreement"  # cell_margin | disagreement | fusion_concat | fusion_add
+    reliability_mode: "valid"         # valid | mean_confidence
+    fusion_min_labels_per_class: 2.0
+    fusion_normalize_logits: false     # true = row-LN ablation before concat/add
+    diag: true
+
+  nucleus_coverage:
+    cell_source: "cellvit_embedding"   # cache field read in run.py; this sampler always uses CellViT tokens, never crop_dino
+    coverage_source: "dino"            # dino | cellvit | concat — the 3 controlled experiments (override via SAMPLER_OVERRIDES on Kaggle)
+    missing_impute: "mean"             # mean | zero — patches with no detected nucleus. "zero" leaves them orthogonal to
+                                       # everything (never covered by an earlier pick) so the greedy over-selects them; ablation only.
+    num_rounds: 5
+    chunk_size: 2000
+    n_sigma: 2000                      # pool-subsample size for the round-1 sigma bootstrap and the sigma floor reference
+    sigma_floor_ratio: 0.25            # sigma >= this * bootstrap sigma; min-pairwise collapses to ~0 on near-duplicate tiles
+    probe_epochs: 50
+    probe_lr: 0.001
+    probe_weight_decay: 0.0001
+    diag: true
+
+  graph_deuce:
+    cell_source: "cellvit_embedding"    # cache field read in run.py; this sampler always uses CellViT tokens, never crop_dino
+    acquisition_variant: "laplace_margin"  # laplace_margin | uherding_swap_uncertainty | uherding_swap_coverage | laplace_plus_ppr
+                                            # override via SAMPLER_OVERRIDES on Kaggle to run all 4, one session each — same
+                                            # pattern as nucleus_coverage's coverage_source (see EXPERIMENT.md Hướng 3 mục 7.10)
+    per_point: false                       # true = giải lại Laplace learning sau MỖI điểm chọn (đúng vòng lặp tuần tự thật
+                                            # của SARGraphAL gốc), chỉ có tác dụng với laplace_margin/laplace_plus_ppr — 2
+                                            # biến thể uherding_swap_* bỏ qua tham số này (giữ nguyên round-based của UHerding
+                                            # gốc). false (mặc định) = discount-batch 1 lần/vòng, rẻ hơn ~5x nhưng kém trung
+                                            # thành hơn — xem chat 2026-08-17 (per-point fidelity).
+    k: 20                               # kNN neighbors for both W_visual/W_cell (mượn SARGraphAL's k, not DEUCE's k=500 which is for text pools)
+    chunk_size: 2000
+    vae_epochs: 100
+    vae_lr: 0.001
+    vae_batch_size: 512                 # bigger batches keep the GPU busier for this small MLP-VAE (see chat 2026-08-17 GPU-utilization note)
+    vae_visual_hidden: [256, 128]
+    vae_cell_hidden: [128, 64]
+    vae_latent_dim: 32                  # mượn nguyên latent_dim của CVAE gốc SARGraphAL
+    gamma: 1.0                          # DEUCE merge threshold — KHÔNG phải hyperparameter cần tune (xem EXPERIMENT.md mục 0)
+    probe_epochs: 50                    # chỉ dùng bởi uherding_swap_coverage (LinearProbe+ECE trên DINO)
+    probe_lr: 0.001
+    ppr_damping: 0.85                   # chỉ dùng bởi laplace_plus_ppr
+    ppr_alpha: 0.5                      # chỉ dùng bởi laplace_plus_ppr — trộn (1-alpha)*uncertainty + alpha*coverage, CHƯA TUNE
+
+nucleus_extraction:
+  # Do not silently reuse one scale/checkpoint for all datasets. Override these
+  # fields only after confirming the source slide/patch resolution metadata.
+  checkpoint: null
+  architecture: "CellViT256"
+  batch_size: 2                 # conservative for Kaggle T4/P100 16 GB
+  magnification: null
+  input_mpp: null
+  model_mpp: null
+  crop_padding: 0.25
+  min_cell_area: 10
+  max_cells_per_patch: null
+  dino_crop_batch_size: 32      # DINO and CellViT coexist on the GPU
+  datasets:
+    pathmnist:
+      # NCT-CRC-HE-100K patches are published at 0.5 microns/pixel (20x).
+      checkpoint: null
+      magnification: 20
+      input_mpp: 0.5
+      model_mpp: 0.5
+    histoset:
+      # Composite dataset: fill from the provenance of each source before use.
+      checkpoint: null
+      magnification: null
+      input_mpp: null
+      model_mpp: null
+    skintissue:
+      # Published tiles cover 100 x 100 microns at about 395 x 395 pixels.
+      checkpoint: null
+      magnification: 40
+      input_mpp: 0.2531646
+      model_mpp: 0.25
 
 prompt_templates:
   - "Photomicrograph showing {}."
