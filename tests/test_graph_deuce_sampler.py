@@ -31,6 +31,7 @@ def _toy_pool(n=60, dino_dim=16, cell_dim=10, num_classes=3, seed=0):
     "uherding_swap_uncertainty",
     "uherding_swap_coverage",
     "laplace_plus_ppr",
+    "deuce_native",
 ])
 def test_all_variants_return_unique_budget(variant):
     dino, cell, reliability, labels = _toy_pool()
@@ -89,6 +90,96 @@ def test_default_variant_is_laplace_margin():
         vae_epochs=2,
     )
     assert len(selected) == 10
+
+
+@pytest.mark.parametrize("variant", ["laplace_margin", "uherding_swap_coverage"])
+def test_pca_embedding_reduction_returns_unique_budget(variant):
+    dino, cell, reliability, labels = _toy_pool()
+    selected = graph_deuce_sampling(
+        image_embeddings=dino, nucleus_embeddings=cell, nucleus_reliability=reliability,
+        oracle_labels=labels, num_classes=3, max_budget=15, device=torch.device("cpu"),
+        acquisition_variant=variant, embedding_reduction="pca",
+        k=5, chunk_size=32, vae_epochs=2, probe_epochs=2,
+    )
+    assert len(selected) == 15
+    assert len(set(selected)) == 15
+
+
+def test_unknown_embedding_reduction_rejected():
+    dino, cell, reliability, labels = _toy_pool()
+    with pytest.raises(ValueError, match="embedding_reduction"):
+        graph_deuce_sampling(
+            image_embeddings=dino, nucleus_embeddings=cell, nucleus_reliability=reliability,
+            oracle_labels=labels, num_classes=3, max_budget=5, device=torch.device("cpu"),
+            embedding_reduction="bogus", k=5, chunk_size=32, vae_epochs=2,
+        )
+
+
+def test_unknown_deuce_uncertainty_source_rejected():
+    dino, cell, reliability, labels = _toy_pool()
+    with pytest.raises(ValueError, match="deuce_uncertainty_source"):
+        graph_deuce_sampling(
+            image_embeddings=dino, nucleus_embeddings=cell, nucleus_reliability=reliability,
+            oracle_labels=labels, num_classes=3, max_budget=5, device=torch.device("cpu"),
+            acquisition_variant="deuce_native", deuce_uncertainty_source="bogus",
+            k=5, chunk_size=32, vae_epochs=2,
+        )
+
+
+def test_deuce_native_with_probe_ece_uncertainty_source():
+    dino, cell, reliability, labels = _toy_pool()
+    selected = graph_deuce_sampling(
+        image_embeddings=dino, nucleus_embeddings=cell, nucleus_reliability=reliability,
+        oracle_labels=labels, num_classes=3, max_budget=15, device=torch.device("cpu"),
+        acquisition_variant="deuce_native", deuce_uncertainty_source="probe_ece",
+        deuce_min_cluster_size=5, deuce_fps_starts=3,
+        k=5, chunk_size=32, vae_epochs=2, probe_epochs=2,
+    )
+    assert len(selected) == 15
+    assert len(set(selected)) == 15
+
+
+def test_deuce_native_accepts_explicit_none_fps_starts():
+    """config.yaml sets `deuce_fps_starts: null` explicitly (documented as
+    "reuse k") rather than omitting the key — `kwargs.get("deuce_fps_starts", k)`
+    would NOT fall back to `k` in that case (the key IS present, just None),
+    it would pass None straight to `int(None)` and crash. Regression guard."""
+    dino, cell, reliability, labels = _toy_pool()
+    selected = graph_deuce_sampling(
+        image_embeddings=dino, nucleus_embeddings=cell, nucleus_reliability=reliability,
+        oracle_labels=labels, num_classes=3, max_budget=10, device=torch.device("cpu"),
+        acquisition_variant="deuce_native", deuce_fps_starts=None,
+        k=5, chunk_size=32, vae_epochs=2,
+    )
+    assert len(selected) == 10
+
+
+def test_graph_cache_distinguishes_vae_from_pca():
+    """The process-lifetime graph cache is keyed on `id()` of the input
+    arrays PLUS every hyperparameter that changes the resulting graph — this
+    must include `embedding_reduction`, or switching from "vae" to "pca" in
+    the same session would silently reuse the WRONG (VAE-built) graph."""
+    dino, cell, reliability, labels = _toy_pool()
+    graph_deuce_module._GRAPH_CACHE.clear()
+
+    graph_deuce_sampling(
+        image_embeddings=dino, nucleus_embeddings=cell, nucleus_reliability=reliability,
+        oracle_labels=labels, num_classes=3, max_budget=10, device=torch.device("cpu"),
+        acquisition_variant="laplace_margin", embedding_reduction="vae",
+        k=5, chunk_size=32, vae_epochs=2,
+    )
+    with patch(
+        "sampling.graph_deuce._build_dual_graph",
+        wraps=graph_deuce_module._build_dual_graph,
+    ) as mock_build:
+        graph_deuce_sampling(
+            image_embeddings=dino, nucleus_embeddings=cell, nucleus_reliability=reliability,
+            oracle_labels=labels, num_classes=3, max_budget=10, device=torch.device("cpu"),
+            acquisition_variant="laplace_margin", embedding_reduction="pca",
+            k=5, chunk_size=32, vae_epochs=2,
+        )
+    mock_build.assert_called_once()  # cache miss for the NEW embedding_reduction, must rebuild
+    graph_deuce_module._GRAPH_CACHE.clear()
 
 
 def test_all_missing_nucleus_raises_clear_error():

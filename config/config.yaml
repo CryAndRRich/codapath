@@ -121,9 +121,15 @@ samplers:
 
   graph_deuce:
     cell_source: "cellvit_embedding"    # cache field read in run.py; this sampler always uses CellViT tokens, never crop_dino
-    acquisition_variant: "laplace_margin"  # laplace_margin | uherding_swap_uncertainty | uherding_swap_coverage | laplace_plus_ppr
-                                            # override via SAMPLER_OVERRIDES on Kaggle to run all 4, one session each — same
+    acquisition_variant: "laplace_margin"  # laplace_margin | uherding_swap_uncertainty | uherding_swap_coverage | laplace_plus_ppr | deuce_native
+                                            # override via SAMPLER_OVERRIDES on Kaggle to run all 5, one session each — same
                                             # pattern as nucleus_coverage's coverage_source (see EXPERIMENT.md Hướng 3 mục 7.10)
+    embedding_reduction: "vae"           # vae | pca — "pca" thay 2 MLPVAE bằng PCA xác định (graph_al/pca.py, không thể
+                                          # collapse), thêm 2026-08-18 để chẩn đoán nghi ngờ VAE posterior collapse (CLAUDE.md)
+    deuce_uncertainty_source: "laplace_margin"  # laplace_margin | probe_ece — chỉ dùng bởi acquisition_variant="deuce_native"
+    deuce_min_cluster_size: 5            # HDBSCAN* k_r (paper default 3, tuned cho pool văn bản khác hẳn quy mô — chưa tune lại)
+    deuce_fps_starts: null               # null = mượn đúng k (paper reuse cùng k cho "arg top-k deg" FPS restarts) — override
+                                          # độc lập với k nếu muốn tách rời mật độ graph khỏi số điểm-xuất-phát FPS
     per_point: false                       # true = giải lại Laplace learning sau MỖI điểm chọn (đúng vòng lặp tuần tự thật
                                             # của SARGraphAL gốc), chỉ có tác dụng với laplace_margin/laplace_plus_ppr — 2
                                             # biến thể uherding_swap_* bỏ qua tham số này (giữ nguyên round-based của UHerding

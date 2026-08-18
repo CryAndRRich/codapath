@@ -1,7 +1,7 @@
 """graph_deuce sampler — Hướng 3, Tổ hợp B (`EXPERIMENT.md`, "Hướng 3 (ĐANG
-LÀM)"): 2 MLPVAE độc lập (visual/cell, Option 1A) -> 2 kNN graph (DEUCE
-GRAPHNORM, Option 2E) -> DEUCE dual-neighbor-graph merge -> 1 trong 4 biến
-thể acquisition, chọn qua `acquisition_variant`:
+LÀM)"): 2 bộ giảm chiều độc lập (visual/cell, chọn qua `embedding_reduction`)
+-> 2 kNN graph (DEUCE GRAPHNORM, Option 2E) -> DEUCE dual-neighbor-graph
+merge -> 1 trong 5 biến thể acquisition, chọn qua `acquisition_variant`:
 
   - "laplace_margin"            : Laplace learning + margin thuần (V1)
   - "uherding_swap_uncertainty" : coverage gốc uncertainty_herding.py (kernel
@@ -13,15 +13,31 @@ thể acquisition, chọn qua `acquisition_variant`:
   - "laplace_plus_ppr"          : laplace_margin (uncertainty) + Personalized
                                    PageRank (coverage), trộn weighted-sum +
                                    rank-normalize
+  - "deuce_native"              : cơ chế acquisition THẬT của DEUCE (Section
+                                   3.2.4/Algorithm 1, không phải 4 biến thể
+                                   trên) — HDBSCAN* trên W_dual + uncertainty
+                                   propagation trong cụm + FPS đa điểm-xuất-
+                                   phát, chọn `deuce_uncertainty_source` làm
+                                   nguồn u_i (`laplace_margin` hoặc
+                                   `probe_ece`). Xem `graph_al/deuce_acquisition.py`.
 
-Mỗi biến thể dùng CHUNG 100% phần build VAE+graph+merge (mục 7.1-7.6 của
-EXPERIMENT.md) — chỉ khác công thức tính điểm/vòng lặp chọn mỗi vòng (mục
-7.7/7.8/7.10). `uherding_swap_uncertainty`/`uherding_swap_coverage` cố ý
+`embedding_reduction` ("vae" mặc định, hoặc "pca"): thêm 2026-08-18 để cô lập
+nghi ngờ VAE posterior collapse — "pca" thay 2 MLPVAE bằng PCA xác định
+(`graph_al.pca.pca_reduce`, không train/không thể collapse), giữ nguyên
+100% phần graph/merge/acquisition phía sau.
+
+Mỗi biến thể dùng CHUNG 100% phần build embedding+graph+merge (mục 7.1-7.6
+của EXPERIMENT.md) — chỉ khác công thức tính điểm/vòng lặp chọn mỗi vòng
+(mục 7.7/7.8/7.10). `uherding_swap_uncertainty`/`uherding_swap_coverage` cố ý
 KHÔNG dùng chung vòng lặp chọn-batch với `laplace_margin`/`laplace_plus_ppr`
 — chúng mirror ĐÚNG cơ chế per-point-trong-vòng của `uncertainty_herding.py`
 (chọn 1 điểm, đánh giá lại toàn bộ ứng viên, lặp lại `n_select` lần/vòng),
 trong khi 2 biến thể kia dùng 1 cơ chế approximate-batch tự thiết kế (rẻ hơn,
 không từ paper nào) — xem EXPERIMENT.md mục 7.8/7.10 để biết lý do đánh đổi.
+`deuce_native` cũng KHÔNG dùng chung 2 cơ chế trên — nó chạy HDBSCAN*+
+propagation+FPS mỗi vòng (mục lệch có chủ đích với chính paper DEUCE: paper
+là one-shot hoàn toàn không nhãn, ở đây phải chạy ITERATIVE vì cả 2 nguồn
+uncertainty đều cần nhãn — xem docstring `graph_al/deuce_acquisition.py`).
 """
 
 from typing import Dict, List, Set
@@ -34,9 +50,11 @@ from tqdm import tqdm
 
 from set_up import clear_memory
 from trainer import train_linear
+from graph_al.deuce_acquisition import deuce_native_round
 from graph_al.deuce_merge import merge_dual_neighbor_graphs
 from graph_al.graph import knn_graph_partial, knn_graph_umap
 from graph_al.laplace import laplace_learning, laplace_margin, personalized_pagerank
+from graph_al.pca import pca_reduce
 from graph_al.sparse_coverage import greedy_coverage_sparse
 from graph_al.vae import MLPVAE, train_vae
 from .uncertainty_herding import _calibrate_temperature
@@ -47,7 +65,10 @@ VALID_VARIANTS = {
     "uherding_swap_uncertainty",
     "uherding_swap_coverage",
     "laplace_plus_ppr",
+    "deuce_native",
 }
+VALID_EMBEDDING_REDUCTIONS = {"vae", "pca"}
+VALID_DEUCE_UNCERTAINTY_SOURCES = {"laplace_margin", "probe_ece"}
 
 
 def _rank_normalize(x: np.ndarray) -> np.ndarray:
@@ -152,7 +173,14 @@ def _build_dual_graph(
     vae_latent_dim: int,
     gamma: float,
     vae_batch_size: int = 512,
+    embedding_reduction: str = "vae",
 ) -> sps.csr_matrix:
+    if embedding_reduction not in VALID_EMBEDDING_REDUCTIONS:
+        raise ValueError(
+            f"Unknown embedding_reduction={embedding_reduction!r}, "
+            f"expected one of {sorted(VALID_EMBEDDING_REDUCTIONS)}"
+        )
+
     N = dino_np.shape[0]
     x_visual = F.normalize(
         torch.as_tensor(dino_np, device=device, dtype=torch.float32), p=2, dim=1
@@ -169,29 +197,40 @@ def _build_dual_graph(
         torch.as_tensor(cell_np[reliable_mask], device=device, dtype=torch.float32), p=2, dim=1
     )
 
-    vae_visual = MLPVAE(
-        input_dim=x_visual.shape[1], hidden_dims=vae_visual_hidden, latent_dim=vae_latent_dim
-    ).to(device)
-    train_vae(
-        vae_visual, x_visual, epochs=vae_epochs, lr=vae_lr, batch_size=vae_batch_size,
-        device=device, desc="graph_deuce VAE_visual",
-    )
-    z_visual = vae_visual.latent(x_visual)
-    del vae_visual, x_visual
-    clear_memory()
-    _report_latent_diagnostics(z_visual, "VAE_visual latent", chunk_size)
+    if embedding_reduction == "vae":
+        vae_visual = MLPVAE(
+            input_dim=x_visual.shape[1], hidden_dims=vae_visual_hidden, latent_dim=vae_latent_dim
+        ).to(device)
+        train_vae(
+            vae_visual, x_visual, epochs=vae_epochs, lr=vae_lr, batch_size=vae_batch_size,
+            device=device, desc="graph_deuce VAE_visual",
+        )
+        z_visual = vae_visual.latent(x_visual)
+        del vae_visual, x_visual
+        clear_memory()
+        _report_latent_diagnostics(z_visual, "VAE_visual latent", chunk_size)
 
-    vae_cell = MLPVAE(
-        input_dim=x_cell_reliable.shape[1], hidden_dims=vae_cell_hidden, latent_dim=vae_latent_dim
-    ).to(device)
-    train_vae(
-        vae_cell, x_cell_reliable, epochs=vae_epochs, lr=vae_lr, batch_size=vae_batch_size,
-        device=device, desc="graph_deuce VAE_cell",
-    )
-    z_cell_reliable = vae_cell.latent(x_cell_reliable)
-    del vae_cell, x_cell_reliable
-    clear_memory()
-    _report_latent_diagnostics(z_cell_reliable, "VAE_cell latent", chunk_size)
+        vae_cell = MLPVAE(
+            input_dim=x_cell_reliable.shape[1], hidden_dims=vae_cell_hidden, latent_dim=vae_latent_dim
+        ).to(device)
+        train_vae(
+            vae_cell, x_cell_reliable, epochs=vae_epochs, lr=vae_lr, batch_size=vae_batch_size,
+            device=device, desc="graph_deuce VAE_cell",
+        )
+        z_cell_reliable = vae_cell.latent(x_cell_reliable)
+        del vae_cell, x_cell_reliable
+        clear_memory()
+        _report_latent_diagnostics(z_cell_reliable, "VAE_cell latent", chunk_size)
+    else:  # "pca"
+        z_visual = pca_reduce(x_visual, q=vae_latent_dim)
+        del x_visual
+        clear_memory()
+        _report_latent_diagnostics(z_visual, "PCA_visual latent", chunk_size)
+
+        z_cell_reliable = pca_reduce(x_cell_reliable, q=vae_latent_dim)
+        del x_cell_reliable
+        clear_memory()
+        _report_latent_diagnostics(z_cell_reliable, "PCA_cell latent", chunk_size)
 
     W_visual = knn_graph_umap(z_visual, k=k, chunk_size=chunk_size)
     W_cell = knn_graph_partial(z_cell_reliable, reliable_idx, N, k=k, chunk_size=chunk_size)
@@ -230,30 +269,31 @@ def _build_dual_graph_cached(
     vae_latent_dim: int,
     gamma: float,
     vae_batch_size: int,
+    embedding_reduction: str,
 ) -> sps.csr_matrix:
     key = (
         id(dino_np), id(cell_np), id(reliability), k, vae_epochs, vae_lr,
         tuple(vae_visual_hidden), tuple(vae_cell_hidden), vae_latent_dim, gamma,
-        vae_batch_size,
+        vae_batch_size, embedding_reduction,
     )
     cached = _GRAPH_CACHE.get(key)
     if cached is not None:
         print(
-            "[graph_deuce] Reusing cached VAE+graph build from earlier this "
-            "session (same pool + hyperparams) — skipping VAE retrain/graph rebuild."
+            "[graph_deuce] Reusing cached graph build from earlier this "
+            "session (same pool + hyperparams) — skipping embedding/graph rebuild."
         )
         return cached
 
     print(
-        "[graph_deuce] No cached graph yet for this pool/hyperparams — training "
-        "VAE_visual + VAE_cell and building W_dual now. This happens ONCE per "
-        "session and is reused for every budget and every acquisition_variant "
-        "after this."
+        f"[graph_deuce] No cached graph yet for this pool/hyperparams "
+        f"(embedding_reduction={embedding_reduction!r}) — building embedding + "
+        f"W_dual now. This happens ONCE per session and is reused for every "
+        f"budget and every acquisition_variant after this."
     )
     W_dual = _build_dual_graph(
         dino_np, cell_np, reliability, device, k, chunk_size,
         vae_epochs, vae_lr, vae_visual_hidden, vae_cell_hidden, vae_latent_dim, gamma,
-        vae_batch_size,
+        vae_batch_size, embedding_reduction,
     )
     _GRAPH_CACHE[key] = W_dual
     return W_dual
@@ -603,6 +643,29 @@ def graph_deuce_sampling(**kwargs) -> List[int]:
     vae_batch_size = int(kwargs.get("vae_batch_size", 512))
     per_point = bool(kwargs.get("per_point", False))
 
+    embedding_reduction = kwargs.get("embedding_reduction", "vae")
+    if embedding_reduction not in VALID_EMBEDDING_REDUCTIONS:
+        raise ValueError(
+            f"Unknown embedding_reduction={embedding_reduction!r}, "
+            f"expected one of {sorted(VALID_EMBEDDING_REDUCTIONS)}"
+        )
+    deuce_uncertainty_source = kwargs.get("deuce_uncertainty_source", "laplace_margin")
+    if deuce_uncertainty_source not in VALID_DEUCE_UNCERTAINTY_SOURCES:
+        raise ValueError(
+            f"Unknown deuce_uncertainty_source={deuce_uncertainty_source!r}, "
+            f"expected one of {sorted(VALID_DEUCE_UNCERTAINTY_SOURCES)}"
+        )
+    deuce_min_cluster_size = int(kwargs.get("deuce_min_cluster_size", 5))
+    # Paper Algorithm 1 reuses the SAME `k` for "arg top-k deg" FPS restarts as
+    # for the kNN graph itself — default mirrors that reuse, override
+    # independently via config if graph density and FPS-restart count should differ.
+    # `None`/absent both mean "reuse k" — config.yaml sets this key explicitly
+    # to `null` (-> None after yaml.safe_load) rather than omitting it, so
+    # `kwargs.get(..., k)` alone would NOT fall back to `k` (the key IS
+    # present, just with value None) — handle both cases explicitly.
+    deuce_fps_starts = kwargs.get("deuce_fps_starts")
+    deuce_fps_starts = k if deuce_fps_starts is None else int(deuce_fps_starts)
+
     N = dino_np.shape[0]
     B = min(max_budget, N)
     step_budget = max(1, int(0.2 * B))
@@ -610,7 +673,7 @@ def graph_deuce_sampling(**kwargs) -> List[int]:
     W_dual = _build_dual_graph_cached(
         dino_np, cell_np, reliability, device, k, chunk_size,
         vae_epochs, vae_lr, vae_visual_hidden, vae_cell_hidden, vae_latent_dim, gamma,
-        vae_batch_size,
+        vae_batch_size, embedding_reduction,
     )
 
     dino_features_norm = F.normalize(
@@ -630,16 +693,18 @@ def graph_deuce_sampling(**kwargs) -> List[int]:
     while len(selected_indices) < B:
         current_need = min(step_budget, B - len(selected_indices))
 
-        if acquisition_variant in ("laplace_margin", "laplace_plus_ppr") and not _has_two_classes(
-            oracle_labels, selected_indices
-        ):
-            # Cold start: Laplace learning needs >=2 labeled classes, so there is
-            # no real uncertainty signal yet. Previously this branch fed a
-            # uniform `scores=ones(N)` into `_select_batch_with_discount`, whose
-            # very first pick is `argmax` over an all-tied array — torch breaks
-            # ties by LOWEST INDEX, so the "coverage" round-1 pick was really
-            # just pool-index-0 (or whichever index survives ties), unrelated to
-            # any coverage/diversity property, unlike the coverage-only-round-1
+        if acquisition_variant in (
+            "laplace_margin", "laplace_plus_ppr", "deuce_native",
+        ) and not _has_two_classes(oracle_labels, selected_indices):
+            # Cold start: Laplace learning (and both deuce_native uncertainty
+            # sources, which also need labels — see module docstring) needs
+            # >=2 labeled classes, so there is no real uncertainty signal yet.
+            # Previously this branch fed a uniform `scores=ones(N)` into
+            # `_select_batch_with_discount`, whose very first pick is `argmax`
+            # over an all-tied array — torch breaks ties by LOWEST INDEX, so
+            # the "coverage" round-1 pick was really just pool-index-0 (or
+            # whichever index survives ties), unrelated to any
+            # coverage/diversity property, unlike the coverage-only-round-1
             # convention every other sampler in this project follows (see
             # CLAUDE.md 2×2 sampler table). Use the SAME genuine facility-location
             # greedy the uherding_swap_coverage variant uses for its own round 1
@@ -680,6 +745,21 @@ def graph_deuce_sampling(**kwargs) -> List[int]:
                 dino_features_norm, W_dual, oracle_labels, num_classes,
                 selected_indices, selected_set, uherding_state,
                 current_need, chunk_size, device,
+            )
+
+        elif acquisition_variant == "deuce_native":
+            if deuce_uncertainty_source == "laplace_margin":
+                u_scores = _round_scores_laplace_margin(
+                    W_dual, selected_indices, oracle_labels, num_classes, N, device,
+                ).cpu().numpy().astype(np.float64)
+            else:  # "probe_ece"
+                u_scores = _round_uncertainty_uherding_original(
+                    dino_np, oracle_labels, selected_indices, num_classes,
+                    probe_epochs, probe_lr, device,
+                ).cpu().numpy().astype(np.float64)
+            chosen = deuce_native_round(
+                W_dual, u_scores, deuce_min_cluster_size, deuce_fps_starts,
+                current_need, selected_set,
             )
 
         else:  # "uherding_swap_coverage"

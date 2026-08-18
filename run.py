@@ -92,6 +92,16 @@ def main(
                 # Keep per_point=True runs from overwriting the round-based
                 # (per_point=False) checkpoints of the same acquisition_variant.
                 run_name = f"{run_name}_perpoint"
+            embedding_reduction = sampler_cfg.get("embedding_reduction", "vae")
+            if embedding_reduction != "vae":
+                # Otherwise a "pca" sweep silently overwrites the "vae" run's
+                # checkpoints for the same acquisition_variant (2026-08-18).
+                run_name = f"{run_name}_{embedding_reduction}"
+            k = sampler_cfg.get("k", 20)
+            if k != 20:
+                # Same collision risk when comparing k values (e.g. k=20 vs
+                # k=100) for the same acquisition_variant in one session.
+                run_name = f"{run_name}_k{k}"
     output_name = _safe_run_name(run_name or sampler_name)
 
     train_labels = (
@@ -351,8 +361,15 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--acquisition_variant",
-        choices=["laplace_margin", "uherding_swap_uncertainty", "uherding_swap_coverage", "laplace_plus_ppr"],
+        choices=[
+            "laplace_margin", "uherding_swap_uncertainty", "uherding_swap_coverage",
+            "laplace_plus_ppr", "deuce_native",
+        ],
         default=None, help="Override graph_deuce.acquisition_variant.",
+    )
+    parser.add_argument(
+        "--embedding_reduction", choices=["vae", "pca"],
+        default=None, help="Override graph_deuce.embedding_reduction.",
     )
 
     args = parser.parse_args(remaining_argv)
@@ -383,6 +400,10 @@ if __name__ == "__main__":
         if args.sampler_name != "graph_deuce":
             raise ValueError("--acquisition_variant is valid only for graph_deuce")
         sampler_cfg["acquisition_variant"] = args.acquisition_variant
+    if args.embedding_reduction is not None:
+        if args.sampler_name != "graph_deuce":
+            raise ValueError("--embedding_reduction is valid only for graph_deuce")
+        sampler_cfg["embedding_reduction"] = args.embedding_reduction
 
     print("=" * 60)
     print(f"Dataset      : {dataset_key.upper()} ({dataset_info['num_classes']} classes)")
