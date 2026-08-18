@@ -27,7 +27,7 @@ PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herdin
 
 # ITERATIVE: re-run per budget with internal probe-refinement rounds.
 ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel", "scalpel_multiscale",
-                      "nucleus_al", "nucleus_coverage", "graph_deuce"}
+                      "nucleus_al", "nucleus_coverage", "graph_deuce", "graph_sargraph"}
 
 
 def _save(path: str, obj) -> None:
@@ -86,6 +86,13 @@ def main(
             if missing_impute != "mean":
                 # Keep the ablation from overwriting the main run's checkpoints.
                 run_name = f"{run_name}_{missing_impute}"
+        elif sampler_name == "graph_sargraph":
+            variant = sampler_cfg.get("acquisition_variant", "laplace_margin")
+            run_name = f"graph_sargraph_{variant}_{sampler_cfg.get('reducer', 'vae')}"
+            if sampler_cfg.get("pool_mode", "mean") != "mean":
+                run_name = f"{run_name}_{sampler_cfg['pool_mode']}"
+            if sampler_cfg.get("per_point", False):
+                run_name = f"{run_name}_perpoint"
         elif sampler_name == "graph_deuce":
             acquisition_variant = sampler_cfg.get("acquisition_variant", "laplace_margin")
             run_name = f"graph_deuce_{acquisition_variant}"
@@ -155,7 +162,7 @@ def main(
                 "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"),
         )
 
-    if sampler_name in {"nucleus_al", "nucleus_coverage", "graph_deuce"}:
+    if sampler_name in {"nucleus_al", "nucleus_coverage", "graph_deuce", "graph_sargraph"}:
         from nucleus.cache import load_nucleus_cache
         from nucleus.ragged import pool_ragged_features
 
@@ -183,6 +190,8 @@ def main(
             nucleus_cache.offsets,
             nucleus_cache.confidence,
             reliability_mode=sampler_cfg.get("reliability_mode", "valid"),
+            pool_mode=sampler_cfg.get("pool_mode", "mean"),
+            kde_bandwidth_scale=sampler_cfg.get("kde_bandwidth_scale", 1.0),
         )
         nucleus_embeddings = nucleus_view.patch_features
         nucleus_reliability = nucleus_view.reliability
@@ -225,7 +234,7 @@ def main(
                 device=device,
                 **sampler_cfg,
             )
-            if sampler_name in {"nucleus_al", "nucleus_coverage", "graph_deuce"}:
+            if sampler_name in {"nucleus_al", "nucleus_coverage", "graph_deuce", "graph_sargraph"}:
                 iterative_kwargs.update(
                     nucleus_embeddings=nucleus_embeddings,
                     nucleus_reliability=nucleus_reliability,

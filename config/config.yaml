@@ -91,6 +91,50 @@ samplers:
     min_labels_per_class_for_cap: 2.0   # min avg labels/class before trusting the gap estimate
     use_rank_normalize: true           # true → rank-normalize vac/reconcile instead of minmax (test independently of use_adaptive_cap)
 
+  graph_sargraph:
+    # "Tổ hợp A": 1 reducer trên concat(visual, cell) -> 1 graph SARGraphAL -> acquisition.
+    # Chạy 5 biến thể bằng SAMPLER_OVERRIDES, mỗi lần 1 acquisition_variant.
+    acquisition_variant: "laplace_margin"
+    # laplace_margin            : SARGraphAL gốc (Laplace learning + margin), KHÔNG coverage
+    # laplace_plus_ppr          : + coverage Personalized PageRank từ tập có nhãn
+    # laplace_plus_resistance   : + coverage effective-resistance / commute-time
+    # uherding_swap_uncertainty : coverage kernel Gaussian dày gốc UHerding, uncertainty -> laplace margin
+    # uherding_swap_coverage    : uncertainty LinearProbe+ECE gốc UHerding, coverage -> kernel graph thưa
+    per_point: false          # true = giải lại Laplace sau MỖI điểm (đúng sequential AL của SARGraphAL).
+                              # Chỉ tác dụng với 3 biến thể laplace_*; 2 biến thể uherding_swap_* giữ round-based.
+    reducer: "pca"            # pca | vae | none. PCA là đường chạy HIỆN TẠI (quyết định 2026-08-18):
+                              # VAE ở đây chỉ nén DINOv2 embedding vốn đã là biểu diễn học sẵn, tức chỉ
+                              # làm giảm chiều — PCA làm đúng việc đó, không hyperparameter, không collapse.
+                              # (SARGraphAL gốc train CNNVAE trên ẢNH SAR THÔ, khác hẳn.)
+                              # Bật "vae" chỉ để ablation, và ĐỪNG đặt vae_beta=1.0 — xem chú thích vae_beta.
+    pool_mode: "mean"         # mean | kde — cách gộp nhiều nhân trong 1 patch thành 1 vector
+    kde_bandwidth_scale: 1.0  # h = scale × median pairwise distance trong patch (chỉ dùng khi pool_mode=kde)
+    k: 20                     # CỐ ĐỊNH 20 theo paper gốc ở giai đoạn này (quyết định 2026-08-18).
+                              # Pool 100k lớn hơn MSTAR (~vài nghìn) nhiều và lý thuyết liên thông cho
+                              # k ~ log N, nên quét k ∈ {20, 30, 50} là bước SAU — đọc dòng log
+                              # "components=" của graph trước để biết có cần nâng k không.
+    kernel: "asymmetric"      # asymmetric = đúng công thức in trong paper; symmetric = biến thể symgaussian
+                              # LỆCH CÓ CHỦ Ý so với code gốc: knn_graph chạy normalize=True (L2-normalize
+                              # latent trước khi tìm kNN), còn MSTAR-Active-Learning dùng Euclid THÔ trên
+                              # latent CNNVAE. Giữ theo quy ước repo (quyết định 2026-08-18) — PHẢI ghi vào
+                              # phần hạn chế khi viết paper. Xem docstring graph_sargraph.py.
+    chunk_size: 2000
+    vae_latent_dim: 32        # mượn latent_dim của CNNVAE gốc SARGraphAL
+    vae_hidden: [512, 128]
+    vae_epochs: 100
+    vae_lr: 0.001
+    vae_batch_size: 512
+    vae_beta: 0.01            # KHÔNG để 1.0: input đã L2-normalize nên recon ≤ 1/mẫu, KL 32 chiều cỡ
+                              # hàng chục nat => beta=1 ép posterior collapse. Xem docstring graph_sargraph.py.
+    probe_epochs: 50          # chỉ uherding_swap_coverage dùng
+    probe_lr: 0.001
+    ppr_damping: 0.85         # chỉ laplace_plus_ppr
+    ppr_alpha: 0.5            # trộn (1-alpha)*uncertainty + alpha*coverage — CHƯA TUNE
+    resistance_alpha: 0.5     # chỉ laplace_plus_resistance, cùng nghĩa với ppr_alpha để so công bằng
+    resistance_reduction: "min"   # min = khoảng cách graph tới điểm có nhãn GẦN nhất (coreset); mean = trung bình
+    resistance_n_sketch: 200  # số CG solve của sketch Spielman-Srivastava; 200 -> Spearman ~0.87 vs exact
+    resistance_seed: 0
+
   scalpel_multiscale:
     num_rounds: 5
     chunk_size: 2000
