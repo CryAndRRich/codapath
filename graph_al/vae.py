@@ -210,10 +210,13 @@ def train_vae(
 ) -> List[float]:
     """Trains `model` in place on `data` (N, input_dim). Returns per-epoch mean loss.
 
-    `verbose=True` (default) shows a tqdm bar over epochs with the running
-    loss as postfix — this model has no other progress signal (no accuracy,
-    no eval split), so without this a 100-epoch run prints nothing until it
-    finishes, easy to mistake for a hang."""
+    `verbose=True` (default) shows a tqdm bar over epochs with recon/KL shown
+    SEPARATELY (not just the combined loss) — this model has no other
+    progress signal (no accuracy, no eval split), and a combined-only number
+    hides posterior collapse (KL->~0, recon stuck at "predict the dataset
+    mean") behind an apparently-stable total loss. Watch for KL staying near
+    0 for many epochs while recon barely moves — that is the collapse
+    signature, not merely "loss isn't decreasing" (chat 2026-08-18)."""
     model.to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     loader = DataLoader(TensorDataset(data), batch_size=min(batch_size, len(data)), shuffle=True)
@@ -223,17 +226,25 @@ def train_vae(
     progress = tqdm(range(epochs), desc=desc, disable=not verbose)
     for _ in progress:
         running = 0.0
+        running_recon = 0.0
+        running_kl = 0.0
         for (xb,) in loader:
             xb = xb.to(device)
             optimizer.zero_grad()
             recon, mu, logvar = model(xb)
-            loss, _, _ = vae_loss(recon, xb, mu, logvar, beta=beta)
+            loss, recon_loss, kl = vae_loss(recon, xb, mu, logvar, beta=beta)
             loss.backward()
             optimizer.step()
             running += loss.item()
+            running_recon += recon_loss.item()
+            running_kl += kl.item()
         history.append(running / len(data))
         if verbose:
-            progress.set_postfix(loss=f"{history[-1]:.3f}")
+            progress.set_postfix(
+                loss=f"{history[-1]:.3f}",
+                recon=f"{running_recon / len(data):.3f}",
+                kl=f"{running_kl / len(data):.4f}",
+            )
     return history
 
 

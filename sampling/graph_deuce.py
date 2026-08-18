@@ -63,6 +63,77 @@ def _has_two_classes(oracle_labels: np.ndarray, selected_indices: List[int]) -> 
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic thêm 2026-08-18: nghi ngờ VAE posterior collapse sau khi thấy
+# accuracy quá tệ trên MỌI acquisition_variant (kể cả uherding_swap_coverage,
+# vốn không hề dùng Laplace learning — chỉ dùng W_dual làm coverage kernel —
+# nên nếu nó cũng tệ thì rất có khả năng chính W_dual/latent VAE mới là vấn
+# đề, không phải phần acquisition). Đọc PDF gốc DEUCE xác nhận công thức gộp
+# graph (merge_dual_neighbor_graphs, graphnorm_weights, fuzzy_symmetrize) là
+# ĐÚNG — nên nghi ngờ chuyển sang input của graph (latent VAE) có thể đã
+# collapse (encoder bỏ qua input, KL->0, latent gần như hằng số mọi mẫu).
+# Diagnostic CHỈ đọc/in, không tự sửa gì — mục đích để xác nhận trước khi
+# quyết định hướng sửa (per_point/KL-annealing/redesign acquisition/tăng k).
+# ---------------------------------------------------------------------------
+
+def _nn_distance_sample(z: torch.Tensor, n_ref: int, chunk_size: int) -> torch.Tensor:
+    """Khoảng cách Euclid tới láng giềng gần nhất, tính cho `n_ref` điểm mẫu
+    ngẫu nhiên so với TOÀN BỘ `z` (chunked để tránh OOM — z ở đây là latent
+    VAE thô, KHÔNG L2-normalize, nên không dùng công thức sqrt(2-2cos) như
+    chỗ khác trong project)."""
+    N = z.shape[0]
+    n_ref = min(n_ref, N)
+    ref_idx = np.random.choice(N, n_ref, replace=False)
+    ref = z[ref_idx]
+    ref_sq = (ref ** 2).sum(dim=1)
+    best = torch.full((n_ref,), float("inf"), device=z.device)
+
+    for cs in range(0, N, chunk_size):
+        ce = min(cs + chunk_size, N)
+        chunk = z[cs:ce]
+        chunk_sq = (chunk ** 2).sum(dim=1)
+        dist_sq = torch.clamp(ref_sq[:, None] + chunk_sq[None, :] - 2.0 * (ref @ chunk.T), min=0.0)
+        for i, gi in enumerate(ref_idx):
+            if cs <= gi < ce:
+                dist_sq[i, gi - cs] = float("inf")
+        best = torch.minimum(best, dist_sq.min(dim=1).values)
+
+    return torch.sqrt(best)
+
+
+def _report_latent_diagnostics(z: torch.Tensor, name: str, chunk_size: int) -> None:
+    """In 2 tín hiệu posterior-collapse cho latent `z` (N, latent_dim) của
+    1 VAE đã train xong:
+    1. Phương sai từng chiều latent qua toàn bộ N mẫu + số "active dims"
+       (var>0.01) — chỉ báo collapse chuẩn trong tài liệu VAE: nếu encoder
+       bỏ qua input (decoder chỉ học ra trung bình tập dữ liệu, KL->0), gần
+       như mọi chiều sẽ có phương sai gần 0.
+    2. Khoảng cách tới láng giềng gần nhất (mẫu ngẫu nhiên) — trả lời trực
+       tiếp "graph có cấu trúc thật để dựng kNN hay không", độc lập với #1.
+    Chỉ đọc/in, không tự sửa gì."""
+    with torch.no_grad():
+        var_per_dim = z.var(dim=0, unbiased=False)
+        mean_var = var_per_dim.mean().item()
+        total_dims = z.shape[1]
+        active_dims = int((var_per_dim > 0.01).sum().item())
+
+        nn_dist = _nn_distance_sample(z, n_ref=500, chunk_size=chunk_size)
+        near_dup_frac = (nn_dist < 1e-3).float().mean().item()
+
+    print(
+        f"[graph_deuce DIAG] {name}: latent_dim={total_dims} "
+        f"active_dims(var>0.01)={active_dims} mean_var={mean_var:.5f} | "
+        f"NN-dist min={nn_dist.min().item():.5f} mean={nn_dist.mean().item():.5f} "
+        f"max={nn_dist.max().item():.5f} near-duplicate_frac(<1e-3)={near_dup_frac:.3f}"
+    )
+    if active_dims <= max(1, total_dims // 4):
+        print(
+            f"[graph_deuce WARNING] {name}: only {active_dims}/{total_dims} latent dims "
+            f"are active (var>0.01) — looks like POSTERIOR COLLAPSE (decoder likely "
+            f"ignoring the latent). The resulting graph may carry near-zero real structure."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Mục 7.1-7.6: VAE độc lập + graph construction + DEUCE merge (build 1 LẦN,
 # trước vòng lặp, độc lập nhãn — dùng chung cho cả 4 biến thể)
 # ---------------------------------------------------------------------------
@@ -108,6 +179,7 @@ def _build_dual_graph(
     z_visual = vae_visual.latent(x_visual)
     del vae_visual, x_visual
     clear_memory()
+    _report_latent_diagnostics(z_visual, "VAE_visual latent", chunk_size)
 
     vae_cell = MLPVAE(
         input_dim=x_cell_reliable.shape[1], hidden_dims=vae_cell_hidden, latent_dim=vae_latent_dim
@@ -119,6 +191,7 @@ def _build_dual_graph(
     z_cell_reliable = vae_cell.latent(x_cell_reliable)
     del vae_cell, x_cell_reliable
     clear_memory()
+    _report_latent_diagnostics(z_cell_reliable, "VAE_cell latent", chunk_size)
 
     W_visual = knn_graph_umap(z_visual, k=k, chunk_size=chunk_size)
     W_cell = knn_graph_partial(z_cell_reliable, reliable_idx, N, k=k, chunk_size=chunk_size)

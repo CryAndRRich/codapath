@@ -9,7 +9,7 @@ if importlib.util.find_spec("torchvision") is None:
     pytest.skip("full sampler environment requires torchvision", allow_module_level=True)
 
 import sampling.graph_deuce as graph_deuce_module
-from sampling.graph_deuce import graph_deuce_sampling
+from sampling.graph_deuce import graph_deuce_sampling, _report_latent_diagnostics
 
 
 def _toy_pool(n=60, dino_dim=16, cell_dim=10, num_classes=3, seed=0):
@@ -220,6 +220,30 @@ def test_per_point_resolves_laplace_learning_far_more_often_than_round_based(var
     perpoint_calls = mock_perpoint.call_count
 
     assert perpoint_calls > batch_calls
+
+
+def test_latent_diagnostics_warns_on_collapsed_latent(capsys):
+    """Regression for the 2026-08-18 investigation: catastrophically low
+    accuracy across every acquisition_variant, including uherding_swap_coverage
+    (which doesn't even use Laplace learning — only W_dual as a coverage
+    kernel), pointed at the VAE latent itself possibly being collapsed
+    (encoder ignoring input, near-constant output). This diagnostic must
+    actually detect that case: a latent where every dimension is
+    near-constant across samples."""
+    torch.manual_seed(0)
+    collapsed = torch.zeros(200, 32) + 0.01 * torch.randn(200, 32) * 0.001
+    _report_latent_diagnostics(collapsed, "test_collapsed", chunk_size=64)
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "POSTERIOR COLLAPSE" in out
+
+
+def test_latent_diagnostics_no_warning_on_healthy_latent(capsys):
+    torch.manual_seed(0)
+    healthy = torch.randn(200, 32) * 2.0
+    _report_latent_diagnostics(healthy, "test_healthy", chunk_size=64)
+    out = capsys.readouterr().out
+    assert "WARNING" not in out
 
 
 def test_reliable_subset_smaller_than_k_raises_clear_error():
