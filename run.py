@@ -87,12 +87,24 @@ def main(
                 # Keep the ablation from overwriting the main run's checkpoints.
                 run_name = f"{run_name}_{missing_impute}"
         elif sampler_name == "graph_sargraph":
+            # Every setting that CHANGES THE SELECTION goes into the name. Without
+            # `k` here, a k-sweep (20/100/500) writes all three runs to the same
+            # filenames and silently keeps only the last — the failure is invisible
+            # because nothing errors and the files look complete.
             variant = sampler_cfg.get("acquisition_variant", "laplace_margin")
-            run_name = f"graph_sargraph_{variant}_{sampler_cfg.get('reducer', 'vae')}"
+            run_name = f"graph_sargraph_{variant}_{sampler_cfg.get('reducer', 'pca')}"
+            run_name = f"{run_name}_k{sampler_cfg.get('k', 20)}"
             if sampler_cfg.get("pool_mode", "mean") != "mean":
                 run_name = f"{run_name}_{sampler_cfg['pool_mode']}"
             if sampler_cfg.get("per_point", False):
                 run_name = f"{run_name}_perpoint"
+            # The blend weight only exists for the two blended-coverage variants.
+            # `_safe_run_name` rejects "." so 0.5 becomes "a05".
+            alpha_key = {"laplace_plus_ppr": "ppr_alpha",
+                         "laplace_plus_resistance": "resistance_alpha"}.get(variant)
+            if alpha_key is not None:
+                alpha = str(sampler_cfg.get(alpha_key, 0.5)).replace(".", "")
+                run_name = f"{run_name}_a{alpha}"
         elif sampler_name == "graph_deuce":
             acquisition_variant = sampler_cfg.get("acquisition_variant", "laplace_margin")
             run_name = f"graph_deuce_{acquisition_variant}"
