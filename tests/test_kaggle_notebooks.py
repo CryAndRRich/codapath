@@ -10,6 +10,7 @@ NOTEBOOKS = [
     PROJECT / "scripts" / "extract_nucleus_features.ipynb",
     PROJECT / "scripts" / "extract_features.ipynb",
     PROJECT / "scripts" / "run_al.ipynb",
+    PROJECT / "scripts" / "run_nucleus_coverage.ipynb",
     PROJECT / "scripts" / "evaluate.ipynb",
     PROJECT / "scripts" / "evaluate_nucleus_alignment.ipynb",
 ]
@@ -91,3 +92,18 @@ def test_alignment_notebook_is_diagnostic_and_writes_to_working():
     assert "--budgets" in source
     assert "/kaggle/working/nucleus_alignment_" in source
     assert "unselected training pool" in source
+
+
+def test_nucleus_coverage_notebook_runs_controlled_feature_spaces():
+    notebook = json.loads(
+        (PROJECT / "scripts" / "run_nucleus_coverage.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    source = "\n".join(_source(cell) for cell in notebook["cells"])
+    assert 'SAMPLER_NAME = "nucleus_coverage"' in source
+    for coverage_source in ("dino", "cellvit", "concat"):
+        assert f'{{"coverage_source": "{coverage_source}"}}' in source
+    assert "No nucleus cache found" in source
+    assert "not** the original UHerding UCoverage objective" in source
+    assert 'OUTPUT_DIR = "/kaggle/working/checkpoints"' in source

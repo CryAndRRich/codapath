@@ -52,7 +52,8 @@ samplers:
   uncertainty_herding:
     probe_epochs: 50
     probe_lr: 0.001
-    chunk_size: 2000   
+    chunk_size: 2000
+    num_rounds: 5
 
   tcm:
     probe_epochs: 50
@@ -103,6 +104,22 @@ samplers:
     reliability_mode: "valid"         # valid | mean_confidence
     fusion_min_labels_per_class: 2.0
     fusion_normalize_logits: false     # true = row-LN ablation before concat/add
+    diag: true
+
+  # Controlled coverage-space experiment. This uses DINO margin uncertainty
+  # multiplied by candidate marginal coverage; it is not the UCoverage
+  # objective of standard Uncertainty Herding.
+  nucleus_coverage:
+    cell_source: "cellvit_embedding"
+    coverage_source: "dino"            # dino | cellvit | concat
+    missing_impute: "mean"             # mean | zero (ablation only)
+    num_rounds: 5
+    chunk_size: 2000
+    n_sigma: 2000
+    sigma_floor_ratio: 0.25
+    probe_epochs: 50
+    probe_lr: 0.001
+    probe_weight_decay: 0.0001
     diag: true
 
 nucleus_extraction:

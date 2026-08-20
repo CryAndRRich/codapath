@@ -15,14 +15,18 @@ from evaluate import evaluate_model, palm_evaluate, format_palm_report
 
 
 # SLICEABLE: one greedy order at max_budget; smaller budgets are exact prefixes.
-SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm", "refine"}
+SLICEABLE_SAMPLERS = {"random", "coreset", "codapath", "tcm"}
 
 # PER_BUDGET: selection depends on the budget (budget-scaled phase / #clusters /
 # centroids), so it must be re-run for every budget.
-PER_BUDGET_SAMPLERS = {"typiclust", "activeft", "dropquery", "uncertainty_herding"}
+PER_BUDGET_SAMPLERS = {
+    "typiclust", "activeft", "dropquery", "uncertainty_herding", "refine",
+}
 
 # ITERATIVE: re-run per budget with internal probe-refinement rounds.
-ITERATIVE_SAMPLERS = {"entropy", "margin", "badge", "scalpel", "nucleus_al"}
+ITERATIVE_SAMPLERS = {
+    "entropy", "margin", "badge", "scalpel", "nucleus_al", "nucleus_coverage",
+}
 
 
 def _save(path: str, obj) -> None:
@@ -69,10 +73,17 @@ def main(
     test_sample_ids = get_sample_ids(test_dataset)
     train_fingerprint = sample_order_fingerprint(train_sample_ids)
     test_fingerprint = sample_order_fingerprint(test_sample_ids)
-    if sampler_name == "nucleus_al" and run_name is None:
-        source = sampler_cfg.get("cell_source", "cellvit_embedding")
-        uncertainty = sampler_cfg.get("uncertainty_mode", "disagreement")
-        run_name = f"nucleus_{source}_{uncertainty}"
+    if run_name is None:
+        if sampler_name == "nucleus_al":
+            source = sampler_cfg.get("cell_source", "cellvit_embedding")
+            uncertainty = sampler_cfg.get("uncertainty_mode", "disagreement")
+            run_name = f"nucleus_{source}_{uncertainty}"
+        elif sampler_name == "nucleus_coverage":
+            coverage_source = sampler_cfg.get("coverage_source", "dino")
+            run_name = f"nucleus_coverage_{coverage_source}"
+            missing_impute = sampler_cfg.get("missing_impute", "mean")
+            if missing_impute != "mean":
+                run_name = f"{run_name}_{missing_impute}"
     output_name = _safe_run_name(run_name or sampler_name)
 
     train_labels = (
@@ -123,7 +134,7 @@ def main(
                 "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"),
         )
 
-    if sampler_name == "nucleus_al":
+    if sampler_name in {"nucleus_al", "nucleus_coverage"}:
         from nucleus.cache import load_nucleus_cache
         from nucleus.ragged import pool_ragged_features
 
@@ -192,7 +203,7 @@ def main(
                 device=device,
                 **sampler_cfg,
             )
-            if sampler_name == "nucleus_al":
+            if sampler_name in {"nucleus_al", "nucleus_coverage"}:
                 iterative_kwargs.update(
                     nucleus_embeddings=nucleus_embeddings,
                     nucleus_reliability=nucleus_reliability,
@@ -307,6 +318,14 @@ if __name__ == "__main__":
         choices=["cell_margin", "disagreement", "fusion_concat", "fusion_add"],
         default=None, help="Override nucleus_al.uncertainty_mode.",
     )
+    parser.add_argument(
+        "--coverage_source", choices=["dino", "cellvit", "concat"],
+        default=None, help="Override nucleus_coverage.coverage_source.",
+    )
+    parser.add_argument(
+        "--missing_impute", choices=["mean", "zero"],
+        default=None, help="Override nucleus_coverage.missing_impute.",
+    )
 
     args = parser.parse_args(remaining_argv)
 
@@ -323,6 +342,15 @@ if __name__ == "__main__":
             sampler_cfg["cell_source"] = args.cell_source
         if args.uncertainty_mode is not None:
             sampler_cfg["uncertainty_mode"] = args.uncertainty_mode
+    if args.coverage_source is not None or args.missing_impute is not None:
+        if args.sampler_name != "nucleus_coverage":
+            raise ValueError(
+                "--coverage_source/--missing_impute are valid only for nucleus_coverage"
+            )
+        if args.coverage_source is not None:
+            sampler_cfg["coverage_source"] = args.coverage_source
+        if args.missing_impute is not None:
+            sampler_cfg["missing_impute"] = args.missing_impute
 
     print("=" * 60)
     print(f"Dataset      : {dataset_key.upper()} ({dataset_info['num_classes']} classes)")

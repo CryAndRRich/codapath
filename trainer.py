@@ -49,7 +49,13 @@ class LinearProbe(nn.Module):
 def _class_weights(labels: np.ndarray, num_classes: int) -> np.ndarray:
     counts = np.bincount(labels, minlength=num_classes).astype(np.float32)
     total = counts.sum()
-    weights = np.where(counts > 0, total / (num_classes * counts), 0.0)
+    weights = np.zeros_like(counts, dtype=np.float32)
+    np.divide(
+        total,
+        num_classes * counts,
+        out=weights,
+        where=counts > 0,
+    )
     return weights.astype(np.float32)
 
 
