@@ -122,6 +122,55 @@ samplers:
     probe_weight_decay: 0.0001
     diag: true
 
+  # Two independent UCoverage branches propose 2A samples each; the default
+  # finalizer restarts from the true labeled set and performs joint greedy on
+  # their union. RRF/Borda/score are fusion ablations without a submodular
+  # guarantee. ``rff`` is a Gaussian kernel mean embedding of the cell bag.
+  dual_view_uherding:
+    cell_source: "cellvit_embedding"
+    cell_pooling: "mean"               # mean | rff
+    uncertainty_mode: "branch_margin"  # branch_margin | disagreement
+    fusion_mode: "joint"               # joint | rrf | borda | score | visual_then_cell | cell_then_visual
+    alpha: 0.5
+    shortlist_multiplier: 2
+    rrf_k: 60.0
+    num_rounds: 5
+    candidate_pool_size: 8000           # relevant-set kernel cap; null = full pool (small datasets only)
+    chunk_size: 1000
+    n_sigma: 2000
+    probe_epochs: 50
+    probe_lr: 0.001
+    probe_weight_decay: 0.0001
+    consistency_weight: 0.0             # 0 = independent CE probes (primary)
+    consistency_mode: "symmetric_js"   # symmetric_js | visual_teacher | cell_teacher
+    reliability_mode: "valid"
+    rff_dim: 64
+    rff_bandwidth: null                  # null = deterministic median heuristic
+    rff_bandwidth_sample_size: 2048
+    rff_transform_batch_size: 32768
+    diag: true
+
+  # Direct controlled rerun of the old disagreement experiment: calibrated
+  # JSD replaces margin inside proper DINO UCoverage; no cell coverage branch.
+  disagreement_uherding:
+    cell_source: "cellvit_embedding"
+    cell_pooling: "mean"                # mean | rff
+    num_rounds: 5
+    candidate_pool_size: 8000
+    chunk_size: 1000
+    n_sigma: 2000
+    probe_epochs: 50
+    probe_lr: 0.001
+    probe_weight_decay: 0.0001
+    consistency_weight: 0.0
+    consistency_mode: "symmetric_js"
+    reliability_mode: "valid"
+    rff_dim: 64
+    rff_bandwidth: null
+    rff_bandwidth_sample_size: 2048
+    rff_transform_batch_size: 32768
+    diag: true
+
 nucleus_extraction:
   # Do not silently reuse one scale/checkpoint for all datasets. Override these
   # fields only after confirming the source slide/patch resolution metadata.

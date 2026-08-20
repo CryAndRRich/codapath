@@ -11,6 +11,7 @@ NOTEBOOKS = [
     PROJECT / "scripts" / "extract_features.ipynb",
     PROJECT / "scripts" / "run_al.ipynb",
     PROJECT / "scripts" / "run_nucleus_coverage.ipynb",
+    PROJECT / "scripts" / "run_dual_view_uherding.ipynb",
     PROJECT / "scripts" / "evaluate.ipynb",
     PROJECT / "scripts" / "evaluate_nucleus_alignment.ipynb",
 ]
@@ -107,3 +108,34 @@ def test_nucleus_coverage_notebook_runs_controlled_feature_spaces():
     assert "No nucleus cache found" in source
     assert "not** the original UHerding UCoverage objective" in source
     assert 'OUTPUT_DIR = "/kaggle/working/checkpoints"' in source
+
+
+def test_dual_view_notebook_contains_primary_controlled_matrix():
+    notebook = json.loads(
+        (PROJECT / "scripts" / "run_dual_view_uherding.ipynb").read_text(
+            encoding="utf-8"
+        )
+    )
+    source = "\n".join(_source(cell) for cell in notebook["cells"])
+    assert '"disagreement_uherding"' in source
+    assert '"dual_view_uherding"' in source
+    assert '{"cell_pooling": "rff"' in source
+    assert '"shortlist_multiplier"' not in source  # locked by canonical config
+    assert "Aligned nucleus cache not found" in source
+    assert 'OUTPUT_DIR = Path("/kaggle/working/checkpoints")' in source
+    assert "Commit and push the dual-view implementation" in source
+    assert "expected_sample_ids=train_ids" in source
+    assert 'feature_manifest.get("train_fingerprint") == train_fingerprint' in source
+    assert "estimated kernel working set" in source
+    assert "real-cache RFF pilot PASS" in source
+    assert "GPU smoke PASS" in source
+    assert "artifact audit PASS" in source
+    assert "ALL ARTIFACTS PASS" in source
+
+    cells = [_source(cell) for cell in notebook["cells"]]
+    smoke_index = next(i for i, cell in enumerate(cells) if "GPU smoke PASS" in cell)
+    run_index = next(i for i, cell in enumerate(cells) if "main(" in cell)
+    audit_index = next(
+        i for i, cell in enumerate(cells) if "ALL ARTIFACTS PASS" in cell
+    )
+    assert smoke_index < run_index < audit_index

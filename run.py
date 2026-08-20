@@ -26,6 +26,12 @@ PER_BUDGET_SAMPLERS = {
 # ITERATIVE: re-run per budget with internal probe-refinement rounds.
 ITERATIVE_SAMPLERS = {
     "entropy", "margin", "badge", "scalpel", "nucleus_al", "nucleus_coverage",
+    "dual_view_uherding", "disagreement_uherding",
+}
+
+NUCLEUS_SAMPLERS = {
+    "nucleus_al", "nucleus_coverage", "dual_view_uherding",
+    "disagreement_uherding",
 }
 
 
@@ -84,6 +90,14 @@ def main(
             missing_impute = sampler_cfg.get("missing_impute", "mean")
             if missing_impute != "mean":
                 run_name = f"{run_name}_{missing_impute}"
+        elif sampler_name == "dual_view_uherding":
+            pooling = sampler_cfg.get("cell_pooling", "mean")
+            uncertainty = sampler_cfg.get("uncertainty_mode", "branch_margin")
+            fusion = sampler_cfg.get("fusion_mode", "joint")
+            run_name = f"dual_uh_{pooling}_{uncertainty}_{fusion}"
+        elif sampler_name == "disagreement_uherding":
+            pooling = sampler_cfg.get("cell_pooling", "mean")
+            run_name = f"disagreement_uh_{pooling}"
     output_name = _safe_run_name(run_name or sampler_name)
 
     train_labels = (
@@ -134,9 +148,9 @@ def main(
                 "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"),
         )
 
-    if sampler_name in {"nucleus_al", "nucleus_coverage"}:
+    if sampler_name in NUCLEUS_SAMPLERS:
         from nucleus.cache import load_nucleus_cache
-        from nucleus.ragged import pool_ragged_features
+        from nucleus.ragged import pool_ragged_features, pool_ragged_rff
 
         cache_path = os.path.join(
             nucleus_cache_dir, f"{dataset_key}_seed{random_seed}"
@@ -157,19 +171,41 @@ def main(
                 "Crop-DINO cache backbone does not match the run backbone"
             )
         cell_features = nucleus_cache.features(cell_source)
-        nucleus_view = pool_ragged_features(
-            cell_features,
-            nucleus_cache.offsets,
-            nucleus_cache.confidence,
-            reliability_mode=sampler_cfg.get("reliability_mode", "valid"),
-        )
+        cell_pooling = sampler_cfg.get("cell_pooling", "mean")
+        reliability_mode = sampler_cfg.get("reliability_mode", "valid")
+        if cell_pooling == "mean":
+            nucleus_view = pool_ragged_features(
+                cell_features,
+                nucleus_cache.offsets,
+                nucleus_cache.confidence,
+                reliability_mode=reliability_mode,
+            )
+        elif cell_pooling == "rff":
+            nucleus_view = pool_ragged_rff(
+                cell_features,
+                nucleus_cache.offsets,
+                nucleus_cache.confidence,
+                reliability_mode=reliability_mode,
+                output_dim=int(sampler_cfg.get("rff_dim", 64)),
+                bandwidth=sampler_cfg.get("rff_bandwidth"),
+                bandwidth_sample_size=int(
+                    sampler_cfg.get("rff_bandwidth_sample_size", 2048)
+                ),
+                transform_batch_size=int(
+                    sampler_cfg.get("rff_transform_batch_size", 32768)
+                ),
+                seed=random_seed,
+            )
+        else:
+            raise ValueError("cell_pooling must be 'mean' or 'rff'")
         nucleus_embeddings = nucleus_view.patch_features
         nucleus_reliability = nucleus_view.reliability
-        nucleus_manifest = nucleus_cache.manifest
+        nucleus_manifest = dict(nucleus_cache.manifest)
+        nucleus_manifest["pooling"] = nucleus_view.metadata
         print(
             f"[nucleus] Loaded {cache_path}: "
             f"patches={nucleus_cache.num_patches}, cells={nucleus_cache.num_cells}, "
-            f"source={cell_source}"
+            f"source={cell_source}, pooling={nucleus_view.metadata}"
         )
 
     master_selected = None
@@ -203,7 +239,7 @@ def main(
                 device=device,
                 **sampler_cfg,
             )
-            if sampler_name in {"nucleus_al", "nucleus_coverage"}:
+            if sampler_name in NUCLEUS_SAMPLERS:
                 iterative_kwargs.update(
                     nucleus_embeddings=nucleus_embeddings,
                     nucleus_reliability=nucleus_reliability,
@@ -311,12 +347,15 @@ if __name__ == "__main__":
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument(
         "--cell_source", choices=["cellvit_embedding", "crop_dino"],
-        default=None, help="Override nucleus_al.cell_source.",
+        default=None, help="Override the CellViT/crop-DINO cache source.",
     )
     parser.add_argument(
         "--uncertainty_mode",
-        choices=["cell_margin", "disagreement", "fusion_concat", "fusion_add"],
-        default=None, help="Override nucleus_al.uncertainty_mode.",
+        choices=[
+            "cell_margin", "disagreement", "fusion_concat", "fusion_add",
+            "branch_margin",
+        ],
+        default=None, help="Override a nucleus sampler's uncertainty mode.",
     )
     parser.add_argument(
         "--coverage_source", choices=["dino", "cellvit", "concat"],
@@ -326,6 +365,17 @@ if __name__ == "__main__":
         "--missing_impute", choices=["mean", "zero"],
         default=None, help="Override nucleus_coverage.missing_impute.",
     )
+    parser.add_argument(
+        "--cell_pooling", choices=["mean", "rff"], default=None,
+        help="Override dual-view cell bag pooling.",
+    )
+    parser.add_argument(
+        "--fusion_mode", choices=[
+            "joint", "rrf", "borda", "score",
+            "visual_then_cell", "cell_then_visual",
+        ],
+        default=None, help="Override dual-view shortlist fusion.",
+    )
 
     args = parser.parse_args(remaining_argv)
 
@@ -333,15 +383,36 @@ if __name__ == "__main__":
     dataset_info = config["datasets"][dataset_key]
     sampler_cfg  = config.get("samplers", {}).get(args.sampler_name, {})
     sampler_cfg = dict(sampler_cfg)
-    if args.cell_source is not None or args.uncertainty_mode is not None:
-        if args.sampler_name != "nucleus_al":
+    if args.cell_source is not None:
+        if args.sampler_name not in NUCLEUS_SAMPLERS:
+            raise ValueError("--cell_source requires a nucleus sampler")
+        sampler_cfg["cell_source"] = args.cell_source
+    if args.uncertainty_mode is not None:
+        allowed_uncertainties = {
+            "nucleus_al": {
+                "cell_margin", "disagreement", "fusion_concat", "fusion_add"
+            },
+            "dual_view_uherding": {"branch_margin", "disagreement"},
+            "disagreement_uherding": {"disagreement"},
+        }
+        allowed = allowed_uncertainties.get(args.sampler_name)
+        if allowed is None or args.uncertainty_mode not in allowed:
             raise ValueError(
-                "--cell_source/--uncertainty_mode are valid only for nucleus_al"
+                f"--uncertainty_mode={args.uncertainty_mode!r} is not valid "
+                f"for {args.sampler_name!r}"
             )
-        if args.cell_source is not None:
-            sampler_cfg["cell_source"] = args.cell_source
-        if args.uncertainty_mode is not None:
-            sampler_cfg["uncertainty_mode"] = args.uncertainty_mode
+        sampler_cfg["uncertainty_mode"] = args.uncertainty_mode
+    if args.cell_pooling is not None or args.fusion_mode is not None:
+        if args.sampler_name not in {"dual_view_uherding", "disagreement_uherding"}:
+            raise ValueError(
+                "--cell_pooling/--fusion_mode require a dual-view UH sampler"
+            )
+        if args.cell_pooling is not None:
+            sampler_cfg["cell_pooling"] = args.cell_pooling
+        if args.fusion_mode is not None:
+            if args.sampler_name != "dual_view_uherding":
+                raise ValueError("--fusion_mode is only used by dual_view_uherding")
+            sampler_cfg["fusion_mode"] = args.fusion_mode
     if args.coverage_source is not None or args.missing_impute is not None:
         if args.sampler_name != "nucleus_coverage":
             raise ValueError(
