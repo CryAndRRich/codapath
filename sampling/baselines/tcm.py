@@ -1,3 +1,20 @@
+"""TCM: TypiClust-then-Margin (ICLR 2024 Workshop).
+
+No public reference implementation, so this follows the paper text directly
+(`references/TCM.md`, and `pdfs/TCM_2403.03728.pdf`).
+
+Phase 1 is TypiClust, phase 2 is Margin refit after every step. The paper's
+"tiny" regime -- the one this project's budgets fall in -- sets "the initial
+sample size equal to the number of classes" with "a step size equal to the
+number of initial samples", and its heuristic performs "3 steps of TypiClust
+before switching to Margin". Hence a transition at `3 * num_classes` and a
+Margin step of `num_classes`, both budget-independent.
+
+The TypiClust phase is a separate implementation from `typiclust.py` because it
+starts from an empty labeled set: clusters are ranked by size alone, since the
+"fewest existing labels first" key is constant at zero.
+"""
+
 from typing import List
 
 import numpy as np
@@ -7,7 +24,7 @@ from tqdm import tqdm
 from sklearn.cluster import MiniBatchKMeans, KMeans
 
 from utils.runtime import clear_memory
-from .. import register_sampler
+from ..registry import register_sampler
 
 
 def _typicality(features: torch.Tensor, indices: List[int], k_nn: int,
@@ -46,10 +63,10 @@ def _typiclust_phase(features: torch.Tensor,
     feats_np = features.cpu().numpy()
 
     if num_select <= 50:
-        km = KMeans(n_clusters=num_select, n_init="auto", random_state=42)
+        km = KMeans(n_clusters=num_select, n_init=10, random_state=42)
     else:
         km = MiniBatchKMeans(n_clusters=num_select, batch_size=5000,
-                             n_init="auto", random_state=42)
+                             n_init=3, random_state=42)
 
     cluster_ids = km.fit_predict(feats_np)
     cluster_sizes = np.bincount(cluster_ids, minlength=num_select)
@@ -105,10 +122,22 @@ def tcm_sampling(**kwargs) -> List[int]:
     device = kwargs["device"]
     k_nn = kwargs.get("k_nn", 20)
     chunk_size = kwargs.get("chunk_size", 5000)
-    transition_budget = kwargs.get("transition_budget", min(2 * num_classes, max_budget))
-    transition_budget = min(transition_budget, max_budget)
+    # Paper Sec. 4.1: the "tiny" budget regime it defines has "the initial
+    # sample size equal to the number of classes" and "a step size equal to the
+    # number of initial samples". Its heuristic (Sec. 3.3) then performs "3
+    # steps of TypiClust before switching to Margin" in the Tiny and Low
+    # settings. This project's budgets (25..200 over 9-16 classes) sit squarely
+    # in that regime, so the transition lands at 3 * num_classes and the Margin
+    # phase steps by num_classes.
+    #
+    # Both multiples are class-relative and independent of max_budget, which is
+    # what keeps the selection order budget-independent (see sampling.specs:
+    # prefix-exact once budget >= 3 * num_classes).
+    transition_multiple = int(kwargs.get("transition_class_multiple", 3))
+    step_multiple = int(kwargs.get("step_class_multiple", 1))
+    transition_budget = min(transition_multiple * num_classes, max_budget)
 
-    from training.probe import train_linear
+    from training.probe import train_probe
 
     features = torch.tensor(image_embeddings, device=device, dtype=torch.float32)
     features = F.normalize(features, p=2, dim=1)
@@ -124,23 +153,17 @@ def tcm_sampling(**kwargs) -> List[int]:
     phase1_set = set(phase1)
     unlabeled_indices = [i for i in range(len(image_embeddings)) if i not in phase1_set]
 
-    # Paper (references/TCM.md, Sec. 4.1 "Setup"): "classifier training
-    # following EACH sampling step" — Margin retrains on the FULL accumulated
-    # labeled set every acquisition, exactly like basic_samplers.py's own
-    # margin_sampling. A single train-once-then-freeze cut (the old behavior
-    # here) is not what the paper describes for its Margin phase.
-    #
-    # Step size (Sec. 3.2: "we use a step size equal to the size of the
-    # initial budget of each setting") is `transition_budget` itself, not a
-    # fraction of `max_budget`.
-    step_budget = max(1, transition_budget)
+    # Paper Sec. 4.1: the classifier is retrained "following each sampling
+    # step", so Margin re-fits on the FULL accumulated labeled set at every
+    # acquisition rather than scoring once and taking a single cut.
+    step_budget = max(1, step_multiple * num_classes)
     phase2: List[int] = []
 
     while len(phase2) < remaining_budget:
         current_need = min(step_budget, remaining_budget - len(phase2))
         labeled_so_far = phase1 + phase2
 
-        probe = train_linear(
+        probe = train_probe(
             image_embeddings[labeled_so_far],
             oracle_labels[labeled_so_far],
             num_classes, probe_epochs, probe_lr, device,

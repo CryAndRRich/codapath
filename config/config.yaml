@@ -1,11 +1,11 @@
-dataset: "pathmnist"
-sampler_name: "codapath"
+# Dataset and sampler are chosen on the command line (see main.py), not here.
 random_seed: 42
 device: "cuda"
 
 cumulative_budget: [25, 50, 75, 100, 125, 150, 175, 200]
+output_dir: "checkpoints"
 feature_cache_dir: "features"
-nucleus_cache_dir: "nucleus_features"
+cellvit_cache_dir: "cellvit_features"
 
 models:
   vit: "facebook/dinov2-base"              
@@ -28,9 +28,11 @@ samplers:
     chunk_size: 10000
 
   activeft:
-    lr: 0.001          # paper/official default (was 0.01 = 10× too high)
-    temperature: 0.07
-    iterations: 300    # official default max_iter (was 100 = 1/3 official)
+    lr: 0.001          # official default in both ActiveFT variants
+    temperature: 0.07  # official default
+    iterations: 300    # official max_iter of the CIFAR variant (the ImageNet
+                       # variant uses 100; more iterations only converges the
+                       # same objective further, it is not a different method)
     balance: 1.0
 
   codapath:
@@ -59,6 +61,8 @@ samplers:
     probe_lr: 0.001
     k_nn: 20
     chunk_size: 5000
+    transition_class_multiple: 3   # paper: 3 TypiClust steps before switching to Margin (Tiny/Low regime)
+    step_class_multiple: 1         # paper: step size = initial sample size = number of classes
 
   dropquery:
     probe_epochs: 50
@@ -69,87 +73,43 @@ samplers:
   refine:
     probe_epochs: 30
     probe_lr: 0.001
-    filter_rounds: 5       # progressive-filter rounds (paper)
-    filter_alpha: 0.4      # subsample ratio per round (paper)
-    filter_batches: 5      # queries per strategy per round (paper uses ~10; raise if compute allows)
-    init_subset_size: 5000 # round-1 fixed subsample (paper)
-    chunk_size: 2000       # stage-2 UncertaintyHerding coverage chunk
+    filter_rounds: 5           # official progressive_depth
+    filter_alpha: 0.4          # official alpha
+    num_candidate_batches: 100 # official num_batches, a TOTAL split across the
+                               # filter strategies (100 // 5 = 20 each per round).
+                               # This is the method's whole cost: 5 strategies x 20
+                               # batches x 5 rounds of sampler calls per budget.
+                               # Lower it if a Kaggle session cannot finish, and say
+                               # so when reporting -- it is a fidelity trade, not free.
+    init_subset_size: 5000     # official init_subset_size
+    max_pool_size: 10000       # official cap on the surviving pool after each round
+    chunk_size: 2000           # stage-2 UncertaintyHerding coverage chunk
 
+  # The project's own method: Uncertainty Herding's objective with the weight
+  # replaced by visual/cell disagreement. See sampling/scalpel/.
   scalpel:
-    num_rounds: 5             # iterative AL rounds (like SaE T=5)
-    chunk_size: 2000          # greedy coverage chunk size (DINOv2 space)
-    kappa: 1.0                # vacuity evidence scale λ=κ·L/(H+0.1)
-    probe_epochs: 50          # per-round probe epochs (morphology + stain)
-    probe_lr: 0.001           # per-round probe lr
-    use_stain_discount: true  # false → plain margin uncertainty (ablation)
-    diag: true                # print probe acc + stain-shortcut hypothesis check
-    n_sigma: 2000             # subsample size for adaptive sigma
-    use_adaptive_cap: false              # false → original fixed t=r/(T-1) schedule (ablation)
-    gap_trend_thresh: 0.005             # round-over-round gap growth below this = "not widening"
-    gap_abs_thresh: 0.03                # gap below this = "shortcut too weak to trust"
-    t_cap_value: 0.4                    # cap on t once adaptive cap triggers
-    min_labels_per_class_for_cap: 2.0   # min avg labels/class before trusting the gap estimate
-    use_rank_normalize: true           # true → rank-normalize vac/reconcile instead of minmax (test independently of use_adaptive_cap)
-
-  nucleus_al:
+    uncertainty_mode: "disagreement"   # disagreement | visual_margin (ablation: plain UHerding weight)
+    cell_source: "cellvit_embedding"   # cellvit_embedding | crop_dino (which cache field to read)
+    cell_pooling: "mean"               # mean | rff | moments — how per-cell embeddings become one vector
+    missing_impute: "mean"             # mean | zero — patches where CellViT found no nucleus
+    reliability_mode: "valid"          # valid | mean_confidence
     num_rounds: 5
     chunk_size: 2000
-    n_sigma: 2000
+    n_sigma: 2000                      # pool subsample for the round-1 bandwidth and the sigma floor
+    sigma_floor_ratio: 0.25            # sigma >= this * bootstrap sigma; near-duplicate tiles drive min-pairwise to ~0
     probe_epochs: 50
     probe_lr: 0.001
     probe_weight_decay: 0.0001
-    cell_source: "cellvit_embedding"   # cellvit_embedding | crop_dino
-    uncertainty_mode: "disagreement"  # cell_margin | disagreement | fusion_concat | fusion_add
-    reliability_mode: "valid"         # valid | mean_confidence
-    fusion_min_labels_per_class: 2.0
-    fusion_normalize_logits: false     # true = row-LN ablation before concat/add
+    consistency_weight: 0.0            # >0 couples the two probes during training. Works AGAINST acquisition:
+                                       # forcing agreement shrinks the divergence this sampler selects on.
+    consistency_mode: "symmetric_js"   # symmetric_js | visual_teacher | cell_teacher
+    rff_dim: 64                        # cell_pooling=rff only
+    rff_bandwidth: null                # null = deterministic median heuristic
+    rff_bandwidth_sample_size: 2048
+    rff_transform_batch_size: 32768
     diag: true
 
-  nucleus_coverage:
-    cell_source: "cellvit_embedding"   # cache field read in run.py; this sampler always uses CellViT tokens, never crop_dino
-    coverage_source: "dino"            # dino | cellvit | concat — the 3 controlled experiments (override via SAMPLER_OVERRIDES on Kaggle)
-    missing_impute: "mean"             # mean | zero — patches with no detected nucleus. "zero" leaves them orthogonal to
-                                       # everything (never covered by an earlier pick) so the greedy over-selects them; ablation only.
-    num_rounds: 5
-    chunk_size: 2000
-    n_sigma: 2000                      # pool-subsample size for the round-1 sigma bootstrap and the sigma floor reference
-    sigma_floor_ratio: 0.25            # sigma >= this * bootstrap sigma; min-pairwise collapses to ~0 on near-duplicate tiles
-    probe_epochs: 50
-    probe_lr: 0.001
-    probe_weight_decay: 0.0001
-    diag: true
-
-  graph_deuce:
-    cell_source: "cellvit_embedding"    # cache field read in run.py; this sampler always uses CellViT tokens, never crop_dino
-    acquisition_variant: "laplace_margin"  # laplace_margin | uherding_swap_uncertainty | uherding_swap_coverage | laplace_plus_ppr | deuce_native
-                                            # override via SAMPLER_OVERRIDES on Kaggle to run all 5, one session each — same
-                                            # pattern as nucleus_coverage's coverage_source (see EXPERIMENT.md Hướng 3 mục 7.10)
-    embedding_reduction: "vae"           # vae | pca — "pca" thay 2 MLPVAE bằng PCA xác định (graph_al/pca.py, không thể
-                                          # collapse), thêm 2026-08-18 để chẩn đoán nghi ngờ VAE posterior collapse (CLAUDE.md)
-    deuce_uncertainty_source: "laplace_margin"  # laplace_margin | probe_ece — chỉ dùng bởi acquisition_variant="deuce_native"
-    deuce_min_cluster_size: 5            # HDBSCAN* k_r (paper default 3, tuned cho pool văn bản khác hẳn quy mô — chưa tune lại)
-    deuce_fps_starts: null               # null = mượn đúng k (paper reuse cùng k cho "arg top-k deg" FPS restarts) — override
-                                          # độc lập với k nếu muốn tách rời mật độ graph khỏi số điểm-xuất-phát FPS
-    per_point: false                       # true = giải lại Laplace learning sau MỖI điểm chọn (đúng vòng lặp tuần tự thật
-                                            # của SARGraphAL gốc), chỉ có tác dụng với laplace_margin/laplace_plus_ppr — 2
-                                            # biến thể uherding_swap_* bỏ qua tham số này (giữ nguyên round-based của UHerding
-                                            # gốc). false (mặc định) = discount-batch 1 lần/vòng, rẻ hơn ~5x nhưng kém trung
-                                            # thành hơn — xem chat 2026-08-17 (per-point fidelity).
-    k: 20                               # kNN neighbors for both W_visual/W_cell (mượn SARGraphAL's k, not DEUCE's k=500 which is for text pools)
-    chunk_size: 2000
-    vae_epochs: 100
-    vae_lr: 0.001
-    vae_batch_size: 512                 # bigger batches keep the GPU busier for this small MLP-VAE (see chat 2026-08-17 GPU-utilization note)
-    vae_visual_hidden: [256, 128]
-    vae_cell_hidden: [128, 64]
-    vae_latent_dim: 32                  # mượn nguyên latent_dim của CVAE gốc SARGraphAL
-    gamma: 1.0                          # DEUCE merge threshold — KHÔNG phải hyperparameter cần tune (xem EXPERIMENT.md mục 0)
-    probe_epochs: 50                    # chỉ dùng bởi uherding_swap_coverage (LinearProbe+ECE trên DINO)
-    probe_lr: 0.001
-    ppr_damping: 0.85                   # chỉ dùng bởi laplace_plus_ppr
-    ppr_alpha: 0.5                      # chỉ dùng bởi laplace_plus_ppr — trộn (1-alpha)*uncertainty + alpha*coverage, CHƯA TUNE
-
-nucleus_extraction:
+cellvit_extraction:
   # Do not silently reuse one scale/checkpoint for all datasets. Override these
   # fields only after confirming the source slide/patch resolution metadata.
   checkpoint: null

@@ -28,7 +28,7 @@ def _all_finite(array: np.ndarray, chunk_size: int = 65536) -> bool:
 
 
 @dataclass(frozen=True)
-class NucleusCache:
+class CellViTCache:
     offsets: np.ndarray
     cellvit_embeddings: Optional[np.ndarray]
     cell_dino_features: Optional[np.ndarray]
@@ -109,7 +109,7 @@ def _validate_arrays(
         raise ValueError("bboxes must have shape (num_cells, 4)")
 
 
-def save_nucleus_cache(
+def save_cellvit_cache(
     cache_dir: str,
     *,
     offsets: np.ndarray,
@@ -166,17 +166,17 @@ def save_nucleus_cache(
         json.dump(full_manifest, f, indent=2, sort_keys=True)
 
 
-def load_nucleus_cache(
+def load_cellvit_cache(
     cache_dir: str,
     *,
     expected_sample_ids: Optional[Sequence[str]] = None,
     mmap_mode: Optional[str] = "r",
-) -> NucleusCache:
+) -> CellViTCache:
     manifest_path = os.path.join(cache_dir, "manifest.json")
     if not os.path.exists(manifest_path):
         raise FileNotFoundError(
             f"Nucleus cache manifest not found: {manifest_path}. "
-            "Run scripts/extract_nucleus_features.py first."
+            "Run scripts/extract_cellvit_features.py first."
         )
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
@@ -231,7 +231,7 @@ def load_nucleus_cache(
         if sample_ids.tolist() != list(expected_sample_ids):
             raise ValueError("Nucleus cache sample IDs do not exactly match the split")
 
-    return NucleusCache(
+    return CellViTCache(
         offsets=offsets,
         cellvit_embeddings=cellvit_embeddings,
         cell_dino_features=cell_dino_features,

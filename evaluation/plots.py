@@ -6,11 +6,12 @@ training paths do not need.
 from __future__ import annotations
 
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+import torch
 from sklearn.manifold import TSNE
 
 from utils.runtime import clear_memory
@@ -218,4 +219,3 @@ def plot_label_diversity(
     save_path = f"label_diversity_{dataset}_{budget}.png"
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.show()
-

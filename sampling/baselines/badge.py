@@ -1,10 +1,27 @@
+"""BADGE (Ash et al., ICLR 2020).
+
+Verified against `repos/badge/query_strategies/badge_sampling.py::init_centers`.
+
+BADGE runs k-means++ seeding in the space of loss-gradient embeddings
+`g_x = (onehot(argmax p) - p) (x) h(x)`. Those vectors are never formed: for a
+Kronecker product the squared distance factorises as
+
+    ||g_a - g_b||^2 = ||r_a||^2||h_a||^2 + ||r_b||^2||h_b||^2
+                      - 2 (r_a . r_b)(h_a . h_b)
+
+which is what the code below computes. First center is the largest-norm point
+(deterministic, as upstream), and each later center is drawn with probability
+proportional to the squared distance to the nearest chosen center. Upstream
+rejects repeats by resampling; zeroing their probability is equivalent.
+"""
+
 from typing import List
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .. import register_sampler
+from ..registry import register_sampler
 
 
 @register_sampler("badge")
@@ -17,7 +34,7 @@ def badge_sampling(**kwargs) -> List[int]:
     probe_lr = kwargs.get("probe_lr", 1e-3)
     device = kwargs["device"]
 
-    from training.probe import train_linear
+    from training.probe import train_probe
 
     num_samples = image_embeddings.shape[0]
     step_budget = max(1, int(0.2 * max_budget))
@@ -32,7 +49,7 @@ def badge_sampling(**kwargs) -> List[int]:
             chosen_local = np.random.choice(len(unlabeled_indices), current_need, replace=False)
             chosen = [unlabeled_indices[i] for i in chosen_local]
         else:
-            probe = train_linear(
+            probe = train_probe(
                 image_embeddings[selected_indices],
                 oracle_labels[selected_indices],
                 num_classes, probe_epochs, probe_lr, device,

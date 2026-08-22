@@ -1,6 +1,6 @@
 import numpy as np
 
-from nucleus.uncertainty import (
+from sampling.uncertainty import (
     js_disagreement_from_logits,
     margin_uncertainty_from_logits,
     row_layer_norm,

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from nucleus.ragged import pool_ragged_features
+from features.cellvit.pooling import pool_cells_mean
 
 
 def test_confidence_weighted_pool_and_empty_patch():
@@ -9,7 +9,7 @@ def test_confidence_weighted_pool_and_empty_patch():
     offsets = np.asarray([0, 2, 2, 3])
     confidence = np.asarray([0.25, 0.75, 0.5])
 
-    view = pool_ragged_features(features, offsets, confidence)
+    view = pool_cells_mean(features, offsets, confidence)
 
     np.testing.assert_allclose(view.patch_features[0], [2.5, 1.5])
     np.testing.assert_allclose(view.patch_features[1], [0.0, 0.0])
@@ -19,7 +19,7 @@ def test_confidence_weighted_pool_and_empty_patch():
 
 
 def test_mean_confidence_reliability_is_bounded():
-    view = pool_ragged_features(
+    view = pool_cells_mean(
         np.ones((2, 1)), np.asarray([0, 2]),
         confidence=np.asarray([-2.0, 3.0]),
         reliability_mode="mean_confidence",
@@ -29,4 +29,4 @@ def test_mean_confidence_reliability_is_bounded():
 
 def test_rejects_invalid_offsets():
     with pytest.raises(ValueError, match="offsets"):
-        pool_ragged_features(np.ones((2, 3)), np.asarray([0, 2, 1]))
+        pool_cells_mean(np.ones((2, 3)), np.asarray([0, 2, 1]))

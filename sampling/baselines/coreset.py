@@ -1,3 +1,15 @@
+"""Core-Set / k-center greedy (Sener & Savarese, ICLR 2018).
+
+Verified against `repos/badge/query_strategies/kcenter_greedy.py`: seed a
+center, then repeatedly take the point whose distance to the nearest chosen
+center is largest, updating that nearest-center distance incrementally.
+
+Distance here is `1 - cosine` on L2-normalized rows, which equals half the
+squared Euclidean distance. k-center greedy only ever compares distances, and
+a monotone transform leaves every argmax unchanged, so the selection is
+identical to the reference while matching this project's kernel convention.
+"""
+
 from typing import List
 
 import numpy as np
@@ -6,7 +18,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from utils.runtime import clear_memory
-from .. import register_sampler
+from ..registry import register_sampler
 
 
 @register_sampler("coreset")

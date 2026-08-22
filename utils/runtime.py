@@ -4,7 +4,7 @@ import random
 import warnings
 import ctypes
 
-import numpy as np 
+import numpy as np
 import torch
 
 def set_seed(seed: int) -> None:

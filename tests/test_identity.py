@@ -1,4 +1,4 @@
-from identity import sample_order_fingerprint
+from data.identity import sample_order_fingerprint
 
 
 def test_sample_fingerprint_depends_on_membership_and_order():

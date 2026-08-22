@@ -1,3 +1,22 @@
+"""DropQuery (TMLR 2024).
+
+Verified against `repos/dropquery/ALFM/src/query_strategies/dropout.py` and
+`ALFM/src/clustering/kmeans.py`.
+
+Candidates are points whose prediction flips under dropout. The threshold is
+NOT a fixed 50%: it starts at `n_dropout // 2` and is lowered until at least
+`25 * acq_size` points qualify, or it reaches zero. Survivors are
+L2-normalized, clustered into `acq_size` clusters, and one point is taken per
+cluster -- the member closest to its OWN centroid, a Voronoi pick rather than a
+global nearest-neighbour scan. `n_init=1` matches upstream's single faiss
+k-means run with an explicit k-means++ init.
+
+One forced adaptation: upstream perturbs an MLP head's hidden activations,
+which a single linear probe does not have. Dropout is applied to the input
+features instead -- the closest analogue under this project's frozen-backbone
+protocol.
+"""
+
 from typing import List
 
 import numpy as np
@@ -6,7 +25,7 @@ import torch.nn.functional as F
 from sklearn.cluster import MiniBatchKMeans, KMeans
 
 from utils.runtime import clear_memory
-from .. import register_sampler
+from ..registry import register_sampler
 
 
 @register_sampler("dropquery")
@@ -34,7 +53,7 @@ def dropquery_sampling(**kwargs) -> List[int]:
     num_rounds = kwargs.get("num_rounds", 5)
     device = kwargs["device"]
 
-    from training.probe import train_linear
+    from training.probe import train_probe
 
     num_samples = image_embeddings.shape[0]
     rounds = max(1, min(num_rounds, max_budget))
@@ -59,7 +78,7 @@ def dropquery_sampling(**kwargs) -> List[int]:
             selected_set.update(chosen)
             continue
 
-        probe = train_linear(
+        probe = train_probe(
             image_embeddings[selected_indices],
             oracle_labels[selected_indices],
             num_classes, probe_epochs, probe_lr, device,
@@ -110,9 +129,9 @@ def dropquery_sampling(**kwargs) -> List[int]:
             cand_features = cand_t.numpy()
 
             if n_select <= 50:
-                km = KMeans(n_clusters=n_select, n_init="auto", random_state=42)
+                km = KMeans(n_clusters=n_select, n_init=1, random_state=42)
             else:
-                km = MiniBatchKMeans(n_clusters=n_select, batch_size=5000, n_init="auto", random_state=42)
+                km = MiniBatchKMeans(n_clusters=n_select, batch_size=5000, n_init=1, random_state=42)
 
             km.fit(cand_features)
             all_dist = km.transform(cand_features)  # (num_candidates, n_select)

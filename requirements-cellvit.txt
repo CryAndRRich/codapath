@@ -1,2 +1,7 @@
-# Official PyPI wheel audited against nucleus/cellvit_extractor.py.
+# CellViT only. Kept separate because it pulls a heavy, version-sensitive stack
+# (numba, cv2, scikit-image) that the sampling and training paths never import.
+# Install this in the nucleus-extraction notebook only; main.py reads the cache
+# that notebook writes and needs none of it.
+#
+# Official PyPI wheel, audited against features/cellvit/extractor.py.
 cellvit==1.0.9 --hash=sha256:0dc07a8cb5dd4318882f5200d60170d3326de6de8514cae6f6dafe0a8230b699

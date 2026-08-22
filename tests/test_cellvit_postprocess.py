@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from nucleus.postprocessing import stack_prediction_maps_numpy
+from features.cellvit.postprocess import stack_prediction_maps_numpy
 
 
 def test_stack_prediction_maps_matches_cellvit_semantics_without_numba():

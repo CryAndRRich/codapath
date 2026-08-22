@@ -1,3 +1,23 @@
+"""TypiClust (Hacohen et al., ICML 2022).
+
+Verified against `repos/typiclust/deep-al/pycls/al/typiclust.py`. Matching
+constants: `MIN_CLUSTER_SIZE=5`, `MAX_NUM_CLUSTERS=500`, `K_NN=20`, KMeans
+below 50 clusters and MiniBatchKMeans(batch_size=5000) above.
+
+Two details that are easy to lose:
+
+* typicality is recomputed on the SHRINKING set of still-unlabeled members of
+  a cluster at every single pick, not once per cluster. Density among the
+  remaining candidates changes as their neighbours get taken.
+* `n_init` is pinned to the sklearn defaults upstream inherited (10 for KMeans,
+  3 for MiniBatchKMeans). Today's `n_init="auto"` resolves to 1, which would
+  quietly give the clustering this whole method rests on a single restart.
+
+Upstream measures neighbour distance with `faiss.IndexFlatL2` (squared L2) on
+L2-normalized features; `1 - cosine` here is the same quantity up to a factor
+of two, so the argmax over typicality is unchanged.
+"""
+
 from typing import List
 
 import numpy as np
@@ -7,7 +27,7 @@ from tqdm import tqdm
 from sklearn.cluster import MiniBatchKMeans, KMeans
 
 from utils.runtime import clear_memory
-from .. import register_sampler
+from ..registry import register_sampler
 
 
 @register_sampler("typiclust")
@@ -28,9 +48,11 @@ def typiclust_sampling(**kwargs) -> List[int]:
     num_clusters = min(len(existing_labeled_indices) + max_budget, 500)
 
     if num_clusters <= 50:
-        km = KMeans(n_clusters=num_clusters, n_init="auto", random_state=42)
+        km = KMeans(n_clusters=num_clusters, n_init=10, random_state=42)
     else:
-        km = MiniBatchKMeans(n_clusters=num_clusters, batch_size=5000, n_init="auto", random_state=42)
+        km = MiniBatchKMeans(
+            n_clusters=num_clusters, batch_size=5000, n_init=3, random_state=42
+        )
 
     cluster_ids = km.fit_predict(features_np)
     cluster_sizes = np.bincount(cluster_ids, minlength=num_clusters)
@@ -64,12 +86,12 @@ def typiclust_sampling(**kwargs) -> List[int]:
         for c in valid_clusters
     }
 
-    def _typicality(indices: List[int]) -> np.ndarray:
+    def _typicality(features: torch.Tensor, indices: List[int]) -> np.ndarray:
         n_c = len(indices)
         if n_c <= 1:
             return np.zeros(n_c, dtype=np.float32)
 
-        feats = features_tensor[indices]
+        feats = features[indices]
         k_val = max(1, min(K_NN, n_c // 2))  # upstream: min(K_NN, len(indices) // 2)
         mean_nn_dist = torch.zeros(n_c, device=device)
 
@@ -97,7 +119,7 @@ def typiclust_sampling(**kwargs) -> List[int]:
             available_indices = cluster_members[cluster]
 
             if len(available_indices) > 0:
-                cluster_typ = _typicality(available_indices)
+                cluster_typ = _typicality(features_tensor, available_indices)
                 best_local_idx = int(np.argmax(cluster_typ))
                 best_global_idx = available_indices[best_local_idx]
 

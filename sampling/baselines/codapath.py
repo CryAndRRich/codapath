@@ -1,3 +1,15 @@
+"""CODAPath -- this project's earlier method, kept as a baseline.
+
+Scores the pool against dual-VLM (PLIP + BiomedCLIP) text prototypes built from
+per-class descriptions, then greedily maximises
+`(1 - alpha) * coverage + alpha * uncertainty` with
+`uncertainty = (1 - margin)(1 + JSD)` at tau = 0.05.
+
+Unlike every other sampler here it selects in the VLM embedding space rather
+than DINOv2, so `main.py` extracts VLM image features for it. Evaluation still
+uses the shared DINOv2 probe, so the comparison stays fair.
+"""
+
 from typing import Dict, List
 
 import numpy as np
@@ -8,7 +20,7 @@ from tqdm import tqdm
 from transformers import CLIPVisionModel, CLIPTokenizer, CLIPTextModel, AutoTokenizer, AutoModel
 
 from utils.runtime import clear_memory
-from .. import register_sampler
+from ..registry import register_sampler
 
 
 class DualVLMExtractor(nn.Module):

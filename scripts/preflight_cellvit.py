@@ -7,7 +7,6 @@ small raw-RGB batch, and estimates cache storage before a full extraction.
 import argparse
 import importlib
 import importlib.metadata
-import os
 from pathlib import Path
 import shutil
 import sys
@@ -25,12 +24,12 @@ PROJECT_DIR = SCRIPT_DIR.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from load_data import RawRGBDataset, get_data_loaders
-from nucleus.cellvit_extractor import (
+from data.loaders import RawRGBDataset, get_data_loaders
+from features.cellvit.extractor import (
     CellViTPatchExtractor,
     SUPPORTED_CELLVIT_VERSION,
 )
-from nucleus.crop_dino import DINOCellCropEncoder, masked_nucleus_crop
+from features.cellvit.crops import DINOCellCropEncoder, masked_nucleus_crop
 
 
 CELLVIT_VERSION = SUPPORTED_CELLVIT_VERSION
@@ -46,7 +45,7 @@ def parse_args():
         "--vit_name", default="facebook/dinov2-base",
         help="Hugging Face model ID or local DINOv2 directory.",
     )
-    parser.add_argument("--cache_dir", default="/kaggle/working/nucleus_features")
+    parser.add_argument("--cache_dir", default="/kaggle/working/cellvit_features")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--input_mpp", type=float, default=None)
     parser.add_argument("--model_mpp", type=float, default=None)
@@ -89,7 +88,7 @@ def _require_runtime() -> None:
 
 
 def _resolve_scale(args, config):
-    extraction = config["nucleus_extraction"]
+    extraction = config["cellvit_extraction"]
     dataset_cfg = extraction.get("datasets", {}).get(args.dataset, {})
     input_mpp = args.input_mpp or dataset_cfg.get("input_mpp")
     model_mpp = args.model_mpp or dataset_cfg.get("model_mpp")
@@ -197,7 +196,7 @@ def main() -> None:
         f"raw sizes={[image.size for image in images]}"
     )
 
-    extraction = config["nucleus_extraction"]
+    extraction = config["cellvit_extraction"]
     cellvit = CellViTPatchExtractor(
         str(checkpoint), device,
         input_mpp=input_mpp,

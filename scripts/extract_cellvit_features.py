@@ -20,11 +20,11 @@ PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
-from identity import sample_order_fingerprint
-from load_data import RawRGBDataset, get_data_loaders, get_sample_ids
-from nucleus.cache import save_nucleus_cache, sha256_file
-from nucleus.cellvit_extractor import CellViTPatchExtractor
-from nucleus.crop_dino import DINOCellCropEncoder, masked_nucleus_crop
+from data.identity import sample_order_fingerprint
+from data.loaders import RawRGBDataset, get_data_loaders, get_sample_ids
+from features.cellvit.cache import save_cellvit_cache, sha256_file
+from features.cellvit.extractor import CellViTPatchExtractor
+from features.cellvit.crops import DINOCellCropEncoder, masked_nucleus_crop
 
 
 class _PersistentBuildDirectory:
@@ -91,7 +91,7 @@ def main() -> None:
         config = yaml.safe_load(f)
     if args.dataset not in config["datasets"]:
         raise ValueError(f"Unknown dataset: {args.dataset}")
-    extraction = config["nucleus_extraction"]
+    extraction = config["cellvit_extraction"]
     dataset_config = extraction.get("datasets", {}).get(args.dataset, {})
 
     checkpoint = (
@@ -100,7 +100,7 @@ def main() -> None:
         or extraction.get("checkpoint")
     )
     cache_root = args.cache_dir or config.get(
-        "nucleus_cache_dir", "nucleus_features"
+        "cellvit_cache_dir", "cellvit_features"
     )
     cache_path = os.path.join(cache_root, f"{args.dataset}_seed{args.seed}")
     manifest_path = os.path.join(cache_path, "manifest.json")
@@ -121,7 +121,7 @@ def main() -> None:
     if checkpoint is None:
         raise ValueError(
             "A CellViT256 checkpoint must be supplied via --checkpoint or the "
-            "dataset-specific nucleus_extraction config."
+            "dataset-specific cellvit_extraction config."
         )
     if input_mpp is None or model_mpp is None or magnification is None:
         raise ValueError(
@@ -326,7 +326,7 @@ def main() -> None:
         ):
             array.flush()
 
-        save_nucleus_cache(
+        save_cellvit_cache(
             cache_path,
             offsets=np.asarray(offsets, dtype=np.int64),
             confidence=confidence_memmap,

@@ -5,8 +5,8 @@ import torch
 import torch.nn.functional as F
 
 from utils.runtime import clear_memory
-from . import register_sampler, get_sampler
-from .uncertainty_herding import _calibrate_temperature
+from ..calibration import calibrate_temperature
+from ..registry import get_sampler, register_sampler
 
 
 def _stage2_coverage_select(
@@ -31,7 +31,7 @@ def _stage2_coverage_select(
     has at least 2 points; the very first cycle (Lt empty) falls back to pure
     coverage (MaxHerding), matching UHerding's own U->1 cold-start behavior.
     """
-    from training.probe import train_linear
+    from training.probe import train_probe
 
     cand_t = torch.as_tensor(candidate_indices, device=device, dtype=torch.long)
     cand_feats = features[cand_t]
@@ -46,11 +46,11 @@ def _stage2_coverage_select(
         del sel_feats, sel_sim, sel_dist
 
         norm_embeddings = features.cpu().numpy()
-        tau = _calibrate_temperature(
+        tau = calibrate_temperature(
             norm_embeddings, oracle_labels, labeled_indices, num_classes,
             probe_epochs, probe_lr, device,
         )
-        probe = train_linear(
+        probe = train_probe(
             norm_embeddings[labeled_indices],
             oracle_labels[labeled_indices],
             num_classes, probe_epochs, probe_lr, device,
@@ -109,7 +109,6 @@ def _stage2_coverage_select(
 
     return [candidate_indices[i] for i in selected_local]
 
-
 @register_sampler("refine")
 def refine_sampling(**kwargs) -> List[int]:
     """REFINE (CVPR 2026): progressive ensemble pool-filtering -> UHerding coverage.
@@ -138,15 +137,27 @@ def refine_sampling(**kwargs) -> List[int]:
     device           = kwargs["device"]
     R                = kwargs.get("filter_rounds", 5)
     alpha            = kwargs.get("filter_alpha", 0.4)
-    J                = kwargs.get("filter_batches", 5)
+    total_batches    = kwargs.get("num_candidate_batches", 100)
     init_subset      = kwargs.get("init_subset_size", 5000)
+    max_pool_size    = kwargs.get("max_pool_size", 10000)
     probe_epochs     = kwargs.get("probe_epochs", 30)
     probe_lr         = kwargs.get("probe_lr", 1e-3)
     chunk_size       = kwargs.get("chunk_size", 2000)
     num_rounds       = kwargs.get("num_rounds", 5)
 
     num_samples = image_embeddings.shape[0]
-    strategies = ["coreset", "typiclust", "margin", "badge"]
+    # Official ensemble (publications/cleaning_the_pool/strategies.py::Refine)
+    # is 9 strategies: random, margin, badge, bait, typiclust, alfamix,
+    # dropquery, max_herding, unc_herding. Five of them exist in this project
+    # and are used here. `bait`, `alfamix` and `max_herding` are not
+    # implemented, and `unc_herding` is deliberately left out of the FILTER
+    # ensemble while remaining the select strategy: it is by far the most
+    # expensive member, and its job in this method is the final pick, not
+    # candidate generation. Everything else follows the official config.
+    strategies = ["random", "margin", "badge", "typiclust", "dropquery"]
+    # `num_batches` upstream is a TOTAL split across strategies, not a
+    # per-strategy count: `num_batches // len(strategies)`.
+    J = max(1, total_batches // len(strategies))
 
     features = torch.tensor(image_embeddings, device=device, dtype=torch.float32)
     features = F.normalize(features, p=2, dim=1)
@@ -177,7 +188,7 @@ def refine_sampling(**kwargs) -> List[int]:
             if r == 0:
                 sample_size = min(init_subset, len(pool_indices))
             else:
-                sample_size = min(max(b + 1, int(alpha * len(pool_indices))), len(pool_indices))
+                sample_size = min(max(b, int(alpha * len(pool_indices))), len(pool_indices))
 
             next_pool: set = set()
             for s_name in strategies:
@@ -205,6 +216,13 @@ def refine_sampling(**kwargs) -> List[int]:
                 next_pool.update(np.random.choice(extras, min(need, len(extras)), replace=False).tolist())
 
             pool_indices = list(next_pool)
+            # Upstream caps the surviving pool at `max_pool_size` after every
+            # round. Without it the pool stays huge on a 90k-image dataset and
+            # every later strategy call scales with it, which is both slower
+            # than the published method and a different filtering schedule.
+            if len(pool_indices) > max_pool_size:
+                keep = np.random.choice(len(pool_indices), max_pool_size, replace=False)
+                pool_indices = [pool_indices[i] for i in keep]
 
         # --- Stage 2: uncertainty-weighted coverage select over the refined pool ---
         cycle_picks = _stage2_coverage_select(
