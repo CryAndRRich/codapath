@@ -25,6 +25,9 @@ from data.loaders import RawRGBDataset, get_data_loaders, get_sample_ids
 from features.cellvit.cache import save_cellvit_cache, sha256_file
 from features.cellvit.extractor import CellViTPatchExtractor
 from features.cellvit.crops import DINOCellCropEncoder, masked_nucleus_crop
+from features.cellvit.segmaps import (
+    InstanceMapWriter, merge_blobs, overlay_boundaries,
+)
 
 
 class _PersistentBuildDirectory:
@@ -45,14 +48,8 @@ class _PersistentBuildDirectory:
 
 
 def _save_qc(path: str, rgb: np.ndarray, instance_map: np.ndarray) -> None:
-    boundary = np.zeros_like(instance_map, dtype=bool)
-    boundary[1:] |= instance_map[1:] != instance_map[:-1]
-    boundary[:, 1:] |= instance_map[:, 1:] != instance_map[:, :-1]
-    boundary &= instance_map > 0
-    overlay = rgb.copy()
-    overlay[boundary] = np.asarray([255, 0, 0], dtype=np.uint8)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    Image.fromarray(overlay).save(path)
+    Image.fromarray(overlay_boundaries(rgb, instance_map)).save(path)
 
 
 def parse_args():
@@ -78,6 +75,14 @@ def parse_args():
     parser.add_argument("--dino_crop_batch_size", type=int, default=None)
     parser.add_argument("--max_cells_per_patch", type=int, default=None)
     parser.add_argument("--qc_count", type=int, default=16)
+    parser.add_argument(
+        "--save_instance_maps", action="store_true",
+        help="Also store CellViT's per-pixel instance map for every patch, "
+             "zlib-compressed. This is the raw segmentation output, kept for "
+             "visualisation; no sampler reads it. Measured ~230-300x compression "
+             "on capped patches (~0.15 GiB per 100k), because a label image is "
+             "mostly background and piecewise constant.",
+    )
     parser.add_argument(
         "--mmap_cache_dir", default=None,
         help="Directory holding the .npz re-exported as memory-mappable .npy "
@@ -252,6 +257,10 @@ def main() -> None:
             "crop_padding": float(extraction.get("crop_padding", 0.25)),
             "min_cell_area": int(extraction.get("min_cell_area", 10)),
             "max_cells_per_patch": max_cells_per_patch,
+            # A resumed build must not mix batches that stored an instance map
+            # with batches that did not: the blob would be missing patches and
+            # its offsets index would silently misalign with the patch order.
+            "save_instance_maps": bool(args.save_instance_maps),
         }
         state_path = os.path.join(build_dir, "state.json")
         if os.path.exists(state_path):
@@ -312,6 +321,20 @@ def main() -> None:
 
             images = [raw_dataset[idx][0] for idx in range(start, stop)]
             patches = cellvit.extract_batch(images)
+            # One blob per batch, beside its npz, so resume and shard assembly
+            # work on exactly the same unit as the features do.
+            if args.save_instance_maps:
+                map_path = os.path.join(build_dir, f"{start:09d}.maps")
+                with InstanceMapWriter(map_path + ".tmp") as writer:
+                    for patch in patches:
+                        writer.append(patch.instance_map)
+                    map_offsets, map_shapes = writer.close()
+                np.save(map_path + ".idx.tmp.npy", np.concatenate(
+                    [map_offsets[:, None],
+                     np.vstack([map_shapes, [[0, 0]]])], axis=1
+                ))
+                os.replace(map_path + ".tmp", map_path)
+                os.replace(map_path + ".idx.tmp.npy", map_path + ".idx.npy")
             crops = []
             batch_cellvit = []
             batch_confidence = []
@@ -471,6 +494,35 @@ def main() -> None:
         ):
             array.flush()
 
+        # Merge the per-batch instance-map blobs in patch order. Done here, in
+        # the same pass that rebuilt `offsets`, so the sidecar's patch order is
+        # the cache's patch order by construction rather than by assumption.
+        if args.save_instance_maps:
+            os.makedirs(cache_path, exist_ok=True)
+            blob_paths = []
+            blob_indexes = []
+            for shard_path in shard_paths:
+                map_path = shard_path[: -len(".npz")] + ".maps"
+                index_path = map_path + ".idx.npy"
+                if not (os.path.exists(map_path) and os.path.exists(index_path)):
+                    raise FileNotFoundError(
+                        f"--save_instance_maps was requested but {map_path} is "
+                        "missing. It was extracted without the flag; restart "
+                        "with --overwrite to rebuild."
+                    )
+                index = np.load(index_path)
+                blob_paths.append(map_path)
+                blob_indexes.append((index[:, 0], index[:-1, 1:3]))
+            merge_blobs(cache_path, blob_paths, blob_indexes, len(sample_ids))
+            sidecar_bytes = os.path.getsize(
+                os.path.join(cache_path, "instance_maps.bin")
+            )
+            print(
+                f"[nucleus] instance maps: {sidecar_bytes / 2**20:.1f} MiB for "
+                f"{len(sample_ids)} patches "
+                f"({sidecar_bytes / max(1, len(sample_ids)):.0f} B/patch)"
+            )
+
         save_cellvit_cache(
             cache_path,
             offsets=np.asarray(offsets, dtype=np.int64),
@@ -492,6 +544,7 @@ def main() -> None:
                 "crop_padding": float(extraction.get("crop_padding", 0.25)),
                 "max_cells_per_patch": max_cells_per_patch,
                 "feature_dtype": "float16",
+                "has_instance_maps": bool(args.save_instance_maps),
             },
         )
     shutil.rmtree(persistent_build_path)

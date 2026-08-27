@@ -55,6 +55,10 @@ def parse_args():
     parser.add_argument("--dino_crop_batch_size", type=int, default=32)
     parser.add_argument("--max_estimated_hours", type=float, default=None)
     parser.add_argument("--max_cells_per_patch", type=int, default=None)
+    parser.add_argument(
+        "--save_instance_maps", action="store_true",
+        help="Include the compressed instance-map sidecar in the size estimate.",
+    )
     parser.add_argument("--device", default="cuda")
     return parser.parse_args()
 
@@ -270,9 +274,35 @@ def main() -> None:
     bytes_per_cell = 2 * (cellvit.embedding_dim + crop_dino.feature_dim) + 20
     estimated_bytes = len(raw_dataset) * mean_cells * bytes_per_cell
     peak_bytes = 3 * estimated_bytes  # resumable shards + assembly memmap + final cache
+
+    # The instance-map sidecar, measured rather than assumed: compress the maps
+    # this smoke batch actually produced. A label image is mostly background and
+    # piecewise constant, so the ratio is large (hundreds of x) but it depends on
+    # nucleus density, which is exactly what varies by dataset.
+    instance_map_bytes = 0
+    if args.save_instance_maps:
+        import zlib
+
+        sampled = [
+            len(zlib.compress(
+                np.ascontiguousarray(patch.instance_map, dtype=np.uint16).tobytes(), 6
+            ))
+            for patch in patches
+        ]
+        per_patch = sum(sampled) / max(1, len(sampled))
+        raw_per_patch = patches[0].instance_map.size * 2 if patches else 0
+        instance_map_bytes = len(raw_dataset) * per_patch
+        ratio = raw_per_patch / per_patch if per_patch else 0
+        print(
+            f"[estimate] instance maps: {per_patch / 1024:.1f} KiB/patch "
+            f"({ratio:.0f}x smaller than raw uint16) -> "
+            f"{instance_map_bytes / 2**30:.2f} GiB total"
+        )
+        # Blobs exist per-batch during the build and once merged afterwards.
+        peak_bytes += 2 * instance_map_bytes
     print(
         f"[estimate] mean_cells={mean_cells:.1f}/patch, "
-        f"cache≈{estimated_bytes / 2**30:.2f} GiB, "
+        f"cache≈{(estimated_bytes + instance_map_bytes) / 2**30:.2f} GiB, "
         f"peak_disk≈{peak_bytes / 2**30:.2f} GiB (rough smoke estimate)"
     )
     seconds_per_patch = cellvit_seconds / count
