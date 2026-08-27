@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from utils.progress import progress, quiet_progress
 from utils.runtime import clear_memory
 from ..calibration import calibrate_temperature
 from ..registry import get_sampler, register_sampler
@@ -169,7 +170,7 @@ def refine_sampling(**kwargs) -> List[int]:
     selected_indices: List[int] = []
     selected_set: set = set()
 
-    for cycle_idx in range(cycles):
+    for cycle_idx in progress(range(cycles), desc="REFINE cycles", total=cycles):
         b = cycle_sizes[cycle_idx]
         if b <= 0:
             continue
@@ -196,17 +197,21 @@ def refine_sampling(**kwargs) -> List[int]:
                     sub_local = np.random.choice(len(pool_indices), sample_size, replace=False)
                     sub_global = [pool_indices[i] for i in sub_local]
 
-                    local_sel = get_sampler(
-                        s_name,
-                        image_embeddings=image_embeddings[sub_global],
-                        oracle_labels=oracle_labels[sub_global],
-                        num_classes=num_classes,
-                        max_budget=min(b, sample_size),
-                        device=device,
-                        chunk_size=chunk_size,
-                        probe_epochs=probe_epochs,
-                        probe_lr=probe_lr,
-                    )
+                    # Each of these inner calls would otherwise draw its own
+                    # progress bar; there are len(strategies) * J of them per
+                    # round, which floods the log.
+                    with quiet_progress():
+                        local_sel = get_sampler(
+                            s_name,
+                            image_embeddings=image_embeddings[sub_global],
+                            oracle_labels=oracle_labels[sub_global],
+                            num_classes=num_classes,
+                            max_budget=min(b, sample_size),
+                            device=device,
+                            chunk_size=chunk_size,
+                            probe_epochs=probe_epochs,
+                            probe_lr=probe_lr,
+                        )
                     for li in local_sel:
                         next_pool.add(sub_global[li])
 

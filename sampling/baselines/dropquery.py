@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from sklearn.cluster import MiniBatchKMeans, KMeans
 
 from utils.runtime import clear_memory
+from utils.progress import progress
 from ..registry import register_sampler
 
 
@@ -63,7 +64,7 @@ def dropquery_sampling(**kwargs) -> List[int]:
     selected_indices: List[int] = []
     selected_set: set = set()
 
-    for round_idx in range(rounds):
+    for round_idx in progress(range(rounds), desc="DropQuery rounds", total=rounds):
         n_select = round_sizes[round_idx]
         if n_select <= 0:
             continue

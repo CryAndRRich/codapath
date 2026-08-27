@@ -22,6 +22,7 @@ from typing import List, Optional, Sequence
 import numpy as np
 import torch
 
+from utils.progress import progress
 from utils.runtime import clear_memory
 
 
@@ -194,17 +195,26 @@ def greedy_weighted_coverage(
     n_select: int,
     selected_set: set,
     chunk_size: int,
+    trace=None,
+    desc: str = "coverage",
 ) -> List[int]:
     """Greedily pick `n_select` points maximising the weighted marginal gain.
 
     `coverage` is updated in place after every pick, exactly as in Uncertainty
     Herding's Algorithm 1. For fixed non-negative `weights` the objective is
     monotone submodular, so the greedy solution keeps the (1 - 1/e) guarantee.
+
+    `trace` is an optional `utils.trace.SelectionTrace`. The winning gain and
+    the runner-up distance are already computed here and would otherwise be
+    discarded, and they are the only direct evidence that the objective could
+    tell candidates apart — a constant gain vector means the pick was arbitrary.
+    Recording them does not affect selection.
     """
     num_samples = features.shape[0]
     picks: List[int] = []
-    for _ in range(n_select):
+    for _ in progress(range(n_select), desc=desc, total=n_select, log_every=25):
         best_index, best_score = -1, -float("inf")
+        runner_up = -float("inf")
         for start in range(0, num_samples, chunk_size):
             end = min(start + chunk_size, num_samples)
             candidates = features[start:end]
@@ -221,9 +231,15 @@ def greedy_weighted_coverage(
                 if start <= taken < end:
                     gains[taken - start] = -float("inf")
             local_best = int(torch.argmax(gains).item())
-            if gains[local_best].item() > best_score:
-                best_score = gains[local_best].item()
+            local_score = gains[local_best].item()
+            if local_score > best_score:
+                # The old best becomes the runner-up only if it beats the best
+                # non-winner already seen in this chunk.
+                runner_up = max(runner_up, best_score)
+                best_score = local_score
                 best_index = start + local_best
+            else:
+                runner_up = max(runner_up, local_score)
             del candidates, gains
             clear_memory()
 
@@ -231,6 +247,14 @@ def greedy_weighted_coverage(
             break
         picks.append(best_index)
         selected_set.add(best_index)
+        if trace is not None:
+            trace.add_step(
+                best_index,
+                score=best_score,
+                margin_to_runner_up=(
+                    None if runner_up == -float("inf") else best_score - runner_up
+                ),
+            )
         column = kernel_column(features, features[best_index].unsqueeze(0), sigma, chunk_size)
         coverage.copy_(torch.maximum(coverage, column))
         del column

@@ -10,6 +10,7 @@ from typing import List
 
 import numpy as np
 
+from utils.progress import Stopwatch
 from ..registry import register_sampler
 
 
@@ -45,6 +46,7 @@ def margin_sampling(**kwargs) -> List[int]:
 
     selected_indices: List[int] = []
     unlabeled_indices = list(range(num_samples))
+    watch = Stopwatch(max_budget, "Margin")
 
     while len(selected_indices) < max_budget:
         current_need = min(step_budget, max_budget - len(selected_indices))
@@ -68,6 +70,8 @@ def margin_sampling(**kwargs) -> List[int]:
         selected_indices.extend(chosen)
         chosen_set = set(chosen)
         unlabeled_indices = [i for i in unlabeled_indices if i not in chosen_set]
+        watch.advance(len(chosen))
+        watch.report()
 
     return selected_indices
 
@@ -89,6 +93,7 @@ def entropy_sampling(**kwargs) -> List[int]:
 
     selected_indices: List[int] = []
     unlabeled_indices = list(range(num_samples))
+    watch = Stopwatch(max_budget, "Entropy")
 
     while len(selected_indices) < max_budget:
         current_need = min(step_budget, max_budget - len(selected_indices))
@@ -111,5 +116,7 @@ def entropy_sampling(**kwargs) -> List[int]:
         selected_indices.extend(chosen)
         chosen_set = set(chosen)
         unlabeled_indices = [i for i in unlabeled_indices if i not in chosen_set]
+        watch.advance(len(chosen))
+        watch.report()
 
     return selected_indices

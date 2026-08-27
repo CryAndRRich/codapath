@@ -58,11 +58,42 @@ def test_producing_notebooks_zip_their_output(name):
 def test_nucleus_notebook_runs_preflight_before_full_extraction():
     source = _all_source(NOTEBOOK_DIR / "extract_nucleus_features.ipynb")
     preflight = source.index("preflight_cellvit.py")
-    extraction = source.index("extract_cellvit_features.py")
+    # Extraction is dispatched through the shard worker, which invokes
+    # scripts/extract_cellvit_features.py in a child process. The gate is
+    # unchanged: nothing may launch a full extraction above the preflight cell.
+    extraction = source.index("run_cellvit_shard(")
     assert preflight < extraction
     for flag in ("--input_mpp", "--model_mpp", "--magnification", "--max_estimated_hours"):
         assert flag in source
     assert "requirements-cellvit.txt" in source
+
+
+@pytest.mark.parametrize(
+    "name", ["extract_visual_features.ipynb", "extract_nucleus_features.ipynb"]
+)
+def test_extraction_notebooks_use_every_gpu(name):
+    """Half of a T4 x2 session sitting idle is the largest waste available in
+    this project, and extraction is the longest stage. Both notebooks shard the
+    work across the visible GPUs rather than assuming one card."""
+    source = _all_source(NOTEBOOK_DIR / name)
+    assert "visible_gpu_count()" in source
+    assert "run_variants_parallel(" in source
+    # A shard worker must not be handed a device: it pins its own card and
+    # passes 'cuda:0' itself, which run_variants_parallel enforces.
+    assert "num_workers=SHARDS" in source
+
+
+@pytest.mark.parametrize(
+    "name", ["extract_visual_features.ipynb", "extract_nucleus_features.ipynb"]
+)
+def test_extraction_notebooks_verify_the_cache_before_archiving_it(name):
+    """A cache whose rows are misaligned with its split loads without error and
+    silently corrupts every downstream experiment. Catch that before the archive
+    is published and attached to a run notebook, not after."""
+    source = _all_source(NOTEBOOK_DIR / name)
+    checks = [source.index(m) for m in ("# Verify", "make_archive") if m in source]
+    assert len(checks) == 2, f"{name} must both verify and archive"
+    assert checks[0] < checks[1], f"{name} archives before verifying"
 
 
 def test_run_notebook_matches_the_controlled_budget_protocol():
@@ -70,7 +101,10 @@ def test_run_notebook_matches_the_controlled_budget_protocol():
     assert config["cumulative_budget"] == [25, 50, 75, 100, 125, 150, 175, 200]
     source = _all_source(NOTEBOOK_DIR / "run_al_sampler.ipynb")
     assert 'SAMPLER = "scalpel"' in source
-    assert "main.run(" in source
+    # Work is dispatched through the GPU-worker entry point, which resolves its
+    # own device: `main.run` takes a torch.device the parent cannot pin.
+    assert "run_variants_parallel(" in source
+    assert "main.run_on_worker" in source
     # The CellViT cache must be located for exactly the samplers that declare it,
     # or CELLVIT_DIR stays an unresolved placeholder and the failure surfaces deep
     # inside the first variant instead of here.

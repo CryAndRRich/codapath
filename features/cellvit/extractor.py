@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torchvision.transforms import functional as TF
 
-from .postprocessing import stack_prediction_maps_numpy
+from .postprocess import stack_prediction_maps_numpy
 
 
 SUPPORTED_CELLVIT_VERSION = "1.0.9"

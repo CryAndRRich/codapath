@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from utils.progress import Stopwatch
 from ..registry import register_sampler
 
 
@@ -41,6 +42,7 @@ def badge_sampling(**kwargs) -> List[int]:
 
     selected_indices: List[int] = []
     unlabeled_indices = list(range(num_samples))
+    watch = Stopwatch(max_budget, "BADGE")
 
     while len(selected_indices) < max_budget:
         current_need = min(step_budget, max_budget - len(selected_indices))
@@ -104,5 +106,7 @@ def badge_sampling(**kwargs) -> List[int]:
         selected_indices.extend(chosen)
         chosen_set = set(chosen)
         unlabeled_indices = [i for i in unlabeled_indices if i not in chosen_set]
+        watch.advance(len(chosen))
+        watch.report()
 
     return selected_indices

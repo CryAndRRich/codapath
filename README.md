@@ -259,10 +259,41 @@ one file.
 
 Publishing `/kaggle/working/<name>` as a Kaggle Dataset remounts it one level
 deeper (`.../<name>/<name>`), so the notebooks *search* for their caches instead
-of trusting a hard-coded path, and print what they found.
+of trusting a hard-coded path, and print what they found. Each notebook also
+writes a `dataset-metadata.json` next to its archive with a slug derived from
+the dataset and seed, so publishing needs no hand-typed paths.
 
 Seeds matter: ImageFolder datasets are split by a seeded generator, so a feature
 cache is only valid for the seed it was built with.
+
+### Two GPUs
+
+`run_al_sampler.ipynb` splits its variants across both cards of a Kaggle
+**T4 x2** session, one worker process per GPU (`utils/parallel.py`). Set
+`PARALLEL = False` for serial.
+
+Processes, not threads: each run calls `set_seed`, which mutates global RNG
+state and an environment variable, so two threads doing it in one interpreter
+would interleave and destroy reproducibility. Each worker pins one card via
+`CUDA_VISIBLE_DEVICES` before torch initialises, and therefore always uses
+`cuda:0` internally — which is why jobs pass `device_string` to
+`main.run_on_worker` rather than a `torch.device`.
+
+Work is dealt out round-robin up front and a worker that finishes early does
+not steal from a slower one, so order the variants to alternate expensive and
+cheap ones if the imbalance matters. A crashing variant is reported with its
+traceback and does not take the others down. Feature-cache writes go through a
+temporary file and an atomic rename, because two workers can miss the cache and
+extract simultaneously.
+
+### Progress and ETA
+
+Long loops report elapsed time, time remaining and an absolute finish time —
+the number that actually answers "will this fit in the session". `tqdm` drives
+the console; a periodic plain line carries the same information into the log,
+where carriage-return bars are useless. Reports are rate-limited and suppressed
+inside nested sampler calls (`utils.progress.quiet_progress`), since `refine`
+invokes other samplers thousands of times per budget.
 
 ---
 
@@ -272,15 +303,53 @@ Per budget, under `checkpoints/<dataset>/`:
 
 | File | Contents |
 |---|---|
-| `<run>_selected_budget_<B>.pt` | selected indices, their labels, sampler config, dataset fingerprint |
-| `<run>_probe_budget_<B>.pt` | the probe's linear weights |
-| `<run>_results.pt` | accuracy / precision / recall / macro-F1 for every budget |
+| `<run>_selected_budget_<B>.pt` | selected indices, sample ids, labels, per-class counts, sampler config, per-step trace, sanity report, timings, fingerprints |
+| `<run>_probe_budget_<B>.pt` | the probe's linear weights, plus run/budget/seed metadata |
+| `<run>_predictions_budget_<B>.pt` | test-set class probabilities and true labels |
+| `<run>_results.pt` | accuracy / precision / recall / macro-F1 and timings for every budget |
 | `<run>_palm.pt` | fitted PALM parameters |
 | `<run>.log` | everything printed during the run |
 
 `<run>` defaults to the sampler name, extended for `scalpel` with the config
 axes that would otherwise overwrite each other
-(`scalpel_disagreement`, `scalpel_visual_margin`, …).
+(`scalpel_disagreement`, `scalpel_visual_margin`, …), and suffixed `_s<seed>`
+for any seed other than the config default.
+
+Everything a later plot needs is written **during** the run, because none of it
+survives otherwise: the per-step acquisition score exists only inside the greedy
+loop, and rebuilding the test predictions costs a full backbone pass.
+
+### The per-step trace
+
+`trace` in the selection file records, for each pick, its `round_index`, `rank`,
+winning `score` and `margin_to_runner_up`; and for each round, the `sigma` in
+force, a distribution summary of the weight and score vectors, and the round's
+wall-clock. Two uses:
+
+* **Visualisation** — selection order, per-round acquisition distributions, how
+  `sigma` contracts as labels accumulate.
+* **Auditing** — see below.
+
+### The sanity report
+
+Every budget is checked and the result printed and stored under `sanity`. This
+exists because the failures that matter here all return the right number of
+distinct in-range indices, so neither a smoke test nor a plausible accuracy
+reveals them. `evaluation/sanity.py` flags:
+
+| Finding | What it means |
+|---|---|
+| `index_ordered` | picks are ≥0.9 concordant with plain increasing index order — the signature of `argmax` over a constant score |
+| `constant_step_score` / `constant_weight` | the objective could not tell candidates apart |
+| `sigma_zero` | the kernel has collapsed into a duplicate indicator |
+| `nonmonotone_gain` | coverage gains rose *within* a round, so the running max may not be updating |
+| `single_class` / `classes_missing` | the selection cannot train a probe, or is missing classes |
+| `duplicates` / `out_of_range` | the sampler returned an invalid index set |
+
+A round may declare its weights uniform *by design* (`weight_uniform_by_design`),
+which is how round 1 of a coverage method legitimately runs plain MaxHerding
+without being flagged. Nothing raises: an alarm at budget 200 must not throw
+away the hours already spent, so findings are reported, not enforced.
 
 Accuracy at a handful of budgets is a noisy ranking: a method can win at one
 budget and lose at the next. PALM fits the whole learning curve and reports

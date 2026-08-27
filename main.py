@@ -9,15 +9,23 @@ can only come from which samples were selected. How a sampler is swept over the
 budget list is decided by `sampling.specs.SAMPLER_SPECS`, not by anything here.
 
 For each budget the run writes, under `<save_dir>`:
-    <run>_selected_budget_<B>.pt   selected indices and their labels
-    <run>_probe_budget_<B>.pt      the probe's linear weights
-    <run>_results.pt               metrics for every budget
-    <run>_palm.pt                  fitted PALM curve parameters
-    <run>.log                      everything printed during the run
+    <run>_selected_budget_<B>.pt      indices, sample ids, labels, per-step
+                                      trace (round/rank/score) and sanity report
+    <run>_probe_budget_<B>.pt         the probe's linear weights plus metadata
+    <run>_predictions_budget_<B>.pt   test-set probabilities and labels
+    <run>_results.pt                  metrics and timings for every budget
+    <run>_palm.pt                     fitted PALM curve parameters
+    <run>.log                         everything printed during the run
+
+Everything a later plot might need is written during the run, because none of
+it can be recovered afterwards: the per-step acquisition score exists only
+inside the greedy loop, and the test predictions would cost a full backbone
+pass to rebuild.
 """
 
 import argparse
 import os
+import time
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -28,12 +36,19 @@ from data.identity import sample_order_fingerprint
 from data.loaders import get_data_loaders, get_sample_ids
 from evaluation.metrics import evaluate_probe
 from evaluation.palm import format_palm_report, palm_evaluate
+from evaluation.sanity import (
+    SEVERITY_ORDER,
+    check_selection,
+    format_report as format_sanity_report,
+)
 from features.visual import get_or_extract_features
 from sampling import get_sampler
 from sampling.specs import spec_for
 from training.checkpoint import save_probe
 from training.probe import train_probe
 from utils import clear_memory, set_seed, tee_stdout
+from utils.progress import Stopwatch, format_duration
+from utils.trace import SelectionTrace
 
 MIN_PALM_POINTS = 4
 
@@ -50,6 +65,27 @@ def _safe_run_name(name: str) -> str:
     if any(character not in allowed for character in name):
         raise ValueError("run_name may contain only letters, numbers, '_' and '-'")
     return name
+
+
+def _prefix_trace(master: Optional[SelectionTrace], budget: int):
+    """The part of a shared prefix-exact run that produced this budget.
+
+    A prefix-exact sampler runs once at the maximum budget; the first `budget`
+    steps are exactly what a direct run at `budget` would have done, so they are
+    this budget's trace. Rounds are kept whole — they describe the state the
+    picks were made under, and a round is either entered or it is not.
+    """
+    if master is None:
+        return None
+    payload = master.to_payload()
+    steps = [step for step in payload["steps"] if step["rank"] < budget]
+    rounds_used = {step["round_index"] for step in steps}
+    clipped = SelectionTrace(master.sampler, budget, master.pool_size)
+    clipped.steps = [step for step in master.steps if step.rank < budget]
+    clipped.rounds = [
+        record for record in master.rounds if record.round_index in rounds_used
+    ]
+    return clipped
 
 
 def _default_run_name(sampler_name: str, sampler_cfg: Dict) -> str:
@@ -137,6 +173,7 @@ def run(
     spec = spec_for(sampler_name)
     output_name = _safe_run_name(run_name or _default_run_name(sampler_name, sampler_cfg))
 
+    run_started = time.time()
     with tee_stdout(os.path.join(save_dir, f"{output_name}.log")):
         print(f"Device: {device}")
         set_seed(random_seed)
@@ -193,40 +230,92 @@ def run(
         # gets its own run, so a clamped threshold can never be reported as if
         # it were a prefix.
         master_selected: Optional[List[int]] = None
+        master_trace: Optional[SelectionTrace] = None
         if spec.prefix_exact:
+            print(f"\n{'=' * 68}\nShared run at max budget {max(cumulative_budget)}")
+            master_trace = SelectionTrace(
+                sampler_name, max(cumulative_budget), len(selection_features)
+            )
             master_selected = get_sampler(
                 name=sampler_name,
                 image_embeddings=selection_features,
                 max_budget=max(cumulative_budget),
+                trace=master_trace,
                 **common,
             )
 
         accuracy_by_budget: Dict[int, float] = {}
         results: Dict[int, Dict[str, float]] = {}
+        sweep_watch = Stopwatch(len(cumulative_budget), f"{output_name} budgets")
 
         for budget in cumulative_budget:
             set_seed(random_seed)
+            budget_started = time.time()
+            trace: Optional[SelectionTrace] = None
             if master_selected is not None and spec.is_prefix_exact(budget, num_classes):
                 selected_indices = master_selected[:budget]
+                # The shared run's steps beyond this budget did not influence
+                # this prefix, so only the first `budget` of them are its trace.
+                trace = _prefix_trace(master_trace, budget)
             else:
+                trace = SelectionTrace(sampler_name, budget, len(selection_features))
                 selected_indices = get_sampler(
                     name=sampler_name,
                     image_embeddings=selection_features,
                     max_budget=budget,
+                    trace=trace,
                     **common,
                 )
 
             labeled_features = train_features[selected_indices]
             labeled_labels = train_labels[selected_indices]
+            selection_seconds = time.time() - budget_started
+
+            # Samplers that do not use the shared coverage greedy record no
+            # steps of their own. Backfill the pick ORDER for them, so the
+            # selection sequence — which every sampler has, and which the
+            # order-degeneracy check reads — is present for all of them. The
+            # per-step score stays absent because it genuinely does not exist.
+            if trace is not None and not trace.steps:
+                for index in selected_indices:
+                    trace.add_step(int(index))
+            trace_payload = None if trace is None else trace.to_payload()
+            sanity = check_selection(
+                selected_indices, len(selection_features),
+                labels=train_labels, num_classes=num_classes, trace=trace_payload,
+            )
+            print(format_sanity_report(sanity, output_name, budget))
 
             _save(
                 os.path.join(save_dir, f"{output_name}_selected_budget_{budget}.pt"),
                 {
                     "selected_indices": list(selected_indices),
                     "selected_labels": labeled_labels.tolist(),
+                    "selected_sample_ids": [train_sample_ids[i] for i in selected_indices],
                     "sampler": sampler_name,
                     "run_name": output_name,
                     "sampler_config": sampler_cfg,
+                    "budget": budget,
+                    "seed": random_seed,
+                    "dataset": dataset_key,
+                    "num_classes": num_classes,
+                    "pool_size": len(selection_features),
+                    "class_names": list(class_names),
+                    "label_counts": np.bincount(
+                        labeled_labels.astype(np.int64), minlength=num_classes
+                    ).tolist(),
+                    "selection_seconds": selection_seconds,
+                    "trace": trace_payload,
+                    "sanity": sanity,
+                    "spec": {
+                        "passes": spec.passes,
+                        "prefix_exact": spec.prefix_exact,
+                        "prefix_used": bool(
+                            master_selected is not None
+                            and spec.is_prefix_exact(budget, num_classes)
+                        ),
+                    },
+                    "visual_backbone": visual_backbone,
                     "train_fingerprint": train_fingerprint,
                     "cellvit_manifest": cellvit_manifest,
                 },
@@ -242,13 +331,41 @@ def run(
             )
             accuracy_by_budget[budget] = accuracy
             results[budget] = {
-                "acc": accuracy, "precision": precision, "recall": recall, "f1": f1
+                "acc": accuracy, "precision": precision, "recall": recall, "f1": f1,
+                "selection_seconds": selection_seconds,
+                "sanity_severity": sanity["severity"],
             }
             save_probe(
-                probe, os.path.join(save_dir, f"{output_name}_probe_budget_{budget}.pt")
+                probe,
+                os.path.join(save_dir, f"{output_name}_probe_budget_{budget}.pt"),
+                metadata={
+                    "run_name": output_name,
+                    "sampler": sampler_name,
+                    "budget": budget,
+                    "seed": random_seed,
+                    "dataset": dataset_key,
+                    "class_names": list(class_names),
+                    "metrics": results[budget],
+                },
+            )
+            # Test-set predictions are what a confusion matrix or a per-class
+            # error plot needs, and re-deriving them means re-running the
+            # backbone over the whole test set.
+            _save(
+                os.path.join(save_dir, f"{output_name}_predictions_budget_{budget}.pt"),
+                {
+                    "run_name": output_name,
+                    "budget": budget,
+                    "probabilities": probe.predict_proba(test_features, device),
+                    "test_labels": np.asarray(test_labels),
+                    "class_names": list(class_names),
+                    "test_fingerprint": test_fingerprint,
+                },
             )
             del probe
             clear_memory()
+            sweep_watch.advance()
+            print(f"[sweep] {sweep_watch.line()}")
 
         _save(
             os.path.join(save_dir, f"{output_name}_results.pt"),
@@ -258,12 +375,44 @@ def run(
                 "sampler_config": sampler_cfg,
                 "budgets": cumulative_budget,
                 "linear": results,
+                "seed": random_seed,
+                "dataset": dataset_key,
+                "num_classes": num_classes,
+                "class_names": list(class_names),
+                "visual_backbone": visual_backbone,
+                "probe_epochs": probe_epochs,
+                "probe_lr": probe_lr,
+                "spec": {"passes": spec.passes, "prefix_exact": spec.prefix_exact},
+                "total_seconds": time.time() - run_started,
                 "train_fingerprint": train_fingerprint,
                 "test_fingerprint": test_fingerprint,
                 "cellvit_manifest": cellvit_manifest,
             },
         )
         _fit_palm(accuracy_by_budget, save_dir, output_name, dataset_key, verbose)
+
+        worst = max(
+            (results[budget]["sanity_severity"] for budget in results),
+            key=lambda level: SEVERITY_ORDER.index(level),
+            default="ok",
+        )
+        print(
+            f"\n{'=' * 68}\n{output_name}: {len(results)} budgets in "
+            f"{format_duration(time.time() - run_started)} | worst sanity: "
+            f"{worst.upper()}\n{'=' * 68}"
+        )
+
+
+def run_on_worker(**kwargs) -> None:
+    """`run` with the device resolved inside the process that will use it.
+
+    `utils.parallel` pins one GPU per worker through `CUDA_VISIBLE_DEVICES`
+    before torch initialises, so inside a worker the pinned card is always
+    `cuda:0`. A `torch.device` built in the parent would also not survive
+    pickling meaningfully, hence the string here.
+    """
+    device_string = kwargs.pop("device_string", "cuda:0")
+    run(device=torch.device(device_string), **kwargs)
 
 
 def _dataset_labels(dataset) -> np.ndarray:

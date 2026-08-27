@@ -30,6 +30,7 @@ from typing import List
 import numpy as np
 import torch
 
+from utils.progress import format_duration
 from utils.runtime import clear_memory
 from ..kernels import (
     greedy_weighted_coverage,
@@ -96,12 +97,15 @@ def scalpel_sampling(**kwargs) -> List[int]:
 
     selected: List[int] = []
     selected_set: set = set()
+    trace = kwargs.get("trace")
 
     for round_index in range(rounds):
         n_select = round_sizes[round_index]
         if n_select <= 0:
             continue
         started = time.time()
+        if trace is not None:
+            trace.start_round(round_index)
 
         if round_index == 0:
             weights_np = None
@@ -131,15 +135,36 @@ def scalpel_sampling(**kwargs) -> List[int]:
         # different bandwidth and cannot be carried forward.
         coverage = running_max_coverage(coverage_features, selected, sigma, chunk_size)
         picks = greedy_weighted_coverage(
-            coverage_features, weights, coverage, sigma, n_select, selected_set, chunk_size
+            coverage_features, weights, coverage, sigma, n_select, selected_set, chunk_size,
+            trace=trace, desc=f"scalpel b={budget} r={round_index}",
         )
         selected.extend(picks)
+        elapsed = time.time() - started
+
+        if trace is not None:
+            trace.add_round(
+                num_selected=len(picks),
+                seconds=elapsed,
+                sigma=sigma,
+                weights=weights.detach().cpu().numpy(),
+                uncertainty_mode=uncertainty_mode,
+                missing_fraction=missing_fraction,
+                # Round 1 has no labels, so U=1 and the objective is exactly
+                # MaxHerding. Flag it so a checker does not read the constant
+                # weight vector as a degenerate one.
+                weight_uniform_by_design=(weights_np is None),
+                **{
+                    key: float(value)
+                    for key, value in diagnostics.items()
+                    if isinstance(value, (int, float))
+                },
+            )
 
         if diag:
             disagreement = diagnostics["mean_disagreement"]
             print(
                 f"[scalpel b={budget} r={round_index}] picked={len(picks)} "
-                f"in {time.time() - started:.1f}s | mode={uncertainty_mode} "
+                f"in {format_duration(elapsed)} | mode={uncertainty_mode} "
                 f"sigma={sigma:.4f} missing={missing_fraction:.3f} "
                 f"tau={diagnostics['tau_visual']:.1f}/{diagnostics['tau_cell']:.1f} "
                 f"js={'n/a' if np.isnan(disagreement) else f'{disagreement:.4f}'}"

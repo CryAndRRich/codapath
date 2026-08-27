@@ -79,6 +79,20 @@ def parse_args():
     parser.add_argument("--max_cells_per_patch", type=int, default=None)
     parser.add_argument("--qc_count", type=int, default=16)
     parser.add_argument(
+        "--shard_index", type=int, default=None,
+        help="Extract only this shard of the patch range, then stop before "
+             "assembly. One process per GPU on a Kaggle T4 x2 session.",
+    )
+    parser.add_argument(
+        "--shard_count", type=int, default=1,
+        help="Total number of shards the patch range is split into.",
+    )
+    parser.add_argument(
+        "--assemble_only", action="store_true",
+        help="Skip extraction and merge existing shards into the final cache. "
+             "Run once, after every --shard_index process has finished.",
+    )
+    parser.add_argument(
         "--overwrite", action="store_true",
         help="Allow replacing an existing cache for this dataset/seed.",
     )
@@ -131,6 +145,23 @@ def main() -> None:
         raise ValueError("qc_count must be non-negative")
     if args.max_cells_per_patch is not None and args.max_cells_per_patch < 1:
         raise ValueError("max_cells_per_patch must be positive")
+    if args.shard_count < 1:
+        raise ValueError("shard_count must be positive")
+    if args.shard_index is not None and not 0 <= args.shard_index < args.shard_count:
+        raise ValueError(
+            f"shard_index {args.shard_index} outside [0, {args.shard_count})"
+        )
+    if args.assemble_only and args.shard_index is not None:
+        raise ValueError("--assemble_only and --shard_index are mutually exclusive")
+    if args.assemble_only and args.overwrite:
+        # --overwrite empties the .build directory on entry, which is exactly the
+        # shard output --assemble_only exists to merge. Together they would
+        # delete hours of GPU work and then fail on the first missing batch.
+        raise ValueError(
+            "--assemble_only with --overwrite would delete the shards being "
+            "assembled. Drop --overwrite, or delete the cache directory by hand "
+            "to restart extraction from scratch."
+        )
     device = torch.device(args.device or config.get("device", "cuda"))
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but no Kaggle GPU is attached")
@@ -154,27 +185,34 @@ def main() -> None:
         if args.max_cells_per_patch is not None
         else extraction.get("max_cells_per_patch")
     )
-    cellvit = CellViTPatchExtractor(
-        checkpoint, device,
-        input_mpp=input_mpp,
-        model_mpp=model_mpp,
-        magnification=magnification,
-        min_cell_area=extraction.get("min_cell_area", 10),
-        max_cells_per_patch=max_cells_per_patch,
-    )
     vit_name = args.vit_name or config.get("models", {}).get(
         "vit", "facebook/dinov2-base"
     )
-    crop_dino = DINOCellCropEncoder(
-        vit_name,
-        device,
-        batch_size=(
-            args.dino_crop_batch_size
-            or extraction.get("dino_crop_batch_size", 32)
-        ),
-    )
+    # Assembly only concatenates existing batch files, so it must not load two
+    # networks onto the GPU: that is minutes of download and VRAM for nothing,
+    # and it would make the merge pass need a GPU it does not use. The feature
+    # dimensions it needs for the output memmaps are read off the batch files.
+    if args.assemble_only:
+        cellvit = None
+        crop_dino = None
+    else:
+        cellvit = CellViTPatchExtractor(
+            checkpoint, device,
+            input_mpp=input_mpp,
+            model_mpp=model_mpp,
+            magnification=magnification,
+            min_cell_area=extraction.get("min_cell_area", 10),
+            max_cells_per_patch=max_cells_per_patch,
+        )
+        crop_dino = DINOCellCropEncoder(
+            vit_name,
+            device,
+            batch_size=(
+                args.dino_crop_batch_size
+                or extraction.get("dino_crop_batch_size", 32)
+            ),
+        )
 
-    offsets = [0]
     batch_size = int(args.batch_size or extraction.get("batch_size", 2))
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
@@ -220,22 +258,47 @@ def main() -> None:
             with open(state_path, "w", encoding="utf-8") as f:
                 json.dump(build_state, f, indent=2, sort_keys=True)
 
+        # Every batch start offset, in the exact order a serial run visits them.
+        # Sharding assigns whole batches, never splitting one, so each batch has
+        # the same members as in a serial run: CellViT pads a batch to the
+        # largest image in it, so a batch with different members is a different
+        # forward pass on a variable-size dataset.
+        all_starts = list(range(0, len(raw_dataset), batch_size))
+        if args.assemble_only:
+            my_starts = []
+            print("[nucleus] --assemble_only: merging existing batch files")
+        elif args.shard_index is None:
+            my_starts = all_starts
+        else:
+            # Contiguous blocks of batches. Either split covers the same
+            # batches in total; contiguity is chosen because it makes each
+            # worker's progress log a single advancing range, and because a
+            # resumed run with the same shard_count reuses exactly the npz
+            # files that worker already wrote.
+            per_shard, remainder = divmod(len(all_starts), args.shard_count)
+            first = args.shard_index * per_shard + min(args.shard_index, remainder)
+            count = per_shard + (1 if args.shard_index < remainder else 0)
+            my_starts = all_starts[first:first + count]
+            print(
+                f"[nucleus] shard {args.shard_index}/{args.shard_count}: "
+                f"{len(my_starts)} of {len(all_starts)} batches, patches "
+                f"[{my_starts[0] if my_starts else 0}:"
+                f"{min(my_starts[-1] + batch_size, len(raw_dataset)) if my_starts else 0})"
+            )
+
+        # `offsets` is a running prefix sum over the WHOLE dataset, so it can
+        # only be built by a process that sees every batch. A shard worker
+        # writes its own npz files and leaves the offsets to the assembly pass.
         shard_paths = []
-        for start in range(0, len(raw_dataset), batch_size):
+        for start in my_starts:
             stop = min(start + batch_size, len(raw_dataset))
             shard_path = os.path.join(build_dir, f"{start:09d}.npz")
             if os.path.exists(shard_path):
                 with np.load(shard_path, allow_pickle=False) as shard:
-                    counts = shard["counts"].astype(np.int64).tolist()
-                    if len(counts) != stop - start:
+                    if len(shard["counts"]) != stop - start:
                         raise RuntimeError(f"Invalid resumed shard: {shard_path}")
-                    for count in counts:
-                        offsets.append(offsets[-1] + int(count))
                 shard_paths.append(shard_path)
-                print(
-                    f"[nucleus] resumed {stop}/{len(raw_dataset)} patches | "
-                    f"cells={offsets[-1]}"
-                )
+                print(f"[nucleus] resumed {stop}/{len(raw_dataset)} patches")
                 continue
 
             images = [raw_dataset[idx][0] for idx in range(start, stop)]
@@ -258,7 +321,6 @@ def main() -> None:
                 batch_cellvit.append(patch.embeddings)
                 batch_confidence.append(patch.confidence)
                 batch_bboxes.append(patch.bboxes)
-                offsets.append(offsets[-1] + len(patch.instance_ids))
 
             encoded_crops = crop_dino.encode(crops)
             batch_cells = sum(len(patch.instance_ids) for patch in patches)
@@ -284,17 +346,91 @@ def main() -> None:
             shard_paths.append(shard_path)
             print(
                 f"[nucleus] {stop}/{len(raw_dataset)} patches | "
-                f"cells={offsets[-1]}"
+                f"cells={int(np.sum([len(p.instance_ids) for p in patches]))} in batch"
             )
 
+        if args.shard_index is not None:
+            print(
+                f"[nucleus] shard {args.shard_index}/{args.shard_count} wrote "
+                f"{len(shard_paths)} batch files to {build_dir}. Run this script "
+                "again with --assemble_only once every shard has finished."
+            )
+            return
+
+        # Assembly. Rebuild `offsets` by reading every batch file in patch order
+        # rather than accumulating during extraction: with several processes
+        # sharding the range, no single process saw every batch, and a resumed
+        # run sees only the batches it recomputed. The files on disk are the one
+        # complete record.
+        expected_starts = list(range(0, len(raw_dataset), batch_size))
+        offsets = [0]
+        ordered_shard_paths = []
+        for start in expected_starts:
+            stop = min(start + batch_size, len(raw_dataset))
+            shard_path = os.path.join(build_dir, f"{start:09d}.npz")
+            if not os.path.exists(shard_path):
+                raise FileNotFoundError(
+                    f"Missing batch file for patches [{start}:{stop}) at "
+                    f"{shard_path}. Assembly needs every batch; re-run the "
+                    "shard workers to fill the gap before assembling."
+                )
+            with np.load(shard_path, allow_pickle=False) as shard:
+                counts = shard["counts"].astype(np.int64).tolist()
+            if len(counts) != stop - start:
+                raise RuntimeError(
+                    f"Batch file {shard_path} covers {len(counts)} patches, "
+                    f"expected {stop - start}. It was written with a different "
+                    "batch_size; restart with --overwrite."
+                )
+            for count in counts:
+                offsets.append(offsets[-1] + int(count))
+            ordered_shard_paths.append(shard_path)
+        if len(offsets) != len(raw_dataset) + 1:
+            raise RuntimeError(
+                f"Rebuilt offsets cover {len(offsets) - 1} patches, expected "
+                f"{len(raw_dataset)}"
+            )
+        shard_paths = ordered_shard_paths
+        print(
+            f"[nucleus] assembling {len(shard_paths)} batch files | "
+            f"patches={len(raw_dataset)} cells={offsets[-1]}"
+        )
+
         total_cells = offsets[-1]
+        # Read the feature widths off the first batch file that holds any cell.
+        # Under --assemble_only the models are not loaded, so their `.dim`
+        # attributes are unavailable; when they ARE loaded this is the same
+        # number, cross-checked below.
+        cellvit_dim = None
+        crop_dino_dim = None
+        for shard_path in shard_paths:
+            with np.load(shard_path, allow_pickle=False) as shard:
+                if len(shard["confidence"]):
+                    cellvit_dim = int(shard["cellvit"].shape[1])
+                    crop_dino_dim = int(shard["crop_dino"].shape[1])
+                    break
+        if cellvit_dim is None:
+            raise RuntimeError(
+                "No batch file contains a single cell. CellViT detected nothing "
+                "anywhere, which is a scale/checkpoint problem, not a cache one."
+            )
+        if cellvit is not None and cellvit_dim != cellvit.embedding_dim:
+            raise RuntimeError(
+                f"Batch files carry {cellvit_dim}-d CellViT tokens but the loaded "
+                f"model produces {cellvit.embedding_dim}-d"
+            )
+        if crop_dino is not None and crop_dino_dim != crop_dino.feature_dim:
+            raise RuntimeError(
+                f"Batch files carry {crop_dino_dim}-d crop-DINO features but the "
+                f"loaded model produces {crop_dino.feature_dim}-d"
+            )
         cellvit_memmap = np.lib.format.open_memmap(
             os.path.join(build_dir, "cellvit.npy"), mode="w+", dtype=np.float16,
-            shape=(total_cells, cellvit.embedding_dim),
+            shape=(total_cells, cellvit_dim),
         )
         crop_dino_memmap = np.lib.format.open_memmap(
             os.path.join(build_dir, "crop_dino.npy"), mode="w+", dtype=np.float16,
-            shape=(total_cells, crop_dino.feature_dim),
+            shape=(total_cells, crop_dino_dim),
         )
         confidence_memmap = np.lib.format.open_memmap(
             os.path.join(build_dir, "confidence.npy"), mode="w+", dtype=np.float32,

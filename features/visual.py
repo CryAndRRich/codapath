@@ -1,10 +1,11 @@
 import os
 import json
+import shutil
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from transformers import Dinov2Model
 
@@ -124,9 +125,21 @@ def get_or_extract_features(train_loader: DataLoader,
         torch.cuda.empty_cache()
 
     os.makedirs(cache_dir, exist_ok=True)
-    np.save(train_path, train_features)
-    np.save(test_path,  test_features)
-    with open(manifest_path, "w", encoding="utf-8") as f:
+    # Write through a process-unique temporary file and rename. Two workers
+    # sharing one cache directory (a T4 x2 session running two variants) can
+    # both miss the cache and extract at once; a direct `np.save` to the same
+    # path would interleave and leave a corrupt array that still loads. Rename
+    # is atomic on the same filesystem, so a reader sees either the old file or
+    # a complete new one. The manifest is written LAST, because it is what
+    # marks a cache as trustworthy.
+    suffix = f".tmp{os.getpid()}"
+    for path, array in ((train_path, train_features), (test_path, test_features)):
+        temporary = path + suffix
+        np.save(temporary, array)
+        # np.save appends .npy when the name lacks it.
+        os.replace(temporary if temporary.endswith(".npy") else temporary + ".npy", path)
+    manifest_temporary = manifest_path + suffix
+    with open(manifest_temporary, "w", encoding="utf-8") as f:
         json.dump({
             "schema_version": 1,
             "dataset": dataset_key,
@@ -137,6 +150,193 @@ def get_or_extract_features(train_loader: DataLoader,
             "train_shape": list(train_features.shape),
             "test_shape": list(test_features.shape),
         }, f, indent=2, sort_keys=True)
+    os.replace(manifest_temporary, manifest_path)
     print(f"[features] Saved cache → {train_path} + {test_path}")
 
     return train_features, test_features
+
+
+def _shard_bounds(total: int, shard_index: int, shard_count: int):
+    """Contiguous [start, stop) row range for one shard of `total` rows.
+
+    Contiguous, not strided: `extract_image_features` batches rows in dataloader
+    order, and a strided split would put different samples in a batch than a
+    serial run does. For a fixed-size, batch-independent forward pass that makes
+    no numerical difference, but it makes the shard outputs impossible to compare
+    against a serial run row by row, which is how this split is tested. The
+    remainder is spread over the first shards so the two T4s differ by at most
+    one row.
+    """
+    if shard_count < 1:
+        raise ValueError("shard_count must be positive")
+    if not 0 <= shard_index < shard_count:
+        raise ValueError(f"shard_index {shard_index} outside [0, {shard_count})")
+    base, remainder = divmod(total, shard_count)
+    start = shard_index * base + min(shard_index, remainder)
+    stop = start + base + (1 if shard_index < remainder else 0)
+    return start, stop
+
+
+def _shard_paths(cache_dir: str, base: str, split: str, shard_count: int):
+    shard_dir = os.path.join(cache_dir, f".shards_{base}_{split}_of{shard_count}")
+    return shard_dir
+
+
+def extract_features_shard(train_loader: DataLoader,
+                           test_loader: DataLoader,
+                           dataset_key: str,
+                           seed: int,
+                           vit_name: str,
+                           device: torch.device,
+                           shard_index: int,
+                           shard_count: int,
+                           cache_dir: str = "features") -> None:
+    """Extract one contiguous row range of train AND test into a shard file.
+
+    Written for a Kaggle T4 x2 session: two processes, one per GPU, each call
+    this with its own `shard_index`, then one process calls
+    `assemble_feature_shards` to concatenate them into the normal cache layout.
+    Nothing is shared between the processes except the output directory, and
+    each writes only its own file, so no locking is needed.
+
+    A shard that already exists is skipped, so a session that dies half way
+    through resumes instead of recomputing what it already has.
+    """
+    if shard_count < 1:
+        raise ValueError("shard_count must be positive")
+    train_path, test_path, _ = _feature_cache_paths(
+        cache_dir, dataset_key, seed, vit_name
+    )
+    if os.path.exists(train_path) and os.path.exists(test_path):
+        print(f"[features] shard {shard_index}: complete cache exists, nothing to do")
+        return
+
+    base = os.path.basename(train_path)[:-len("_train.npy")]
+    extractor = None
+    for split, loader in (("train", train_loader), ("test", test_loader)):
+        shard_dir = _shard_paths(cache_dir, base, split, shard_count)
+        os.makedirs(shard_dir, exist_ok=True)
+        shard_path = os.path.join(shard_dir, f"{shard_index:03d}.npy")
+        start, stop = _shard_bounds(len(loader.dataset), shard_index, shard_count)
+        if os.path.exists(shard_path):
+            existing = np.load(shard_path, mmap_mode="r")
+            if existing.shape[0] == stop - start:
+                print(f"[features] shard {shard_index} {split}: reusing "
+                      f"{existing.shape} rows [{start}:{stop})")
+                continue
+            print(f"[features] shard {shard_index} {split}: stale row count "
+                  f"({existing.shape[0]} != {stop - start}), recomputing")
+        if extractor is None:
+            extractor = DINOv2Extractor(model_name=vit_name).to(device)
+        # Subset over the loader's own dataset, so the rows this shard produces
+        # are exactly rows [start, stop) of the serial cache.
+        subset = Subset(loader.dataset, list(range(start, stop)))
+        shard_loader = DataLoader(
+            subset,
+            batch_size=loader.batch_size,
+            shuffle=False,
+            num_workers=getattr(loader, "num_workers", 0),
+            pin_memory=True,
+        )
+        print(f"[features] shard {shard_index}/{shard_count} {split}: "
+              f"rows [{start}:{stop}) of {len(loader.dataset)}")
+        features = extract_image_features(shard_loader, extractor, device)
+        if features.shape[0] != stop - start:
+            raise RuntimeError(
+                f"shard produced {features.shape[0]} rows, expected {stop - start}"
+            )
+        temporary = shard_path + f".tmp{os.getpid()}"
+        np.save(temporary, features)
+        os.replace(
+            temporary if temporary.endswith(".npy") else temporary + ".npy",
+            shard_path,
+        )
+    if extractor is not None:
+        del extractor
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def assemble_feature_shards(dataset_key: str,
+                            seed: int,
+                            vit_name: str,
+                            shard_count: int,
+                            n_train: int,
+                            n_test: int,
+                            cache_dir: str = "features",
+                            train_fingerprint: str = None,
+                            test_fingerprint: str = None,
+                            keep_shards: bool = False):
+    """Concatenate per-GPU shards into the standard cache, manifest last.
+
+    The manifest is what `get_or_extract_features` trusts, so it is written only
+    after both arrays are complete and their row counts check out. A missing
+    shard is an error rather than a short array: silently concatenating 3 of 4
+    shards would produce a cache that loads and is wrong.
+    """
+    train_path, test_path, manifest_path = _feature_cache_paths(
+        cache_dir, dataset_key, seed, vit_name
+    )
+    base = os.path.basename(train_path)[:-len("_train.npy")]
+    assembled = {}
+    for split, expected_rows, path in (
+        ("train", n_train, train_path), ("test", n_test, test_path)
+    ):
+        shard_dir = _shard_paths(cache_dir, base, split, shard_count)
+        parts = []
+        for shard_index in range(shard_count):
+            shard_path = os.path.join(shard_dir, f"{shard_index:03d}.npy")
+            if not os.path.exists(shard_path):
+                raise FileNotFoundError(
+                    f"Missing {split} shard {shard_index} at {shard_path}. "
+                    "Every shard must finish before assembly; re-run the "
+                    "extraction cell to fill the gap."
+                )
+            start, stop = _shard_bounds(expected_rows, shard_index, shard_count)
+            part = np.load(shard_path)
+            if part.shape[0] != stop - start:
+                raise RuntimeError(
+                    f"{split} shard {shard_index} has {part.shape[0]} rows, "
+                    f"expected {stop - start}"
+                )
+            parts.append(part)
+        features = np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+        if features.shape[0] != expected_rows:
+            raise RuntimeError(
+                f"assembled {split} has {features.shape[0]} rows, "
+                f"expected {expected_rows}"
+            )
+        if not np.all(np.isfinite(features)):
+            raise RuntimeError(f"assembled {split} features are not all finite")
+        assembled[split] = (path, features)
+
+    suffix = f".tmp{os.getpid()}"
+    for path, array in assembled.values():
+        temporary = path + suffix
+        np.save(temporary, array)
+        os.replace(
+            temporary if temporary.endswith(".npy") else temporary + ".npy", path
+        )
+    manifest_temporary = manifest_path + suffix
+    with open(manifest_temporary, "w", encoding="utf-8") as f:
+        json.dump({
+            "schema_version": 1,
+            "dataset": dataset_key,
+            "seed": seed,
+            "backbone": vit_name,
+            "train_fingerprint": train_fingerprint,
+            "test_fingerprint": test_fingerprint,
+            "train_shape": list(assembled["train"][1].shape),
+            "test_shape": list(assembled["test"][1].shape),
+            "shard_count": shard_count,
+        }, f, indent=2, sort_keys=True)
+    os.replace(manifest_temporary, manifest_path)
+
+    if not keep_shards:
+        for split in ("train", "test"):
+            shutil.rmtree(
+                _shard_paths(cache_dir, base, split, shard_count),
+                ignore_errors=True,
+            )
+    print(f"[features] Assembled {shard_count} shards → {train_path} + {test_path}")
+    return assembled["train"][1], assembled["test"][1]
