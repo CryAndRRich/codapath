@@ -28,6 +28,7 @@ def extract_shard_on_worker(
     shard_index: int,
     shard_count: int,
     cache_dir: str,
+    mmap_cache_dir: str = None,
     device_string: str = "cuda:0",
 ) -> None:
     """Extract one shard, seeding and resolving the device inside the child.
@@ -41,6 +42,12 @@ def extract_shard_on_worker(
     ImageFolder dataset is drawn from a seeded generator inside
     `get_data_loaders`, so both workers must seed identically or they would
     shard two different splits and the assembled cache would interleave them.
+
+    `mmap_cache_dir` is what keeps two workers inside a Kaggle session's RAM. An
+    eager .npz read costs ~15 GiB per process on PathMNIST-224, so two of them
+    exceed the ~30 GiB available and one is OOM-killed inside `np.load` before it
+    prints anything. The export it points at must already exist: building it
+    here would have both workers writing the same files at once.
     """
     import torch
 
@@ -50,10 +57,14 @@ def extract_shard_on_worker(
 
     set_seed(seed)
     device = torch.device(device_string)
-    train_loader, test_loader, _ = get_data_loaders(data_path, seed, verbose=False)
+    train_loader, test_loader, _ = get_data_loaders(
+        data_path, seed, verbose=False, mmap_cache_dir=mmap_cache_dir
+    )
+    mapped = getattr(train_loader.dataset, "mmap", None)
     print(
         f"[worker] {dataset_key} seed={seed} shard={shard_index}/{shard_count} "
-        f"train={len(train_loader.dataset)} test={len(test_loader.dataset)}"
+        f"train={len(train_loader.dataset)} test={len(test_loader.dataset)} "
+        f"mmap={mapped}"
     )
     extract_features_shard(
         train_loader, test_loader, dataset_key, seed, vit_name, device,
@@ -68,6 +79,7 @@ def build_shard_jobs(
     vit_name: str,
     shard_count: int,
     cache_dir: str,
+    mmap_cache_dir: str = None,
 ) -> List[Tuple[str, dict]]:
     """`(label, kwargs)` pairs for `run_variants_parallel`, one per shard.
 
@@ -84,6 +96,7 @@ def build_shard_jobs(
                 shard_index=index,
                 shard_count=shard_count,
                 cache_dir=cache_dir,
+                mmap_cache_dir=mmap_cache_dir,
             ),
         )
         for index in range(shard_count)

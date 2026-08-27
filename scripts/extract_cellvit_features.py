@@ -79,6 +79,13 @@ def parse_args():
     parser.add_argument("--max_cells_per_patch", type=int, default=None)
     parser.add_argument("--qc_count", type=int, default=16)
     parser.add_argument(
+        "--mmap_cache_dir", default=None,
+        help="Directory holding the .npz re-exported as memory-mappable .npy "
+             "files. Required for a multi-GPU run on a large .npz: an eager read "
+             "costs ~15 GiB per process. Export it once in the parent (numpy "
+             "ignores mmap_mode for .npz, so only standalone .npy can be mapped).",
+    )
+    parser.add_argument(
         "--shard_index", type=int, default=None,
         help="Extract only this shard of the patch range, then stop before "
              "assembly. One process per GPU on a Kaggle T4 x2 session.",
@@ -173,8 +180,10 @@ def main() -> None:
         )
 
     train_loader, _, _ = get_data_loaders(
-        data_path, args.seed, verbose=True
+        data_path, args.seed, verbose=True, mmap_cache_dir=args.mmap_cache_dir
     )
+    if args.mmap_cache_dir:
+        print(f"[nucleus] mmap={getattr(train_loader.dataset, 'mmap', None)}")
     raw_dataset = RawRGBDataset(train_loader.dataset)
     sample_ids = get_sample_ids(train_loader.dataset)
     sample_fingerprint = sample_order_fingerprint(sample_ids)

@@ -231,12 +231,16 @@ def extract_features_shard(train_loader: DataLoader,
         # Subset over the loader's own dataset, so the rows this shard produces
         # are exactly rows [start, stop) of the serial cache.
         subset = Subset(loader.dataset, list(range(start, stop)))
+        # Inherit the loader's worker count: whoever built it chose it for this
+        # dataset kind (JPEG decode needs workers, a mapped .npz does not).
+        shard_workers = int(getattr(loader, "num_workers", 0) or 0)
         shard_loader = DataLoader(
             subset,
             batch_size=loader.batch_size,
             shuffle=False,
-            num_workers=getattr(loader, "num_workers", 0),
+            num_workers=shard_workers,
             pin_memory=True,
+            **({"persistent_workers": True} if shard_workers > 0 else {}),
         )
         print(f"[features] shard {shard_index}/{shard_count} {split}: "
               f"rows [{start}:{stop}) of {len(loader.dataset)}")
