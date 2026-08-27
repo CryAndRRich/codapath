@@ -1,7 +1,38 @@
-# CellViT only. Kept separate because it pulls a heavy, version-sensitive stack
-# (numba, cv2, scikit-image) that the sampling and training paths never import.
-# Install this in the nucleus-extraction notebook only; main.py reads the cache
-# that notebook writes and needs none of it.
+# Everything the nucleus-extraction notebook needs, and nothing else.
 #
+# This is the ONLY requirements file that notebook installs. It deliberately does
+# not layer on requirements.txt: that file carries matplotlib, seaborn,
+# scikit-learn and open_clip_torch for the sampler and evaluation notebooks, and
+# nothing on the extraction path imports any of them.
+#
+# It is installed in TWO commands, because the pinned wheel and the rest cannot
+# share a pip invocation. See the notebook's setup cell:
+#
+#   pip install --no-deps --require-hashes -r requirements-cellvit.txt
+#   pip install -r requirements-cellvit-extra.txt
+#
+# Why --no-deps, and why the split:
+#
+#   * The cellvit wheel declares 22 dependencies, 19 unpinned (colour, colorama,
+#     ray, pathopatch, opencv-python-headless==4.7.0.72, numpy<2 ...). A single
+#     --hash anywhere puts pip into --require-hashes mode for the WHOLE file, and
+#     then every transitive dependency must be pinned with == as well. CellViT's
+#     are not, so pip aborts before installing anything:
+#         ERROR: In --require-hashes mode, all requirements must have their
+#         versions pinned with ==. These do not: colour ...
+#   * Even pinned, that tree would replace Kaggle's NumPy, OpenCV, Pydantic and
+#     Ray. This adapter runs CellViT256 over patches and imports none of the WSI
+#     pipeline those pins exist for.
+#   * --require-hashes is per-file, so the unhashed requirements live in their
+#     own file rather than weakening the hash check on this one.
+#
+# NOT listed anywhere, because a Kaggle GPU image ships them and reinstalling
+# risks an ABI break under torch: torch, torchvision, numpy, scipy, pandas,
+# scikit-image, opencv (cv2), numba. scripts/preflight_cellvit.py imports each
+# and names the offender instead of silently changing the image.
+#
+# The audited invocation comes from CELLVIT_SETUP.md on the tiendung branch,
+# where nucleus extraction was first made to work on Kaggle.
+
 # Official PyPI wheel, audited against features/cellvit/extractor.py.
 cellvit==1.0.9 --hash=sha256:0dc07a8cb5dd4318882f5200d60170d3326de6de8514cae6f6dafe0a8230b699

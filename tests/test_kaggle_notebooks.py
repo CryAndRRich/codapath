@@ -118,3 +118,80 @@ def test_run_notebook_offers_the_disagreement_ablation():
     it should be one keystroke away rather than something to remember."""
     source = _all_source(NOTEBOOK_DIR / "run_al_sampler.ipynb")
     assert '"uncertainty_mode": "visual_margin"' in source
+
+
+def test_cellvit_wheel_is_installed_with_no_deps():
+    """--no-deps is load-bearing, and its absence fails only on Kaggle.
+
+    The cellvit wheel declares 22 dependencies, 19 unpinned. A --hash on any line
+    puts pip into --require-hashes mode for the whole file, which then demands ==
+    pins for every transitive dependency; CellViT's lack them, so pip aborts with
+    "In --require-hashes mode, all requirements must have their versions pinned".
+    Installing that tree would also replace Kaggle's NumPy, OpenCV and Ray.
+    """
+    # Parse the pip ARGUMENT LIST, not the cell text. A substring search passes on
+    # the comments that explain why --no-deps matters, so it would still pass with
+    # the flag deleted — which is exactly the bug being guarded against.
+    notebook = json.loads(
+        (NOTEBOOK_DIR / "extract_nucleus_features.ipynb").read_text(encoding="utf-8")
+    )
+    calls = []
+    for cell in notebook["cells"]:
+        if cell["cell_type"] != "code":
+            continue
+        tree = ast.parse("\n".join(
+            line for line in _source(cell).splitlines()
+            if not line.lstrip().startswith(("%", "!"))
+        ))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            if not isinstance(node.args[0], (ast.List, ast.Tuple)):
+                continue
+            argv = [
+                element.value for element in node.args[0].elts
+                if isinstance(element, ast.Constant) and isinstance(element.value, str)
+            ]
+            if "pip" in argv and "requirements-cellvit.txt" in argv:
+                calls.append(argv)
+
+    assert len(calls) == 1, f"expected one pip call for the wheel, got {len(calls)}"
+    argv = calls[0]
+    assert "--no-deps" in argv, f"cellvit must be installed with --no-deps: {argv}"
+    assert "--require-hashes" in argv, argv
+
+
+def test_hashed_and_unhashed_requirements_stay_in_separate_files():
+    """--require-hashes applies per FILE, so one unhashed line disables the check
+    for the pinned wheel too. PyYAML and Pillow are C extensions with a distinct
+    wheel and hash per platform, so hashing them would break on a Kaggle image
+    bump — they belong in the unhashed file."""
+    hashed = (PROJECT / "requirements-cellvit.txt").read_text(encoding="utf-8")
+    extra = (PROJECT / "requirements-cellvit-extra.txt").read_text(encoding="utf-8")
+
+    def requirement_lines(text):
+        return [l.strip() for l in text.splitlines()
+                if l.strip() and not l.lstrip().startswith("#")]
+
+    for line in requirement_lines(hashed):
+        assert "--hash=sha256:" in line, f"unhashed line in hashed file: {line}"
+        assert "==" in line, f"unpinned line in hashed file: {line}"
+    for line in requirement_lines(extra):
+        assert "--hash" not in line, f"hash in the unhashed file: {line}"
+
+
+def test_nucleus_notebook_installs_only_its_own_requirements():
+    """requirements.txt carries matplotlib/seaborn/open_clip for the sampler and
+    evaluation notebooks; nothing on the extraction path imports them."""
+    source = _all_source(NOTEBOOK_DIR / "extract_nucleus_features.ipynb")
+    assert '"-r", "requirements.txt"' not in source
+    assert "requirements-cellvit.txt" in source
+    assert "requirements-cellvit-extra.txt" in source
+
+
+def test_extra_requirements_cover_what_no_deps_leaves_out():
+    """--no-deps means CellViT brings none of its own dependencies. einops is the
+    one its model code imports that Kaggle does not ship."""
+    extra = (PROJECT / "requirements-cellvit-extra.txt").read_text(encoding="utf-8")
+    for package in ("einops", "transformers", "PyYAML", "Pillow", "tqdm"):
+        assert package in extra, package

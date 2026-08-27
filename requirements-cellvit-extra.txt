@@ -1,0 +1,27 @@
+# The unhashed half of the nucleus-extraction environment.
+#
+# Separate from requirements-cellvit.txt because --require-hashes applies to a
+# whole file: the CellViT wheel is hash-pinned, and these cannot be without
+# making the environment brittle.
+#
+# PyYAML and Pillow are C extensions with one wheel (and one hash) per platform
+# and per Python version, so pinning a hash would break the moment Kaggle bumps
+# its image. They are also normally preinstalled there; pip leaves a satisfying
+# version alone, so in practice these lines are a safety net for a slimmer image
+# rather than an install.
+#
+# Installed WITH dependencies, unlike the CellViT wheel: these are ordinary
+# packages whose dependency trees do not fight Kaggle's stack.
+#
+# Everything the extraction path imports and Kaggle might not ship:
+#   transformers  -> features/visual.py (DINOv2 for the masked nucleus crops)
+#   PyYAML        -> scripts/extract_cellvit_features.py, preflight_cellvit.py
+#   Pillow        -> features/cellvit/crops.py, the raw-RGB loader, QC overlays
+#   tqdm          -> features/visual.py progress reporting
+#   einops        -> imported by cellvit's own model code, and --no-deps means
+#                    the wheel did not bring it
+transformers>=4.27.0
+PyYAML>=6.0
+Pillow>=9.0.0
+tqdm>=4.60.0
+einops>=0.6.1
