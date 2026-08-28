@@ -14,6 +14,7 @@ Two subtleties in the diversity term, both reproduced below: its left factor is
 detached, and the self-similarity diagonal stays in the sum.
 """
 
+import time
 from typing import List
 
 import numpy as np
@@ -37,6 +38,7 @@ def activeft_sampling(**kwargs) -> List[int]:
     tau = kwargs.get("temperature", 0.07)
     iterations = kwargs.get("iterations", 300)
     lambda_reg = kwargs.get("balance", 1.0)
+    trace = kwargs.get("trace")
 
     features = torch.tensor(image_embeddings, device=device, dtype=torch.float32)
     features = F.normalize(features, p=2, dim=1)
@@ -79,19 +81,44 @@ def activeft_sampling(**kwargs) -> List[int]:
     selected_indices = []
     selected_set = set()
 
+    started = time.time()
+    if trace is not None:
+        trace.start_round(0)
+
     with torch.no_grad():
         theta_final = F.normalize(theta, p=2, dim=1)
         dist_to_real = torch.matmul(theta_final, features.t())
-        _, ids_sort = torch.sort(dist_to_real, dim=1, descending=True)
+        sorted_sims, ids_sort = torch.sort(dist_to_real, dim=1, descending=True)
+        sorted_sims = sorted_sims.cpu().numpy()
         ids_sort = ids_sort.cpu().numpy()
 
         for i in tqdm(range(max_budget), desc="ActiveFT Selection"):
             for j in range(num_samples):
                 candidate_idx = int(ids_sort[i, j])
                 if candidate_idx not in selected_set:
+                    if trace is not None:
+                        # ActiveFT optimises `max_budget` centroids and then
+                        # takes the real point nearest each one. The score is
+                        # that cosine similarity to its own centroid -- a pure
+                        # coverage quantity; this method never fits a
+                        # classifier, so it has no uncertainty term at all.
+                        trace.add_step(
+                            candidate_idx,
+                            score=float(sorted_sims[i, j]),
+                            coverage=float(sorted_sims[i, j]),
+                            centroid=float(i),
+                        )
                     selected_indices.append(candidate_idx)
                     selected_set.add(candidate_idx)
                     break
+
+    if trace is not None:
+        trace.add_round(
+            num_selected=len(selected_indices),
+            seconds=time.time() - started,
+            final_loss=float(loss.item()),
+            iterations=float(iterations),
+        )
 
     del features, theta, sim_matrix, theta_sim, dist_to_real, ids_sort
     clear_memory()

@@ -35,10 +35,6 @@ samplers:
                        # same objective further, it is not a different method)
     balance: 1.0
 
-  codapath:
-    alpha: 0.5         
-    chunk_size: 10000
-
   entropy:
     probe_epochs: 50
     probe_lr: 0.001

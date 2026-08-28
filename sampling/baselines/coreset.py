@@ -10,6 +10,7 @@ a monotone transform leaves every argmax unchanged, so the selection is
 identical to the reference while matching this project's kernel convention.
 """
 
+import time
 from typing import List
 
 import numpy as np
@@ -27,6 +28,7 @@ def coreset_sampling(**kwargs) -> List[int]:
     max_budget = kwargs["max_budget"]
     device = kwargs["device"]
     chunk_size = kwargs["chunk_size"]
+    trace = kwargs.get("trace")
 
     num_samples = image_embeddings.shape[0]
 
@@ -37,6 +39,13 @@ def coreset_sampling(**kwargs) -> List[int]:
 
     first_idx = np.random.randint(0, num_samples)
     selected_indices.append(first_idx)
+
+    started = time.time()
+    if trace is not None:
+        trace.start_round(0)
+        # The seed centre is drawn at random, so it has no k-center distance of
+        # its own -- recorded with no score, like every other random pick here.
+        trace.add_step(int(first_idx))
 
     min_distances = torch.full((num_samples,), float("inf"), device=device)
 
@@ -59,9 +68,32 @@ def coreset_sampling(**kwargs) -> List[int]:
         min_distances[selected_indices] = -1.0
 
         furthest_idx = torch.argmax(min_distances).item()
+        if trace is not None:
+            # k-center greedy's acquisition value IS this distance to the
+            # nearest already-chosen centre, which is a pure coverage quantity:
+            # large means "far from everything selected so far". There is no
+            # uncertainty term in this method at all, so none is recorded.
+            best_distance = min_distances[furthest_idx].item()
+            runner_up = torch.topk(min_distances, 2).values[1].item() \
+                if min_distances.numel() > 1 else None
+            trace.add_step(
+                int(furthest_idx),
+                score=best_distance,
+                margin_to_runner_up=(
+                    None if runner_up is None else best_distance - runner_up
+                ),
+                coverage=best_distance,
+            )
         selected_indices.append(furthest_idx)
 
         clear_memory()
+
+    if trace is not None:
+        trace.add_round(
+            num_selected=len(selected_indices),
+            seconds=time.time() - started,
+            scores=min_distances.detach().cpu().numpy(),
+        )
 
     del unlabeled_tensor, min_distances
     clear_memory()

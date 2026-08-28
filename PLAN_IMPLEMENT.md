@@ -140,10 +140,25 @@ của CODAPath (xem `PLAN_VARIANTS.md` §2.3 để biết vì sao).
 | `run_al_baseline.ipynb` | **mới** (tách từ `run_al_sampler`) | §5 |
 | `run_al_main.ipynb` | **mới** (tách từ `run_al_sampler`) | §6 |
 | `run_al_sampler.ipynb` | **xoá** | bị hai cái trên thay thế |
-| `evaluate_al_sampler.ipynb` | giữ | bỏ `codapath` khỏi `RUN_NAMES` ví dụ |
+| `evaluate_al_sampler.ipynb` | **sửa** | §2.1 — hiện hard-code DINOv2, không đánh giá được run CONCH |
 
 Mọi notebook mới đều theo đúng khung đã có: clone + verify branch → `%cd` →
 pip install → cell EDIT → import → resolve cache → chạy → archive.
+
+### 2.1 `evaluate_al_sampler.ipynb` — lỗ hổng phát hiện khi rà plan
+
+Notebook này **hard-code `DINOv2Extractor`** và tự extract lại test feature mỗi
+lần chạy. Hai vấn đề:
+
+1. Run của Protocol B nằm trong không gian CONCH, nhưng notebook sẽ chấm chúng
+   bằng feature DINOv2 → sai hoàn toàn mà **không có gì báo lỗi**: probe 512-d
+   gặp feature 768-d thì crash, nhưng nếu số chiều tình cờ khớp thì ra con số
+   vô nghĩa.
+2. Nó extract lại toàn bộ test set mỗi lần, trong khi cache đã có sẵn.
+
+Sửa: đọc `metadata` trong `<run>_probe_budget_<B>.pt` (đã có từ lần trước) để
+biết run đó dùng encoder nào, rồi load đúng cache tương ứng. Thêm assert số
+chiều probe khớp số chiều feature. Bỏ `codapath` khỏi `RUN_NAMES` ví dụ.
 
 ---
 
@@ -462,10 +477,73 @@ Theo đúng nguyên tắc của dự án: assert vào **cơ chế**, không ph�
 
 ## 9. Thứ tự làm
 
-1. **Xoá codapath + assets** (§1.1) — độc lập, làm sạch trước khi thêm.
-2. **`utils/kaggle.py`** (§0.3) — mọi notebook sau dùng chung.
-3. **Tách `run_al_baseline`** (§5) — chạy được ngay, không cần gì mới. Đây là
-   thứ cho bạn số liệu Protocol A sớm nhất.
+1. ~~Xoá codapath + assets~~ (§1.1) — **XONG**. `codapath.py`, `assets/` (12
+   file, hồi được từ `4b6280f`), entry trong `specs.py`/`__init__.py`/
+   `config.yaml`, nhánh `_load_vlm_inputs` trong `main.py`, 5 chỗ trong
+   README, 1 test viết lại (`test_needs_is_not_an_axis`, giờ chứng minh bằng
+   `scalpel`/`random`/`margin` vì `scalpel` là sampler duy nhất còn `needs`
+   khác rỗng). `BASELINE_SAMPLERS` đã thêm vào `specs.py` (dùng ở bước 3).
+2. ~~`utils/kaggle.py`~~ (§0.3) — **XONG**. 4 hàm (`find_dir_containing`,
+   `find_data_root`, `find_visual_cache`, `find_cellvit_cache`); **không**
+   gồm archive-writing — hai notebook trích đặc trưng và `run_al_sampler` dùng
+   2 pattern zip khác nhau có chủ đích (xem docstring module), gộp là quyết
+   định khác, không âm thầm làm ở đây. Đã wire vào `run_al_sampler.ipynb`
+   (cell 6–8), thay `dir_containing` cục bộ. 13 test mới
+   (`test_kaggle_cache_lookup.py`), bắt được 1 lỗi thật lúc viết: test kỳ vọng
+   sai hướng trả về của `find_cellvit_cache` (hàm đúng, trả về **parent** của
+   `pathmnist_seed42/` để khớp `main.py::_load_cell_view` tự nối path — test
+   ban đầu viết ngược, đã sửa). 256 test pass, pyflakes sạch.
+3. ~~Tách `run_al_baseline`~~ (§5) — **XONG**. Notebook mới 11 cell, cùng khung
+   với `run_al_sampler.ipynb` nhưng: không nhắc CellViT/VLM ở đâu trong code
+   (chỉ ở prose giải thích phạm vi), assert `SAMPLER in BASELINE_SAMPLERS` +
+   `spec.needs` rỗng cả hai loại ngay trong cell cấu hình (nổ trước khi tốn
+   GPU, không phải giữa chừng vòng lặp budget), archive slug
+   `{dataset}-baseline-{sampler}`. `run_al_sampler.ipynb` giữ nguyên (cần cho
+   `scalpel`) — sẽ xoá ở bước 6 khi `run_al_main` thay thế nó.
+   17 test mới (8 test riêng cho notebook này trong
+   `test_kaggle_notebooks.py`, cộng `EXPECTED_NOTEBOOKS` +1). Một lần viết
+   test sai — kỳ vọng "không được nhắc CellViT" chặn cả comment/assert-message
+   giải thích lý do reject `scalpel`, phải sửa lại để chỉ chặn *cơ chế* (import
+   `find_cellvit_cache`, biến `CELLVIT_DIR`, `cellvit_cache_dir=`), không chặn
+   *nhắc tên*. 265 test pass (kể cả bộ `test_kaggle_cache_lookup.py` của bước
+   2), pyflakes sạch. Verify thêm bằng mô phỏng thủ công: dựng cache DINOv2
+   giả lập đúng như `extract_visual_features.ipynb` sẽ publish, gọi
+   `find_visual_cache` với `hint` không phải đường dẫn chính xác (mô phỏng
+   Kaggle remount), rồi `main.run_on_worker` **không** truyền
+   `cellvit_cache_dir` — chạy xong ghi đủ file kết quả.
+3b. ~~Rà soát luồng baseline sau bước 3~~ — **XONG**. Audit toàn luồng phát hiện
+   4 vấn đề, 3 cái phải sửa:
+   - **Không sampler baseline nào ghi trace** — hạ tầng `SelectionTrace` có sẵn
+     và `main.py` truyền `trace=` vào mọi sampler, nhưng `grep` trên
+     `sampling/baselines/*.py` không khớp dòng nào, nên `main.py` rơi vào nhánh
+     backfill và mọi `score` đều `None`. Đã thêm ghi trace cho cả 10 sampler có
+     điểm số (`random` không có score thật nên vẫn để backfill). Mỗi sampler
+     chỉ ghi thứ nó *thực sự tính*: `coreset`/`typiclust`/`activeft` không fit
+     classifier nên không có `uncertainty`; `tcm` gắn nhãn `phase` 1/2 vì hai
+     pha tối ưu hai đại lượng khác nhau; `uncertainty_herding`/`refine` tách
+     riêng `uncertainty` và `coverage` khỏi `score` (tích của chúng) để sau này
+     trả lời được "yếu tố nào thực sự quyết định lượt chọn".
+   - **PALM chạy trong lúc run** — đã bỏ `_fit_palm` khỏi `main.py`. Không tạo
+     lỗ hổng: `evaluate_al_sampler.ipynb` vốn tự tính lại accuracy từ probe đã
+     lưu rồi fit PALM độc lập, chưa từng đọc `_palm.pt`.
+   - **2 GPU không hoạt động với cấu hình mặc định** — `utils/parallel.py` có
+     `workers = min(workers, len(variants))`, mà mặc định `SEEDS=[42]` ×
+     `VARIANTS=[{}]` = 1 job → 1 GPU chạy, 1 GPU ngồi không. Đã thêm chia theo
+     **budget** (`SPLIT_BUDGETS`), chia round-robin (không chia liền khối, vì
+     chi phí tăng theo budget). Điều kiện chia là chính `spec.prefix_exact`
+     chứ không phải danh sách tên tự giữ — sampler prefix-exact
+     (`random`/`coreset`/`tcm`) dùng chung một lượt chọn cho cả sweep nên chia
+     ra sẽ lặp lại lượt đó ở mỗi shard; `main.run` raise thẳng nếu nhận
+     `shard_tag` cho loại này. Mỗi shard ghi `<run>_<tag>_results.pt` + log
+     riêng (file theo budget vốn đã không đụng nhau), rồi
+     `main.merge_budget_shards` gộp lại đúng một `<run>_results.pt` như chạy
+     không chia — downstream không cần biết đã chia.
+   - Zip 1 file cho "Save & Run All": **đã đúng sẵn**, không sửa.
+   43 test mới (35 `test_baseline_trace.py` + 8 `test_budget_shards.py`) cộng 3
+   test notebook. Test quan trọng nhất là *fidelity*: chạy mỗi sampler hai lần
+   cùng seed, có và không có trace, danh sách index phải bằng nhau — đã xác
+   nhận **cả 11 sampler không đổi lựa chọn**. Và sharded vs unsharded cho
+   **cùng accuracy và cùng selected indices ở mọi budget**.
 4. **`features/vlm.py` + `extract_vlm_features`** (§1.2, §4).
 5. **`generate_class_description`** (§3) — cần trước khi text chạy được.
 6. **`run_al_main` phần chọn mẫu** (§6.1–6.3) — encoder + text, chưa train cuối.
@@ -603,13 +681,11 @@ Bạn chốt `0.05`. Nhưng CONCH có `logit_scale` **học được**, khởi t
 probs = F.softmax(logits * model.logit_scale.exp(), dim=1)   # zeroshot_path.py:175
 ```
 
-Giá trị trong checkpoint là kết quả train, không phải 0.07 nữa. Đề xuất:
-`tau_mode = "learned"` (mặc định, dùng `model.logit_scale.exp()` — đúng như tác
-giả) và `tau_mode = "fixed"` với `tau=0.05` làm trục so sánh. Dùng 0.05 cứng
-trong khi checkpoint mang scale khác là bỏ đi thông tin đã được train.
+Giá trị trong checkpoint là kết quả train, không phải 0.07 nữa.
 
-**Cần bạn xác nhận:** dùng `learned` làm mặc định (tôi khuyến nghị) hay giữ
-`0.05` cứng như bạn nói ban đầu?
+**ĐÃ CHỐT: dùng `learned`** — `model.logit_scale.exp()`, đúng như code chính
+thức. Không hard-code 0.05. `tau_mode="fixed"` giữ lại làm trục ablation tuỳ
+chọn, không phải mặc định.
 
 ### 10.7 Đo baseline zero-shot của chính CONCH
 
@@ -621,3 +697,29 @@ làm hỏng toàn bộ kết quả cold-start.
 
 Đây là loại test dự án này cần: assert vào **cơ chế** (khớp số đã công bố), chứ
 không phải shape.
+
+---
+
+## 11. Rà soát trước khi code — những gì ĐÃ kiểm tra
+
+Kiểm tra bằng code thật, không suy đoán. Ghi lại để không phải rà lại.
+
+| Câu hỏi | Kết quả |
+|---|---|
+| 11 baseline có cái nào cần VLM/CellViT không? | **Không** — tất cả `needs=()`. Tách `run_al_baseline` là sạch |
+| CellViT cache có khoá theo encoder không? | **Không** — chỉ theo `dataset+seed`. Nên **dùng lại được** cho cả DINOv2 và CONCH, không phải extract lại |
+| Check `dino_backbone` có chặn CONCH không? | **Không** — chỉ fire khi `cell_source="crop_dino"`. CONCH + `cellvit_embedding` chạy được ngay |
+| Probe và test feature có cùng backbone không? | **Có** — cùng một lời gọi `get_or_extract_features`, nên đổi `visual_backbone` là đổi cả hai, nhất quán |
+| `evaluate_al_sampler` có đánh giá được run CONCH không? | **KHÔNG** — hard-code DINOv2. Xem §2.1 |
+| Test nào tham chiếu codapath? | `tests/test_sampler_specs.py:52`. Viết lại bằng `scalpel` |
+
+### 11.1 Rủi ro còn lại, đã biết và chấp nhận
+
+- ~~`assets/` có hồi được không~~ — **ĐÃ KIỂM TRA: có.** Đã commit ở
+  `4b6280f Add figs and pdf files` và hai commit trước đó, `git ls-files` thấy
+  đủ file. Xoá an toàn, lấy lại bằng `git checkout <sha> -- assets/`.
+- **Chưa commit gì cả.** Toàn bộ thay đổi từ các lượt trước (trace, sanity,
+  parallel, progress) vẫn nằm ở working tree.
+- **CONCH 448 chưa đo thời gian thật.** 4x pixel so với DINOv2 224 là suy ra từ
+  số pixel, chưa benchmark. Phải chạy thử một batch trước khi cam kết cả session
+  cho PathMNIST 90k ảnh.

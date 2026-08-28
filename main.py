@@ -14,13 +14,19 @@ For each budget the run writes, under `<save_dir>`:
     <run>_probe_budget_<B>.pt         the probe's linear weights plus metadata
     <run>_predictions_budget_<B>.pt   test-set probabilities and labels
     <run>_results.pt                  metrics and timings for every budget
-    <run>_palm.pt                     fitted PALM curve parameters
     <run>.log                         everything printed during the run
 
 Everything a later plot might need is written during the run, because none of
 it can be recovered afterwards: the per-step acquisition score exists only
 inside the greedy loop, and the test predictions would cost a full backbone
 pass to rebuild.
+
+This run reports accuracy, precision, recall and macro-F1 only. Curve-level
+evaluation — PALM and anything else derived from the whole budget sweep — is
+`notebooks/evaluate_al_sampler.ipynb`'s job, deliberately: it is a pure
+function of the per-budget outputs written here, it needs every budget to have
+finished (which a resumed or GPU-split run cannot guarantee mid-sweep), and
+re-fitting it there costs seconds against re-running the sweep.
 """
 
 import argparse
@@ -35,7 +41,6 @@ import yaml
 from data.identity import sample_order_fingerprint
 from data.loaders import get_data_loaders, get_sample_ids
 from evaluation.metrics import evaluate_probe
-from evaluation.palm import format_palm_report, palm_evaluate
 from evaluation.sanity import (
     SEVERITY_ORDER,
     check_selection,
@@ -49,8 +54,6 @@ from training.probe import train_probe
 from utils import clear_memory, set_seed, tee_stdout
 from utils.progress import Stopwatch, format_duration
 from utils.trace import SelectionTrace
-
-MIN_PALM_POINTS = 4
 
 
 def _save(path: str, payload) -> None:
@@ -169,12 +172,29 @@ def run(
     feature_cache_dir: str = "features",
     cellvit_cache_dir: str = "cellvit_features",
     run_name: Optional[str] = None,
+    shard_tag: Optional[str] = None,
 ) -> None:
     spec = spec_for(sampler_name)
     output_name = _safe_run_name(run_name or _default_run_name(sampler_name, sampler_cfg))
 
+    # A budget-sharded run splits `cumulative_budget` across processes. The
+    # per-budget files are already named by budget and so never collide, but
+    # the results table and the log are per-RUN and would overwrite each
+    # other. `shard_tag` gives those two a distinct name per shard; the shards
+    # are merged afterwards by `merge_budget_shards`. Only meaningful for a
+    # sampler that is NOT prefix-exact, since a prefix-exact one shares a
+    # single selection pass that must not be repeated per shard.
+    shard_suffix = "" if shard_tag is None else f"_{_safe_run_name(shard_tag)}"
+    if shard_tag is not None and spec.prefix_exact:
+        raise ValueError(
+            f"{sampler_name!r} is prefix-exact: its whole sweep comes from ONE "
+            "selection pass at the maximum budget, so splitting its budgets "
+            "across processes would repeat that pass per shard and cost more "
+            "than it saves. Run it unsharded."
+        )
+
     run_started = time.time()
-    with tee_stdout(os.path.join(save_dir, f"{output_name}.log")):
+    with tee_stdout(os.path.join(save_dir, f"{output_name}{shard_suffix}.log")):
         print(f"Device: {device}")
         set_seed(random_seed)
 
@@ -198,17 +218,14 @@ def run(
         )
         clear_memory()
 
-        # The probe always trains on DINOv2 features. A sampler may still SELECT
-        # in a different space -- CODAPath scores against VLM text prototypes,
-        # so it needs that VLM's own image tower.
+        # The probe always trains on visual_backbone features, and every
+        # sampler currently selects in that same space -- no sampler declares
+        # `text_embeddings` in `spec.needs` at the moment. A future cold-start
+        # text prior is a config-driven axis of `scalpel` itself, not a static
+        # per-sampler requirement, and will be wired in separately.
         selection_features = train_features
         sampler_inputs: Dict[str, object] = {}
         cellvit_manifest = None
-        if "text_embeddings" in spec.needs:
-            selection_features, sampler_inputs["text_embeddings"] = _load_vlm_inputs(
-                train_loader, data_descriptions, prompt_templates, class_names,
-                device, model_cfg,
-            )
         if "cell_embeddings" in spec.needs:
             view, cellvit_manifest = _load_cell_view(
                 cellvit_cache_dir, dataset_key, random_seed, train_sample_ids,
@@ -244,7 +261,6 @@ def run(
                 **common,
             )
 
-        accuracy_by_budget: Dict[int, float] = {}
         results: Dict[int, Dict[str, float]] = {}
         sweep_watch = Stopwatch(len(cumulative_budget), f"{output_name} budgets")
 
@@ -329,7 +345,6 @@ def run(
             accuracy, precision, recall, f1 = evaluate_probe(
                 probe, test_features, test_labels, device
             )
-            accuracy_by_budget[budget] = accuracy
             results[budget] = {
                 "acc": accuracy, "precision": precision, "recall": recall, "f1": f1,
                 "selection_seconds": selection_seconds,
@@ -368,7 +383,7 @@ def run(
             print(f"[sweep] {sweep_watch.line()}")
 
         _save(
-            os.path.join(save_dir, f"{output_name}_results.pt"),
+            os.path.join(save_dir, f"{output_name}{shard_suffix}_results.pt"),
             {
                 "sampler": sampler_name,
                 "run_name": output_name,
@@ -389,8 +404,6 @@ def run(
                 "cellvit_manifest": cellvit_manifest,
             },
         )
-        _fit_palm(accuracy_by_budget, save_dir, output_name, dataset_key, verbose)
-
         worst = max(
             (results[budget]["sanity_severity"] for budget in results),
             key=lambda level: SEVERITY_ORDER.index(level),
@@ -401,6 +414,64 @@ def run(
             f"{format_duration(time.time() - run_started)} | worst sanity: "
             f"{worst.upper()}\n{'=' * 68}"
         )
+
+
+def merge_budget_shards(
+    save_dir: str, output_name: str, shard_tags: List[str]
+) -> Dict[int, Dict[str, float]]:
+    """Fold per-shard results files into the single `<run>_results.pt`.
+
+    A budget-sharded run writes one results table per shard. Everything else it
+    writes is already named by budget and needs no merging. The merged file is
+    byte-for-byte the shape an unsharded run produces, so nothing downstream —
+    `evaluate_al_sampler.ipynb` included — has to know a run was sharded.
+
+    Shard files are left in place rather than deleted: they carry each shard's
+    own timings, and a partially-finished sweep is worth being able to inspect.
+    """
+    merged: Dict[int, Dict[str, float]] = {}
+    budgets: List[int] = []
+    base: Optional[Dict] = None
+    missing: List[str] = []
+
+    for tag in shard_tags:
+        path = os.path.join(save_dir, f"{output_name}_{tag}_results.pt")
+        if not os.path.isfile(path):
+            missing.append(tag)
+            continue
+        payload = torch.load(path, weights_only=False)
+        if base is None:
+            base = payload
+        overlap = set(payload["linear"]) & set(merged)
+        if overlap:
+            raise ValueError(
+                f"Budget shards overlap on {sorted(overlap)}: two shards ran the "
+                "same budget, so one overwrote the other's per-budget files."
+            )
+        merged.update(payload["linear"])
+        budgets.extend(payload["budgets"])
+
+    if base is None:
+        raise FileNotFoundError(
+            f"No shard results found for {output_name!r} in {save_dir!r}"
+        )
+    if missing:
+        raise FileNotFoundError(
+            f"Shards {missing} produced no results file; the merged table would "
+            "silently be missing their budgets. Re-run them before merging."
+        )
+
+    payload = dict(base)
+    payload["linear"] = {budget: merged[budget] for budget in sorted(merged)}
+    payload["budgets"] = sorted(budgets)
+    payload["run_name"] = output_name
+    payload["sharded_over"] = list(shard_tags)
+    # Per-shard wall clock does not add up to anything meaningful once the
+    # shards ran concurrently, so it is dropped rather than summed into a
+    # number that would read as the run's duration.
+    payload.pop("total_seconds", None)
+    _save(os.path.join(save_dir, f"{output_name}_results.pt"), payload)
+    return payload["linear"]
 
 
 def run_on_worker(**kwargs) -> None:
@@ -419,67 +490,6 @@ def _dataset_labels(dataset) -> np.ndarray:
     if hasattr(dataset, "lbl"):
         return dataset.lbl
     return np.array(dataset.dataset.targets)[dataset.indices]
-
-
-def _load_vlm_inputs(
-    train_loader,
-    data_descriptions: Dict[str, str],
-    prompt_templates: List[str],
-    class_names: List[str],
-    device: torch.device,
-    model_cfg: Dict,
-):
-    """Return `(pool image features, class text prototypes)` in the VLM space.
-
-    CODAPath compares images against text prototypes, so both sides have to
-    come from the same dual-VLM encoder; DINOv2 features do not live in that
-    space and cannot be substituted here.
-    """
-    from features.visual import extract_image_features
-    from sampling.baselines.codapath import DualVLMExtractor, extract_text_features
-
-    plip = model_cfg.get("vlm_secondary", "vinid/plip")
-    biomedclip = model_cfg.get(
-        "vlm_primary", "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-    )
-    extractor = DualVLMExtractor(plip_model=plip, biomedclip_model=biomedclip).to(device)
-    image_features = extract_image_features(train_loader, extractor, device)
-    del extractor
-    clear_memory()
-
-    text_embeddings = extract_text_features(
-        data_descriptions, prompt_templates, class_names, device,
-        plip_model=plip,
-        biomedbert_model=model_cfg.get(
-            "biomedbert",
-            "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext",
-        ),
-    )
-    return image_features, text_embeddings
-
-
-def _fit_palm(
-    accuracy_by_budget: Dict[int, float],
-    save_dir: str,
-    output_name: str,
-    dataset_key: str,
-    verbose: bool,
-) -> None:
-    if len(accuracy_by_budget) < MIN_PALM_POINTS:
-        print(f"[PALM] Skipped: need >= {MIN_PALM_POINTS} budgets, got {len(accuracy_by_budget)}.")
-        return
-    try:
-        params = palm_evaluate(
-            budgets=list(accuracy_by_budget), accuracies=list(accuracy_by_budget.values())
-        )
-    except (RuntimeError, ValueError) as error:
-        print(f"[PALM] Fitting failed: {error}")
-        return
-    if verbose:
-        print(format_palm_report(params, output_name, dataset_key))
-    path = os.path.join(save_dir, f"{output_name}_palm.pt")
-    _save(path, params)
-    print(f"[PALM] Saved -> {path}")
 
 
 def _parse_overrides(pairs: List[str]) -> Dict[str, object]:

@@ -17,6 +17,7 @@ features instead -- the closest analogue under this project's frozen-backbone
 protocol.
 """
 
+import time
 from typing import List
 
 import numpy as np
@@ -53,6 +54,7 @@ def dropquery_sampling(**kwargs) -> List[int]:
     n_dropout = kwargs.get("n_dropout", 3)
     num_rounds = kwargs.get("num_rounds", 5)
     device = kwargs["device"]
+    trace = kwargs.get("trace")
 
     from training.probe import train_probe
 
@@ -69,12 +71,23 @@ def dropquery_sampling(**kwargs) -> List[int]:
         if n_select <= 0:
             continue
 
+        round_started = time.time()
+        if trace is not None:
+            trace.start_round(round_idx)
         unlabeled_indices = [i for i in range(num_samples) if i not in selected_set]
 
         if round_idx == 0:
             chosen = np.random.choice(
                 unlabeled_indices, min(n_select, len(unlabeled_indices)), replace=False
             ).tolist()
+            if trace is not None:
+                # Round 1 is plain random init, exactly as upstream: no model
+                # exists yet, so there is no inconsistency score to record.
+                for index in chosen:
+                    trace.add_step(int(index))
+                trace.add_round(
+                    num_selected=len(chosen), seconds=time.time() - round_started,
+                )
             selected_indices.extend(chosen)
             selected_set.update(chosen)
             continue
@@ -123,6 +136,21 @@ def dropquery_sampling(**kwargs) -> List[int]:
             )
             chosen_local = np.concatenate([candidate_local, fill_local]).astype(int)
             chosen = [unlabeled_indices[i] for i in chosen_local]
+            if trace is not None:
+                # No clustering happened on this branch, so there is no
+                # distance-to-centroid; only the inconsistency count exists.
+                # The random fill points are not candidates at all and keep a
+                # score of None.
+                candidate_set = set(candidate_local.tolist())
+                for local in chosen_local:
+                    if int(local) in candidate_set:
+                        value = float(inconsistency[local])
+                        trace.add_step(
+                            int(unlabeled_indices[local]),
+                            score=value, uncertainty=value,
+                        )
+                    else:
+                        trace.add_step(int(unlabeled_indices[local]))
         else:
             candidate_global = [unlabeled_indices[i] for i in candidate_local]
             cand_features = image_embeddings[candidate_global]
@@ -157,6 +185,31 @@ def dropquery_sampling(**kwargs) -> List[int]:
             selected_local.extend(remaining_local[:delta])
 
             chosen = [candidate_global[i] for i in selected_local]
+            if trace is not None:
+                # Both DropQuery factors, kept apart: the dropout
+                # inconsistency that made the point a candidate at all, and
+                # the distance to its own centroid that won it the cluster.
+                # Smaller distance is better here, so it is not a "score" to
+                # maximise -- `score` stays the uncertainty term.
+                for local in selected_local:
+                    global_index = candidate_global[local]
+                    value = float(inconsistency[candidate_local[local]])
+                    trace.add_step(
+                        int(global_index),
+                        score=value,
+                        uncertainty=value,
+                        coverage=float(dist_to_own_centroid[local]),
+                    )
+
+        if trace is not None:
+            trace.add_round(
+                num_selected=len(chosen),
+                seconds=time.time() - round_started,
+                scores=inconsistency.astype(np.float64),
+                weights=inconsistency.astype(np.float64),
+                threshold=float(thresh),
+                num_candidates=float(len(candidate_local)),
+            )
 
         selected_indices.extend(chosen)
         selected_set.update(chosen)

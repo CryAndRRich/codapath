@@ -11,6 +11,7 @@ EXPECTED_NOTEBOOKS = {
     "extract_visual_features.ipynb",
     "extract_nucleus_features.ipynb",
     "run_al_sampler.ipynb",
+    "run_al_baseline.ipynb",
     "evaluate_al_sampler.ipynb",
 }
 
@@ -25,7 +26,7 @@ def _all_source(path: Path) -> str:
     return "\n".join(_source(cell) for cell in notebook["cells"])
 
 
-def test_notebook_set_is_exactly_the_four_supported_entry_points():
+def test_notebook_set_is_exactly_the_supported_entry_points():
     """Extra notebooks drift out of sync with the code and silently rot; the
     project deliberately keeps one per stage of the pipeline."""
     assert {p.name for p in NOTEBOOK_DIR.glob("*.ipynb")} == EXPECTED_NOTEBOOKS
@@ -109,7 +110,11 @@ def test_run_notebook_matches_the_controlled_budget_protocol():
     # or CELLVIT_DIR stays an unresolved placeholder and the failure surfaces deep
     # inside the first variant instead of here.
     assert 'if "cell_embeddings" in spec.needs:' in source
-    assert "def dir_containing(" in source
+    # The cache-lookup search itself lives in utils/kaggle.py, shared with every
+    # other notebook, rather than being duplicated inline here.
+    assert "from utils.kaggle import" in source
+    assert "find_cellvit_cache" in source
+    assert "find_visual_cache" in source
     assert 'startswith("/kaggle/input")' in source
 
 
@@ -118,6 +123,96 @@ def test_run_notebook_offers_the_disagreement_ablation():
     it should be one keystroke away rather than something to remember."""
     source = _all_source(NOTEBOOK_DIR / "run_al_sampler.ipynb")
     assert '"uncertainty_mode": "visual_margin"' in source
+
+
+def test_baseline_notebook_only_runs_a_declared_baseline():
+    """`scalpel` needs a CellViT cell view, which this notebook never loads a
+    cache for -- picking it here must fail loudly in the notebook's own assert
+    cell, not deep inside main.py after GPU time is already spent on budget 25."""
+    source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
+    assert "from sampling.specs import BASELINE_SAMPLERS" in source
+    assert "assert SAMPLER in BASELINE_SAMPLERS" in source
+    assert '"cell_embeddings" not in spec.needs' in source
+    assert '"text_embeddings" not in spec.needs' in source
+
+
+def test_baseline_notebook_never_touches_cellvit():
+    """The whole point of this notebook is to run from the published DINOv2
+    cache alone. If a CellViT cache path, a `find_cellvit_cache` import, or
+    the extraction requirements file creeps back in, the split from
+    run_al_sampler.ipynb has been undone by accident.
+
+    This does not forbid the word "CellViT" outright: the assert cell
+    legitimately explains the sampler it rejects and why, in a comment and in
+    the assert's own message. What must never appear is an actual mechanism
+    for reading a CellViT cache.
+    """
+    source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
+    assert "find_cellvit_cache" not in source
+    assert "CELLVIT_DIR" not in source
+    assert "cellvit_cache_dir=" not in source
+    assert "requirements-cellvit" not in source
+
+
+def test_baseline_notebook_never_requests_a_vlm_or_text_prior():
+    source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
+    assert "text_embeddings" not in source or '"text_embeddings" not in spec.needs' in source
+    for name in ("CONCH", "vlm_primary", "vlm_secondary", "generate_class_description"):
+        assert name not in source
+
+
+def test_baseline_notebook_resolves_features_by_name_not_hardcoded_path():
+    source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
+    assert "from utils.kaggle import find_data_root, find_visual_cache" in source
+    assert "find_visual_cache(DATASET, SEEDS[0], vit_name, hint=FEATURE_DIR)" in source
+
+
+def test_baseline_notebook_supports_resume_and_both_gpus():
+    source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
+    assert "run_variants_parallel(" in source
+    assert "main.run_on_worker" in source
+    assert "_results.pt" in source and "skipped" in source
+
+
+def test_baseline_notebook_splits_budgets_by_the_prefix_exact_flag():
+    """The GPU split must be decided by `spec.prefix_exact`, not a name list.
+
+    A hand-kept list of "shardable" samplers is exactly the thing that goes
+    stale when a sampler is added: it would silently either repeat a shared
+    selection pass per shard, or leave a card idle. Asserting on the flag makes
+    the notebook track `sampling.specs` automatically.
+    """
+    source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
+    assert "SPLIT_BUDGETS" in source
+    assert "not spec.prefix_exact" in source
+    assert "shard_tag=tag" in source
+    # Round-robin, not contiguous: cost grows with the budget, so a contiguous
+    # split hands one worker every expensive budget.
+    assert "budgets[i::n]" in source
+
+
+def test_baseline_notebook_merges_shards_back_into_one_results_file():
+    """Downstream must not need to know a run was sharded."""
+    source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
+    assert "main.merge_budget_shards" in source
+
+
+def test_baseline_notebook_does_not_fit_palm():
+    """PALM belongs to evaluate_al_sampler.ipynb, which reads these files.
+
+    Checks the run path, not the word: the intro cell legitimately explains
+    that PALM is deferred, so a substring test would pass on that prose.
+    """
+    source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
+    assert "palm_evaluate" not in source
+    assert "_fit_palm" not in source
+
+
+def test_baseline_notebook_archive_slug_names_the_sampler():
+    """Two baselines archived without the sampler in the slug would collide on
+    publish -- `dataset-metadata.json` derives from what THIS run produced."""
+    source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
+    assert 'SLUG = f"{DATASET}-baseline-{SAMPLER}"' in source
 
 
 def test_cellvit_wheel_is_installed_with_no_deps():

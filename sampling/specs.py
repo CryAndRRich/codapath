@@ -55,10 +55,6 @@ SAMPLER_SPECS: Dict[str, SamplerSpec] = {
     # --- single pass, prefix-exact: one greedy order serves every budget ---
     "random": SamplerSpec("single", True, why="uniform draw; a prefix is still uniform"),
     "coreset": SamplerSpec("single", True, why="k-center greedy order is budget-free"),
-    "codapath": SamplerSpec(
-        "single", True, needs=("text_embeddings",),
-        why="greedy on a fixed VLM score; order is budget-free",
-    ),
     # --- single pass, NOT prefix-exact: the single pass reads B ---
     "typiclust": SamplerSpec(
         "single", False, why="num_clusters = min(labeled + B, MAX) depends on B",
@@ -89,6 +85,13 @@ SAMPLER_SPECS: Dict[str, SamplerSpec] = {
         why="probes are retrained and sigma re-adapts every round",
     ),
 }
+
+# Every sampler that needs neither a CellViT cell view nor a VLM text prior, so
+# it can run from the DINOv2 visual cache alone. Derived rather than hand-listed
+# a second time, so it cannot drift out of sync with SAMPLER_SPECS itself.
+BASELINE_SAMPLERS = frozenset(
+    name for name in SAMPLER_SPECS if name != "scalpel"
+)
 
 
 def spec_for(name: str) -> SamplerSpec:

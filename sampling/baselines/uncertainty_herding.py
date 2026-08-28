@@ -1,3 +1,4 @@
+import time
 from typing import List
 
 import numpy as np
@@ -56,6 +57,7 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
     device = kwargs["device"]
     chunk_size = kwargs.get("chunk_size", 2000)
     num_rounds = kwargs.get("num_rounds", 5)
+    trace = kwargs.get("trace")
 
     from training.probe import train_probe
 
@@ -90,6 +92,10 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
         n_select = round_sizes[round_idx]
         if n_select <= 0:
             continue
+        round_started = time.time()
+        picked_before = len(selected_indices)
+        if trace is not None:
+            trace.start_round(round_idx)
 
         if round_idx > 0 and len(selected_indices) >= 2:
             sel_feats = features[selected_indices]
@@ -145,6 +151,11 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
             best_idx = -1
             best_score = -float("inf")
             best_k_col = None
+            # Second-best acquisition value across ALL chunks. A pick whose
+            # score barely beats the runner-up is a pick the objective did not
+            # really discriminate; that gap is the degeneracy signal a "returns
+            # N unique indices" check cannot see, so it is recorded per step.
+            runner_up = -float("inf")
 
             for cs in range(0, num_samples, chunk_size):
                 ce = min(cs + chunk_size, num_samples)
@@ -161,15 +172,45 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
                         scores[si - cs] = -float("inf")
 
                 local_best = torch.argmax(scores).item()
-                if scores[local_best].item() > best_score:
-                    best_score = scores[local_best].item()
+                local_best_score = scores[local_best].item()
+                if scores.numel() > 1:
+                    top2 = torch.topk(scores, 2).values
+                    local_runner_up = top2[1].item()
+                else:
+                    local_runner_up = -float("inf")
+                if local_best_score > best_score:
+                    # The old best is this chunk's runner-up if it beats the
+                    # chunk's own second place.
+                    runner_up = max(best_score, local_runner_up)
+                    best_score = local_best_score
                     best_idx = cs + local_best
                     best_k_col = k_vals[:, local_best].clone()
+                else:
+                    runner_up = max(runner_up, local_best_score)
 
                 del cand, sim, dist_sq, k_vals, gain, scores
                 clear_memory()
 
             if best_idx >= 0 and best_idx not in selected_set:
+                if trace is not None:
+                    # Read coverage BEFORE the k_running update below: after it,
+                    # the point covers itself (k(x,x)=1) and the number would be
+                    # a constant 1 for every step. What is wanted is how well
+                    # the ALREADY-selected set covered this point when it was
+                    # chosen -- a low value is why it was worth picking.
+                    trace.add_step(
+                        best_idx,
+                        # The UHerding acquisition value itself: uncertainty-
+                        # weighted coverage gain summed over the pool.
+                        score=best_score,
+                        margin_to_runner_up=(
+                            None if runner_up == -float("inf") else best_score - runner_up
+                        ),
+                        # The two factors kept apart, so a later plot can ask
+                        # which one actually drove the pick.
+                        uncertainty=U[best_idx].item(),
+                        coverage=k_running[best_idx].item(),
+                    )
                 selected_indices.append(best_idx)
                 selected_set.add(best_idx)
                 k_running = torch.maximum(k_running, best_k_col)
@@ -177,6 +218,17 @@ def uncertainty_herding_sampling(**kwargs) -> List[int]:
                 clear_memory()
             else:
                 break
+
+        if trace is not None:
+            trace.add_round(
+                # What was actually picked, not what the round asked for: the
+                # greedy above breaks early once no unselected candidate wins.
+                num_selected=len(selected_indices) - picked_before,
+                seconds=time.time() - round_started,
+                sigma=sigma,
+                weights=U.detach().cpu().numpy(),
+                bootstrap_sigma=bool(round_idx == 0),
+            )
 
     del features, U, k_running
     clear_memory()

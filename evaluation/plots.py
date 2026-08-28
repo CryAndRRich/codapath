@@ -110,7 +110,7 @@ def plot_acc_diff(
         for i, m in enumerate(methods)
     }
     for m in methods:
-        if m.lower() in {"codapath", "scalpel"}:
+        if m.lower() == "scalpel":
             style[m]["linewidth"] = 2.5
             style[m]["markersize"] = 9
             style[m]["zorder"] = 10

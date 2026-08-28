@@ -18,6 +18,7 @@ L2-normalized features; `1 - cosine` here is the same quantity up to a factor
 of two, so the argmax over typicality is unchanged.
 """
 
+import time
 from typing import List
 
 import numpy as np
@@ -37,6 +38,7 @@ def typiclust_sampling(**kwargs) -> List[int]:
     device = kwargs["device"]
     chunk_size = kwargs["chunk_size"]
     existing_labeled_indices = kwargs.get("existing_labeled_indices", [])
+    trace = kwargs.get("trace")
 
     num_samples = image_embeddings.shape[0]
     K_NN = kwargs.get("k_nn", 20)
@@ -112,6 +114,10 @@ def typiclust_sampling(**kwargs) -> List[int]:
     selected_indices = []
     selected_set = set(existing_labeled_indices)
 
+    started = time.time()
+    if trace is not None:
+        trace.start_round(0)
+
     i = 0
     with tqdm(total=max_budget, desc="TypiClust Selection") as pbar:
         while len(selected_indices) < max_budget:
@@ -122,6 +128,25 @@ def typiclust_sampling(**kwargs) -> List[int]:
                 cluster_typ = _typicality(features_tensor, available_indices)
                 best_local_idx = int(np.argmax(cluster_typ))
                 best_global_idx = available_indices[best_local_idx]
+
+                if trace is not None:
+                    # Typicality is TypiClust's whole acquisition value: local
+                    # density among the still-unlabeled members of this
+                    # cluster. It is a coverage-family quantity (no model, no
+                    # uncertainty), so it is recorded under `coverage`.
+                    best_typ = float(cluster_typ[best_local_idx])
+                    runner_up = (
+                        float(np.sort(cluster_typ)[-2]) if cluster_typ.size > 1 else None
+                    )
+                    trace.add_step(
+                        int(best_global_idx),
+                        score=best_typ,
+                        margin_to_runner_up=(
+                            None if runner_up is None else best_typ - runner_up
+                        ),
+                        coverage=best_typ,
+                        cluster=float(cluster),
+                    )
 
                 selected_indices.append(best_global_idx)
                 selected_set.add(best_global_idx)
@@ -134,11 +159,29 @@ def typiclust_sampling(**kwargs) -> List[int]:
             if i > len(valid_clusters) * max_budget:
                 break
 
+    num_random_fallback = 0
     if len(selected_indices) < max_budget:
         remaining = list(set(range(num_samples)) - selected_set)
         missing = max_budget - len(selected_indices)
         fallback = np.random.choice(remaining, missing, replace=False)
         selected_indices.extend(fallback.tolist())
+        num_random_fallback = len(fallback)
+        if trace is not None:
+            # Random top-up when the clusters ran dry: no typicality behind
+            # these, so they carry no score -- and the count is worth keeping,
+            # since a large one means the clustering, not typicality, decided
+            # most of this budget.
+            for index in fallback.tolist():
+                trace.add_step(int(index))
+
+    if trace is not None:
+        trace.add_round(
+            num_selected=len(selected_indices),
+            seconds=time.time() - started,
+            num_clusters=float(num_clusters),
+            valid_clusters=float(len(valid_clusters)),
+            random_fallback=float(num_random_fallback),
+        )
 
     del features_tensor
     del existing_count_per_cluster

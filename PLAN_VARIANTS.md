@@ -83,7 +83,7 @@ khác nhau, mỗi câu hỏi một bảng riêng.
 | Linear head đánh giá | DINOv2 | **CONCH** |
 | Vòng 1 | `U ≡ 1` (coverage thuần) | text embedding từ LLM description |
 | Training | linear probe | linear + LoRA + center loss (+ augment) |
-| Chạy cho | **mọi** sampler (13 cái) | chỉ pipeline đầy đủ |
+| Chạy cho | **11 baseline** + scalpel | chỉ pipeline đầy đủ |
 | Trả lời | "sampler nào chọn mẫu tốt hơn" | "pipeline đầy đủ có hơn DINO+linear không" |
 
 **Quy tắc một encoder xuyên suốt:** vòng 1 dùng encoder nào thì dùng encoder đó
@@ -172,10 +172,10 @@ viết bài và lúc set transform:
   adapter trên CONCH có thể bị coi là derivative — kiểm tra trước khi định
   release adapter.
 - HF yêu cầu email cơ quan là email **chính** của account, không nhận gmail.
-- **Input resolution của CONCH không tra được** từ model card, GitHub README hay
-  abstract arXiv — chỉ chắc chắn embedding 512-d. Phải đọc `open_clip` config
-  `conch_ViT-B-16` hoặc phần methods của bài Nature Medicine trước khi set
-  transform. Đừng đoán 224 rồi để nó âm thầm resize sai.
+- **448×448, OpenAI-CLIP normalize, tokenizer riêng, hai không gian embedding.**
+  Đã đọc code + paper, chi tiết đầy đủ ở `references/CONCH.md` và
+  `PLAN_IMPLEMENT.md` §10. Tóm tắt: dùng `preprocess` do
+  `create_model_from_pretrained` trả về, đừng tự viết transform.
 
 Các model ungated còn lại giữ trong bảng làm phương án thay thế nếu CONCH gặp
 vấn đề license hoặc access, không phải để chạy hết.
@@ -209,8 +209,22 @@ Objective vẫn là UHerding: CODAPath dùng cosine trần làm kernel (không G
 không σ) và kết hợp bằng `(1−α)·coverage + α·U` — cộng, không phải
 `Σ U_n · gain`. Đừng để người đọc tưởng ta mượn cả objective.
 
-Trục phụ: `prompt_templates` (đã có 5 mẫu trong config) — dùng 1 mẫu hay
-ensemble trung bình cả 5.
+**τ: dùng `model.logit_scale.exp()` đã học** (ĐÃ CHỐT), không hard-code. Đó là
+cách code chính thức của CONCH tính, và checkpoint mang giá trị đã train.
+
+Trục phụ `description_style` — nay có thêm một baseline **bắt buộc**:
+
+| Option | Nguồn |
+|---|---|
+| `manual` | 1 câu viết tay trong `config.yaml` |
+| **`conch_official`** | 22 template × 4–5 classname/lớp, tác giả CONCH tinh chỉnh cho **đúng** NCT-CRC-HE-100K = 9 lớp PathMNIST |
+| `llm_short` / `llm_morphology` | LLM sinh |
+
+`conch_official` là đối thủ mạnh nhất và **phải** có trong bảng: contribution
+"LLM làm giàu nhãn" chỉ có giá trị nếu thắng được prompt do người viết. Cách
+ensemble phải theo đúng bản gốc — normalize **từng** (classname × template), mean
+cả hai chiều, rồi normalize lại. Chỉ PathMNIST có file này; HistoSet/SkinTissue
+không có.
 
 ---
 

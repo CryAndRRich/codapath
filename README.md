@@ -19,9 +19,7 @@ Three contributions, at three different points in the pipeline:
 (margin, entropy, BADGE) or on pure coverage (Uncertainty Herding, TypiClust).
 Both are label-blind. Instead: have an LLM write a rich description per class,
 encode those with a pathology VLM's text tower, and score the pool against them
-zero-shot — so round 1 already carries semantic signal. The machinery exists
-(`sampling/baselines/codapath.py` builds dual-VLM text prototypes); wiring it in
-as SCALPEL's round-1 weight is *not implemented yet*.
+zero-shot — so round 1 already carries semantic signal. *Not implemented yet.*
 
 **2. Cell-vs-visual disagreement as the acquisition signal.** Implemented, and
 the current SCALPEL. Keep Uncertainty Herding's objective exactly as published
@@ -117,7 +115,7 @@ The axes are orthogonal, and every combination is populated:
 
 |                | prefix-exact | not prefix-exact |
 |---|---|---|
-| **single pass** | `random`, `coreset`, `codapath` | `typiclust`, `activeft` |
+| **single pass** | `random`, `coreset` | `typiclust`, `activeft` |
 | **multi round** | `tcm` (once B ≥ 3·C) | `margin`, `entropy`, `badge`, `dropquery`, `uncertainty_herding`, `refine`, `scalpel` |
 
 `typiclust` and `activeft` make exactly one pass yet are *not* prefix-exact,
@@ -131,11 +129,11 @@ by B is not prefix-exact, however one-shot it looks. That is why
 `uncertainty_herding` is False (its phase switch sits at `0.2·B`) and why
 `refine` is False too — its stage-2 head *is* Uncertainty Herding.
 
-A third field, `needs`, lists the extra pool arrays a sampler wants
-(`text_embeddings` for `codapath`, the cell view for `scalpel`). It is **not** a
-classification axis. An earlier version of this file split samplers into three
-sets where two differed only by this field, which read as a third category that
-does not exist — and led to real bugs.
+A third field, `needs`, lists the extra pool arrays a sampler wants (the cell
+view, for `scalpel`). It is **not** a classification axis. An earlier version
+of this file split samplers into three sets where two differed only by this
+field, which read as a third category that does not exist — and led to real
+bugs.
 
 ---
 
@@ -155,7 +153,6 @@ implementation it was verified against, and every deliberate deviation.
 | `dropquery` | TMLR 2024 | `repos/dropquery/ALFM/.../dropout.py` |
 | `uncertainty_herding` | Bae et al., ICLR 2025 | `repos/uherding/.../uherding.py` + paper |
 | `refine` | CVPR 2026 | `repos/refine/.../strategies.py` + official run config |
-| `codapath` | this project (earlier work) | — |
 | `scalpel` | this project | — |
 
 Baselines are the foundation of every claim, so fidelity beats convenience:
@@ -246,7 +243,7 @@ in results and manifests.
 
 ## Notebooks (Kaggle)
 
-Four, one per pipeline stage. Each clones and verifies the pinned branch,
+Five, one per pipeline stage. Each clones and verifies the pinned branch,
 installs from `requirements.txt`, and zips its output so a session downloads as
 one file.
 
@@ -254,8 +251,16 @@ one file.
 |---|---|
 | `extract_visual_features.ipynb` | DINOv2 features, once per (dataset, seed) |
 | `extract_nucleus_features.ipynb` | CellViT cache; runs preflight first |
-| `run_al_sampler.ipynb` | one sampler, several configs back to back |
+| `run_al_baseline.ipynb` | one of the 11 published baselines; no CellViT, no VLM |
+| `run_al_sampler.ipynb` | `scalpel`, this project's own method, several configs back to back |
 | `evaluate_al_sampler.ipynb` | reload saved probes and rebuild the comparison table |
+
+`run_al_baseline.ipynb` and `run_al_sampler.ipynb` are deliberately separate
+notebooks rather than one with a bigger menu: a baseline run only needs the
+DINOv2 visual cache, and asserting that at the top of its own notebook
+(`sampling.specs.BASELINE_SAMPLERS`) catches picking `scalpel` there before any
+GPU time is spent, instead of failing deep inside `main.py` on the first
+budget.
 
 Publishing `/kaggle/working/<name>` as a Kaggle Dataset remounts it one level
 deeper (`.../<name>/<name>`), so the notebooks *search* for their caches instead
@@ -268,9 +273,26 @@ cache is only valid for the seed it was built with.
 
 ### Two GPUs
 
-`run_al_sampler.ipynb` splits its variants across both cards of a Kaggle
-**T4 x2** session, one worker process per GPU (`utils/parallel.py`). Set
-`PARALLEL = False` for serial.
+`run_al_baseline.ipynb` and `run_al_sampler.ipynb` both split their variants
+across both cards of a Kaggle **T4 x2** session, one worker process per GPU
+(`utils/parallel.py`). Set `PARALLEL = False` for serial.
+
+Splitting by variant only helps when there is more than one variant, and the
+common case — one sampler, one seed — is a single job that can occupy only one
+card. `run_al_baseline.ipynb` therefore also splits the **budget list**
+(`SPLIT_BUDGETS`), which is sound precisely for the samplers where every budget
+is already an independent run: `spec.prefix_exact == False`. The flag itself
+decides, so a new sampler cannot drift out of sync with a hand-kept list. A
+prefix-exact sampler (`random`, `coreset`, `tcm`) derives its whole sweep from
+one selection pass, so sharding it would repeat that pass per shard; `main.run`
+refuses a `shard_tag` for those rather than silently doing more work.
+
+Budgets are dealt round-robin, not contiguously, because cost grows with the
+budget — a contiguous split would hand one worker every expensive budget. Each
+shard writes its own `<run>_<tag>_results.pt` and log (the per-budget files are
+already named by budget and never collide), and `main.merge_budget_shards`
+folds them into the single `<run>_results.pt` an unsharded run would have
+written, so nothing downstream needs to know a run was split.
 
 Processes, not threads: each run calls `set_seed`, which mutates global RNG
 state and an environment variable, so two threads doing it in one interpreter
@@ -307,8 +329,20 @@ Per budget, under `checkpoints/<dataset>/`:
 | `<run>_probe_budget_<B>.pt` | the probe's linear weights, plus run/budget/seed metadata |
 | `<run>_predictions_budget_<B>.pt` | test-set class probabilities and true labels |
 | `<run>_results.pt` | accuracy / precision / recall / macro-F1 and timings for every budget |
-| `<run>_palm.pt` | fitted PALM parameters |
 | `<run>.log` | everything printed during the run |
+
+The per-step trace inside `<run>_selected_budget_<B>.pt` carries each pick's
+acquisition `score` and, where the method computes them as separate factors,
+its `uncertainty` and `coverage` terms — so a later plot can ask which of the
+two actually drove a selection. A sampler records only what it genuinely
+computes: `coreset`, `typiclust` and `activeft` fit no classifier and so have
+no uncertainty, and `random` has no score at all.
+
+A run reports **accuracy, precision, recall and macro-F1 only**. PALM and every
+other curve-level metric are fitted by `evaluate_al_sampler.ipynb` from these
+files: the fit needs the whole sweep to have finished, which a resumed or
+GPU-split run cannot guarantee mid-sweep, and re-fitting costs seconds against
+re-running the sweep.
 
 `<run>` defaults to the sampler name, extended for `scalpel` with the config
 axes that would otherwise overwrite each other
@@ -353,7 +387,8 @@ away the hours already spent, so findings are reported, not enforced.
 
 Accuracy at a handful of budgets is a noisy ranking: a method can win at one
 budget and lose at the next. PALM fits the whole learning curve and reports
-interpretable parameters instead.
+interpretable parameters instead. It is fitted in `evaluate_al_sampler.ipynb`,
+not during a run — the fit needs every budget of the sweep to be present.
 
 | PALM metric | Meaning | Better |
 |---|---|---|
@@ -402,7 +437,10 @@ total and pool cap). They are kept as a regression reference only — for "did t
 rewrite move this baseline, and by how much", not as reported results.
 
 `SCALPEL` in these tables is the retired stain-shortcut method (v9), unrelated
-to the current disagreement-based sampler of the same name.
+to the current disagreement-based sampler of the same name. `CODAPath`, this
+project's own earlier dual-VLM sampler, has since been **deleted from the
+code** (`sampling/baselines/codapath.py`); it appears in these tables only as
+historical measurement, never as a runnable sampler.
 
 ### HistoSet
 

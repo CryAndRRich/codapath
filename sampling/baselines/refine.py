@@ -1,3 +1,4 @@
+import time
 from typing import List
 
 import numpy as np
@@ -20,6 +21,7 @@ def _stage2_coverage_select(
     probe_epochs: int,
     probe_lr: float,
     device,
+    trace=None,
 ) -> List[int]:
     """REFINE Eq. (2): B* = argmax_{B⊂CR,|B|=b} E_x[max_{x'∈(Lt∪B)} k(x,x')].
 
@@ -34,6 +36,7 @@ def _stage2_coverage_select(
     """
     from training.probe import train_probe
 
+    stage2_started = time.time()
     cand_t = torch.as_tensor(candidate_indices, device=device, dtype=torch.long)
     cand_feats = features[cand_t]
 
@@ -102,11 +105,42 @@ def _stage2_coverage_select(
             scores[si] = -float("inf")
 
         best_local = int(torch.argmax(scores).item())
+        if trace is not None:
+            # Stage 2 IS UHerding, so the same three quantities are recorded:
+            # the uncertainty-weighted coverage gain that won the argmax, and
+            # the uncertainty and coverage factors kept separately. Coverage is
+            # read before the k_running update below, so it says how well the
+            # already-selected set covered this point when it was picked.
+            best_score = float(scores[best_local].item())
+            finite = scores[torch.isfinite(scores)]
+            runner_up = (
+                float(torch.topk(finite, 2).values[1].item())
+                if finite.numel() > 1 else None
+            )
+            trace.add_step(
+                int(candidate_indices[best_local]),
+                score=best_score,
+                margin_to_runner_up=(
+                    None if runner_up is None else best_score - runner_up
+                ),
+                uncertainty=float(U[best_local].item()),
+                coverage=float(k_running[best_local].item()),
+            )
         selected_local.append(best_local)
         selected_set.add(best_local)
         k_running = torch.maximum(k_running, k_vals[:, best_local])
         del sim, dist_sq, k_vals, gain, scores
         clear_memory()
+
+    if trace is not None:
+        trace.add_round(
+            num_selected=len(selected_local),
+            seconds=time.time() - stage2_started,
+            sigma=sigma,
+            weights=U.detach().cpu().numpy(),
+            stage=2.0,
+            refined_pool_size=float(n_cand),
+        )
 
     return [candidate_indices[i] for i in selected_local]
 
@@ -145,6 +179,7 @@ def refine_sampling(**kwargs) -> List[int]:
     probe_lr         = kwargs.get("probe_lr", 1e-3)
     chunk_size       = kwargs.get("chunk_size", 2000)
     num_rounds       = kwargs.get("num_rounds", 5)
+    trace            = kwargs.get("trace")
 
     num_samples = image_embeddings.shape[0]
     # Official ensemble (publications/cleaning_the_pool/strategies.py::Refine)
@@ -174,10 +209,17 @@ def refine_sampling(**kwargs) -> List[int]:
         b = cycle_sizes[cycle_idx]
         if b <= 0:
             continue
+        if trace is not None:
+            trace.start_round(cycle_idx)
 
         # --- Stage 1: progressive filtering over the CURRENT unlabeled pool ---
         pool_indices = [i for i in range(num_samples) if i not in selected_set]
         if len(pool_indices) <= b:
+            if trace is not None:
+                # Pool exhausted: everything left is taken wholesale, so no
+                # coverage score was computed for any of it.
+                for index in pool_indices:
+                    trace.add_step(int(index))
             selected_indices.extend(pool_indices)
             selected_set.update(pool_indices)
             continue
@@ -232,14 +274,20 @@ def refine_sampling(**kwargs) -> List[int]:
         # --- Stage 2: uncertainty-weighted coverage select over the refined pool ---
         cycle_picks = _stage2_coverage_select(
             features, pool_indices, selected_indices, oracle_labels, num_classes,
-            b, probe_epochs, probe_lr, device,
+            b, probe_epochs, probe_lr, device, trace=trace,
         )
 
         if len(cycle_picks) < b:
             used = selected_set | set(cycle_picks)
             extras = [i for i in range(num_samples) if i not in used]
             need = b - len(cycle_picks)
-            cycle_picks.extend(np.random.choice(extras, min(need, len(extras)), replace=False).tolist())
+            filler = np.random.choice(extras, min(need, len(extras)), replace=False).tolist()
+            if trace is not None:
+                # The refined pool ran out; these are random fill, not
+                # coverage picks, so they carry no score.
+                for index in filler:
+                    trace.add_step(int(index))
+            cycle_picks.extend(filler)
 
         selected_indices.extend(cycle_picks)
         selected_set.update(cycle_picks)

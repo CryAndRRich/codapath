@@ -15,6 +15,7 @@ starts from an empty labeled set: clusters are ranked by size alone, since the
 "fewest existing labels first" key is constant at zero.
 """
 
+import time
 from typing import List
 
 import numpy as np
@@ -58,7 +59,8 @@ def _typicality(features: torch.Tensor, indices: List[int], k_nn: int,
 def _typiclust_phase(features: torch.Tensor,
                      num_select: int,
                      k_nn: int = 20,
-                     chunk_size: int = 5000) -> List[int]:
+                     chunk_size: int = 5000,
+                     trace=None) -> List[int]:
     num_samples = features.shape[0]
     feats_np = features.cpu().numpy()
 
@@ -94,7 +96,20 @@ def _typiclust_phase(features: torch.Tensor,
             available = cluster_members[cluster]
             if available:
                 typ = _typicality(features, available, k_nn, chunk_size)
-                best = available[int(np.argmax(typ))]
+                best_local = int(np.argmax(typ))
+                best = available[best_local]
+                if trace is not None:
+                    # Phase 1 is TypiClust: the score is typicality, a pure
+                    # coverage/density quantity with no model behind it.
+                    best_typ = float(typ[best_local])
+                    runner_up = float(np.sort(typ)[-2]) if typ.size > 1 else None
+                    trace.add_step(
+                        int(best), score=best_typ,
+                        margin_to_runner_up=(
+                            None if runner_up is None else best_typ - runner_up
+                        ),
+                        coverage=best_typ, phase=1.0,
+                    )
                 selected.append(best)
                 selected_set.add(best)
                 cluster_members[cluster] = [idx for idx in available if idx != best]
@@ -106,7 +121,12 @@ def _typiclust_phase(features: torch.Tensor,
     if len(selected) < num_select:
         remaining = list(set(range(num_samples)) - selected_set)
         missing = num_select - len(selected)
-        selected.extend(np.random.choice(remaining, missing, replace=False).tolist())
+        fallback = np.random.choice(remaining, missing, replace=False).tolist()
+        if trace is not None:
+            # Random top-up: no typicality behind these, so no score.
+            for index in fallback:
+                trace.add_step(int(index), phase=1.0)
+        selected.extend(fallback)
 
     return selected
 
@@ -139,10 +159,24 @@ def tcm_sampling(**kwargs) -> List[int]:
 
     from training.probe import train_probe
 
+    trace = kwargs.get("trace")
+
     features = torch.tensor(image_embeddings, device=device, dtype=torch.float32)
     features = F.normalize(features, p=2, dim=1)
 
-    phase1 = _typiclust_phase(features, transition_budget, k_nn=k_nn, chunk_size=chunk_size)
+    phase1_started = time.time()
+    if trace is not None:
+        trace.start_round(0)
+    phase1 = _typiclust_phase(
+        features, transition_budget, k_nn=k_nn, chunk_size=chunk_size, trace=trace,
+    )
+    if trace is not None:
+        trace.add_round(
+            num_selected=len(phase1),
+            seconds=time.time() - phase1_started,
+            phase=1.0,
+            transition_budget=float(transition_budget),
+        )
 
     if transition_budget >= max_budget:
         del features
@@ -158,10 +192,14 @@ def tcm_sampling(**kwargs) -> List[int]:
     # acquisition rather than scoring once and taking a single cut.
     step_budget = max(1, step_multiple * num_classes)
     phase2: List[int] = []
+    round_index = 1
 
     while len(phase2) < remaining_budget:
         current_need = min(step_budget, remaining_budget - len(phase2))
         labeled_so_far = phase1 + phase2
+        round_started = time.time()
+        if trace is not None:
+            trace.start_round(round_index)
 
         probe = train_probe(
             image_embeddings[labeled_so_far],
@@ -175,6 +213,25 @@ def tcm_sampling(**kwargs) -> List[int]:
         chosen = [unlabeled_indices[i] for i in order[:current_need]]
         del probe
 
+        if trace is not None:
+            # Phase 2 is Margin: uncertainty only, oriented larger = more
+            # uncertain to match every other sampler here.
+            uncertainty = 1.0 - margin
+            for local in order[:current_need]:
+                value = float(uncertainty[local])
+                trace.add_step(
+                    int(unlabeled_indices[local]),
+                    score=value, uncertainty=value, phase=2.0,
+                )
+            trace.add_round(
+                num_selected=len(chosen),
+                seconds=time.time() - round_started,
+                scores=uncertainty,
+                weights=uncertainty,
+                phase=2.0,
+            )
+
+        round_index += 1
         phase2.extend(chosen)
         chosen_set = set(chosen)
         unlabeled_indices = [i for i in unlabeled_indices if i not in chosen_set]
