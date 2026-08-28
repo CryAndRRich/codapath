@@ -81,10 +81,19 @@ def find_dir_containing(
 def find_data_root(candidates: Sequence[Path] = ()) -> Path:
     """First existing directory among the dataset-image mount candidates.
 
+    Caller-supplied candidates are tried FIRST and the standard Kaggle mount
+    points after them, rather than instead of them: a notebook naming its own
+    dataset should not thereby lose the fallback that finds a remounted slug.
+    Duplicates are dropped so a candidate that repeats a default is not probed
+    twice.
+
     Falls back to the first candidate (which may not exist yet) so a caller
     gets a concrete path to report in an assertion message rather than `None`.
     """
-    search = list(candidates) or list(_DEFAULT_SEARCH_ROOTS)
+    search: List[Path] = []
+    for path in [*candidates, *_DEFAULT_SEARCH_ROOTS]:
+        if path not in search:
+            search.append(path)
     return next((path for path in search if path.exists()), search[0])
 
 

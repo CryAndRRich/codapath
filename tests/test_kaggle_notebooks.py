@@ -174,6 +174,26 @@ def test_baseline_notebook_supports_resume_and_both_gpus():
     assert "_results.pt" in source and "skipped" in source
 
 
+def test_baseline_notebook_keeps_raw_images_and_features_as_separate_mounts():
+    """Two Kaggle Datasets, and the feature cache cannot stand in for the raw
+    images.
+
+    The cache holds DINOv2 matrices only. The oracle labels a sampler selects
+    on, the labels the probe trains against, and the sample-order fingerprint
+    that VALIDATES the cache all come from the dataset itself, so `main.run`
+    opens it either way. Dropping DATA_PATHS to "run from the cache alone"
+    fails inside `get_data_loaders` before the cache is ever consulted -- so
+    both mounts must stay declared and distinct.
+    """
+    source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
+    assert "DATA_ROOT" in source and "FEATURE_DIR" in source
+    assert "find_data_root(" in source
+    assert "DATA_PATHS" in source
+    # The raw-image loader must still be reached; the cache only replaces the
+    # backbone forward pass, never the dataset.
+    assert 'DATA_PATHS[DATASET]' in source
+
+
 def test_baseline_notebook_splits_budgets_by_the_prefix_exact_flag():
     """The GPU split must be decided by `spec.prefix_exact`, not a name list.
 

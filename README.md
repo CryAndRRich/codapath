@@ -268,6 +268,17 @@ of trusting a hard-coded path, and print what they found. Each notebook also
 writes a `dataset-metadata.json` next to its archive with a slug derived from
 the dataset and seed, so publishing needs no hand-typed paths.
 
+**A run needs two Kaggle Datasets attached, and the feature cache cannot stand
+in for the raw images.** `DATA_ROOT` is the raw dataset (`pathmnist_224.npz`,
+HistoSet, SkinTissue); `FEATURE_DIR` is the `.npy` cache
+`extract_visual_features.ipynb` published. The cache holds DINOv2 matrices and
+nothing else — the oracle labels a sampler selects on, the labels the probe
+trains against, and the sample-order fingerprint that *validates the cache
+itself* all come from the dataset, so `main.run` opens it either way. Attaching
+only the feature dataset fails inside `get_data_loaders`, before the cache is
+ever consulted. What the cache does buy is the backbone forward pass over ~90k
+images, which is the expensive part.
+
 Seeds matter: ImageFolder datasets are split by a seeded generator, so a feature
 cache is only valid for the seed it was built with.
 
