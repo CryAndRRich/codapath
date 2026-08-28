@@ -56,6 +56,10 @@ def parse_args():
     parser.add_argument("--max_estimated_hours", type=float, default=None)
     parser.add_argument("--max_cells_per_patch", type=int, default=None)
     parser.add_argument(
+        "--skip_crop_dino", action="store_true",
+        help="Estimate for a run that stores only CellViT cell embeddings.",
+    )
+    parser.add_argument(
         "--save_instance_maps", action="store_true",
         help="Include the compressed instance-map sidecar in the size estimate.",
     )
@@ -235,43 +239,54 @@ def main() -> None:
         f"(configured batch={args.cellvit_batch_size})"
     )
 
-    crop_dino = DINOCellCropEncoder(
+    crop_dino = None if args.skip_crop_dino else DINOCellCropEncoder(
         args.vit_name,
         device, batch_size=args.dino_crop_batch_size,
     )
-    crops = []
-    for patch in patches:
-        for instance_id, bbox in zip(patch.instance_ids, patch.bboxes):
-            crops.append(masked_nucleus_crop(
-                patch.rgb, patch.instance_map, int(instance_id), bbox,
-                padding=float(extraction.get("crop_padding", 0.25)),
-            ))
+    # With --skip_crop_dino none of this runs: the crops are never cut, the
+    # encoder is never built, and neither its bytes nor its hours belong in an
+    # estimate for a run that will not produce them.
+    if crop_dino is None:
+        dino_seconds = 0.0
+        crop_dino_dim = 0
+        print("[dino] skipped (--skip_crop_dino): no crop features will be stored")
+        dino_inputs = []
+    else:
+        crops = []
+        for patch in patches:
+            for instance_id, bbox in zip(patch.instance_ids, patch.bboxes):
+                crops.append(masked_nucleus_crop(
+                    patch.rgb, patch.instance_map, int(instance_id), bbox,
+                    padding=float(extraction.get("crop_padding", 0.25)),
+                ))
+                if len(crops) >= 8:
+                    break
             if len(crops) >= 8:
                 break
-        if len(crops) >= 8:
-            break
-    # Execute one full configured DINO batch even when the smoke patches contain
-    # fewer nuclei. Repeating a real crop is sufficient to test peak memory.
-    seed_inputs = crops or [Image.fromarray(patches[0].rgb)]
-    dino_inputs = [
-        seed_inputs[idx % len(seed_inputs)]
-        for idx in range(args.dino_crop_batch_size)
-    ]
-    crop_dino.encode(dino_inputs)  # warm-up
-    dino_start = time.perf_counter()
-    dino_features = crop_dino.encode(dino_inputs)
-    dino_seconds = time.perf_counter() - dino_start
-    if dino_features.shape != (len(dino_inputs), crop_dino.feature_dim):
-        raise RuntimeError("DINO crop feature shape mismatch")
-    if not np.all(np.isfinite(dino_features)):
-        raise RuntimeError("DINO crop features contain non-finite values")
-    print(
-        f"[dino] smoke feature shape={dino_features.shape} "
-        f"(configured batch={args.dino_crop_batch_size})"
-    )
+        # Execute one full configured DINO batch even when the smoke patches
+        # contain fewer nuclei. Repeating a real crop is sufficient to test peak
+        # memory.
+        seed_inputs = crops or [Image.fromarray(patches[0].rgb)]
+        dino_inputs = [
+            seed_inputs[idx % len(seed_inputs)]
+            for idx in range(args.dino_crop_batch_size)
+        ]
+        crop_dino.encode(dino_inputs)  # warm-up
+        dino_start = time.perf_counter()
+        dino_features = crop_dino.encode(dino_inputs)
+        dino_seconds = time.perf_counter() - dino_start
+        crop_dino_dim = crop_dino.feature_dim
+        if dino_features.shape != (len(dino_inputs), crop_dino_dim):
+            raise RuntimeError("DINO crop feature shape mismatch")
+        if not np.all(np.isfinite(dino_features)):
+            raise RuntimeError("DINO crop features contain non-finite values")
+        print(
+            f"[dino] smoke feature shape={dino_features.shape} "
+            f"(configured batch={args.dino_crop_batch_size})"
+        )
 
     mean_cells = detected / count
-    bytes_per_cell = 2 * (cellvit.embedding_dim + crop_dino.feature_dim) + 20
+    bytes_per_cell = 2 * (cellvit.embedding_dim + crop_dino_dim) + 20
     estimated_bytes = len(raw_dataset) * mean_cells * bytes_per_cell
     peak_bytes = 3 * estimated_bytes  # resumable shards + assembly memmap + final cache
 
@@ -306,7 +321,7 @@ def main() -> None:
         f"peak_disk≈{peak_bytes / 2**30:.2f} GiB (rough smoke estimate)"
     )
     seconds_per_patch = cellvit_seconds / count
-    seconds_per_crop = dino_seconds / len(dino_inputs)
+    seconds_per_crop = (dino_seconds / len(dino_inputs)) if dino_inputs else 0.0
     cellvit_hours = len(raw_dataset) * seconds_per_patch / 3600
     crop_dino_hours = (
         len(raw_dataset) * mean_cells * seconds_per_crop / 3600

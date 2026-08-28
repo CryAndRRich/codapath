@@ -31,8 +31,8 @@
                                                                             │
                         ┌──────────── VÒNG 2..5 (có nhãn rồi) ──────────────┤
                                                                             ▼
-   Image ──▶ visual encoder ──▶ visual embedding ──▶ probe_v ──┐
-                                                               ├──▶ disagreement
+   Image ──▶ visual encoder ──▶ visual embedding ──▶ probe_v ────────┐
+                                                                     ├──▶ disagreement
    Image ──▶ CellViT ──▶ nhiều cell embedding ──▶ pool ──▶ probe_c ──┘  = U
                                                                             │
                                                                             ▼
@@ -70,9 +70,38 @@ coverage kernel chạy trên không gian visual encoder. Text chỉ dùng làm *
 số vô hướng `U_n`**, không đi vào kernel. Đổi luôn coverage sang không gian VLM
 là chuyện khác và sẽ phá so sánh với baseline.
 
-**Ba trục lớn ⇒ ba câu hỏi tách biệt:**
+### 1.1 Hai protocol — hai claim, không bao giờ trộn một bảng
 
-| Câu hỏi | Trục | So với cái gì |
+**Đây là quyết định kiến trúc quan trọng nhất của cả dự án.** Có hai câu hỏi
+khác nhau, mỗi câu hỏi một bảng riêng.
+
+| | **Protocol A — so sánh chọn mẫu** | **Protocol B — so sánh pipeline** |
+|---|---|---|
+| Encoder | DINOv2, đóng băng | CONCH, **xuyên suốt** |
+| Coverage kernel | DINOv2 | CONCH visual |
+| `probe_v` (disagreement) | DINOv2 | CONCH visual |
+| Linear head đánh giá | DINOv2 | **CONCH** |
+| Vòng 1 | `U ≡ 1` (coverage thuần) | text embedding từ LLM description |
+| Training | linear probe | linear + LoRA + center loss (+ augment) |
+| Chạy cho | **mọi** sampler (13 cái) | chỉ pipeline đầy đủ |
+| Trả lời | "sampler nào chọn mẫu tốt hơn" | "pipeline đầy đủ có hơn DINO+linear không" |
+
+**Quy tắc một encoder xuyên suốt:** vòng 1 dùng encoder nào thì dùng encoder đó
+đến hết — kể cả linear head lúc đánh giá. Không có chuyện vòng 1 CONCH rồi vòng
+2 nhảy về DINOv2: `σ` và `K_n` đo ở không gian khác thì coverage tích luỹ từ
+vòng trước thành vô nghĩa.
+
+**Protocol B so với cái gì:** so với **kết quả tốt nhất của Protocol A**, tức
+là so pipeline-với-pipeline. KHÔNG so với một biến thể bị làm yếu của chính B.
+Nhờ vậy B thắng là thắng thật, và A vẫn là bảng xếp hạng sampler sạch (chỉ khác
+nhau đúng một biến: chọn mẫu nào).
+
+Hệ quả bắt buộc: `_default_run_name` phải encode backbone, nếu không hai
+protocol ghi đè lên nhau (xem `CLAUDE.md`).
+
+### 1.2 Control cho từng trục
+
+| Câu hỏi | Trục | Control |
 |---|---|---|
 | Xoá cold start có lợi không | §2 vs §3 | `round1_weight=uniform` |
 | Cell embedding có thêm gì không | §4, §5 | `uncertainty_mode=visual_margin` |
@@ -116,17 +145,44 @@ Trục nội dung description (`description_style`):
 
 ### 2.2 VLM (cần có **cả** image encoder và text encoder)
 
-| Option | HF repo | License | dim | Ghi chú |
-|---|---|---|---|---|
-| **KEEP** | `Astaxanthin/KEEP` | MIT | 768 | Mặc định. Zero-shot CRC tốt nhất nhóm ungated, init từ UNI |
-| **QuiltNet-B-16-PMB** | `wisdomik/QuiltNet-B-16-PMB` | MIT | 512 | Bản B-32 đạt 88.38% NCT-CRC-100K |
-| **PLIP** | `vinid/plip` | — | 512 | 87.88% NCT-CRC-100K. Baseline pathology-CLIP được cite nhiều nhất |
-| **BiomedCLIP** | `microsoft/BiomedCLIP-...` | MIT | 512 | General-biomedical chứ không thuần patho; yếu nhất nhóm |
+Ở Protocol B, VLM này là encoder **xuyên suốt** — coverage kernel, `probe_v`, và
+cả linear head lúc đánh giá đều dùng nó (§1.1).
 
-Tất cả đều ungated, 224×224, tải được trên Kaggle không cần xin quyền.
+| Option | HF repo | License | dim | Gated | Ghi chú |
+|---|---|---|---|---|---|
+| **CONCH** | `MahmoodLab/CONCH` | CC-BY-NC-ND-4.0 | 512 | **có** | Mặc định đã chọn |
+| KEEP | `Astaxanthin/KEEP` | MIT | 768 | không | Zero-shot CRC tốt nhất nhóm ungated, init từ UNI |
+| QuiltNet-B-16-PMB | `wisdomik/QuiltNet-B-16-PMB` | MIT | 512 | không | Bản B-32 đạt 88.38% NCT-CRC-100K |
+| PLIP | `vinid/plip` | — | 512 | không | 87.88% NCT-CRC-100K, baseline patho-CLIP được cite nhiều nhất |
+
+**Về gated:** không phải rào cản — xin quyền trên HF rồi thêm vào đầu notebook:
+
+```python
+import os
+from huggingface_hub import login
+login(HF_TOKEN)                              # token cá nhân, set khi import lên Kaggle
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+```
+
+Ba điều cần biết về CONCH — không ảnh hưởng việc chạy, nhưng ảnh hưởng lúc
+viết bài và lúc set transform:
+
+- License **CC-BY-NC-ND**: non-commercial, no-derivatives. Ràng buộc lúc publish
+  weight/model dẫn xuất, không ràng buộc việc dùng để chạy thí nghiệm. LoRA
+  adapter trên CONCH có thể bị coi là derivative — kiểm tra trước khi định
+  release adapter.
+- HF yêu cầu email cơ quan là email **chính** của account, không nhận gmail.
+- **Input resolution của CONCH không tra được** từ model card, GitHub README hay
+  abstract arXiv — chỉ chắc chắn embedding 512-d. Phải đọc `open_clip` config
+  `conch_ViT-B-16` hoặc phần methods của bài Nature Medicine trước khi set
+  transform. Đừng đoán 224 rồi để nó âm thầm resize sai.
+
+Các model ungated còn lại giữ trong bảng làm phương án thay thế nếu CONCH gặp
+vấn đề license hoặc access, không phải để chạy hết.
 
 **Không đổi `vlm_primary`/`vlm_secondary` trong config** — hai khoá đó là của
-baseline CODAPath, đổi là làm baseline khác paper. Thêm khoá riêng `vlm_round1`.
+baseline CODAPath, đổi là làm baseline khác paper. Thêm khoá riêng cho pipeline
+này.
 
 ### 2.3 Biến text+image thành `U_n`
 
@@ -139,6 +195,19 @@ baseline CODAPath, đổi là làm baseline khác paper. Thêm khoá riêng `vlm
 
 `text_maxsim` và `text_margin` **không tương đương**, và trực giác không quyết
 định được cái nào tốt hơn — phải chạy cả hai rồi báo cáo cái nào thắng.
+
+**Margin ở đây là margin thuần** `1 − (p₁ − p₂)` trên `softmax(cos/τ)`, KHÔNG
+phải công thức `(1−margin)·(1+JSD)` của baseline CODAPath. Lý do: JSD trong
+CODAPath là giữa `probs` và **one-hot của chính argmax của nó** — đó là thước đo
+độ "nhọn" của phân phối, không liên quan gì đến JSD visual↔cell ở vòng 2–5 dù
+trùng tên. Dùng margin thuần thì cả pipeline có đúng một định nghĩa margin,
+giống hệt `visual_margin` ở vòng 2–5, và hệ số `(1+JSD)` không âm thầm quay lại
+dưới một cái tên giờ đã mang nghĩa khác.
+
+Cái "tương tự CODAPath" chỉ là **phần lấy text embedding** (và loss phụ ở §6).
+Objective vẫn là UHerding: CODAPath dùng cosine trần làm kernel (không Gaussian,
+không σ) và kết hợp bằng `(1−α)·coverage + α·U` — cộng, không phải
+`Σ U_n · gain`. Đừng để người đọc tưởng ta mượn cả objective.
 
 Trục phụ: `prompt_templates` (đã có 5 mẫu trong config) — dùng 1 mẫu hay
 ensemble trung bình cả 5.
@@ -253,13 +322,16 @@ bằng 0, blend thì không. Ở budget nhỏ điều này đổi hẳn tập ch
 
 ## 6. Training sau khi đủ budget
 
-Hai protocol tách biệt, **không trộn bảng**:
+Xem §1.1 cho định nghĩa hai protocol. Nhắc lại phần liên quan đến training:
 
-- **Protocol A** (đang có): visual encoder đóng băng + linear probe. Chạy cho
-  mọi sampler. Đây là bảng so sánh sampler, giữ nguyên không đổi.
-- **Protocol B** (mới): ± finetune backbone + loss phụ. Chạy trên **tập chỉ số
-  đã chọn sẵn** từ Protocol A (đọc `<run>_selected_budget_<B>.pt`), **không
-  chọn mẫu lại**. Nhờ vậy B không ảnh hưởng câu hỏi "sampler nào tốt hơn".
+- **Protocol A**: DINOv2 đóng băng + linear probe, chạy cho mọi sampler. Đây là
+  bảng so sánh sampler và **giữ nguyên không đổi**.
+- **Protocol B**: CONCH xuyên suốt, **chọn mẫu lại bằng chính CONCH** (không tái
+  dùng chỉ số của A — chọn trong không gian CONCH là một phần của pipeline đang
+  được đánh giá), rồi train linear + LoRA + center loss trên CONCH.
+
+Vì B chọn mẫu lại, nó **không** là ablation của A và không được đặt cùng bảng.
+B so với **kết quả tốt nhất của A**: pipeline-với-pipeline.
 
 ### 6.1 Train cái gì (`train_mode`)
 
@@ -282,7 +354,7 @@ DINO" thì bắt buộc có cấu hình `backbone=dinov2-base` để cô lập b
 | Option | Cần gì | Ghi chú |
 |---|---|---|
 | **`none`** | — | **Control bắt buộc** |
-| `center` | 1 center/lớp học cùng | Rẻ và ổn định nhất ở ít mẫu |
+| **`center`** ⬅ | 1 center/lớp học cùng | **Đã chốt: thử cái này trước.** Không cần ≥2 mẫu/lớp trong batch nên chạy được ở mọi budget |
 | `supcon` | nhãn + augmentation | Cần **≥2 mẫu/lớp trong batch** — ở budget 25 với 9 lớp là không đủ, phải guard chứ không được lặng lẽ sai |
 | `triplet` | mining + `margin` | Dễ collapse ở ít mẫu |
 | `arcface` / `cosface` | margin góc | Ổn định hơn triplet |
@@ -296,10 +368,18 @@ tính, đúng cách SupCon làm) / `logits`.
 **Trọng số** `aux_weight ∈ {0, 0.01, 0.1, 0.5, 1.0}`. `aux_weight=0` phải cho
 kết quả giống hệt `aux_loss=none` — cũng là một test.
 
-**Xung đột phải nhớ:** `probe_consistency` kéo hai probe đồng ý sẽ triệt tiêu
-đúng cái divergence mà §5 chọn mẫu dựa trên. Trong Protocol B thì hai việc ở
-hai thời điểm khác nhau (chọn mẫu xong trước khi train) nên **không xung đột** —
-nhưng chỉ vì B không chọn mẫu lại. Gộp vào vòng AL là xung đột quay lại.
+**LoRA và loss phụ CHỈ ở lần train cuối.** Trong 5 vòng AL, hai probe
+visual/cell là linear probe trên feature **đóng băng**, train xong dùng để tính
+`U_n` rồi bỏ đi — không LoRA, không loss phụ, không cập nhật backbone. Backbone
+chỉ được finetune **một lần duy nhất**, sau khi đã chọn đủ B ảnh.
+
+Vì thế `probe_consistency` không xung đột với disagreement: lúc loss phụ chạy
+thì việc chọn mẫu đã xong hẳn, embedding dùng để chọn mẫu không bao giờ bị loss
+phụ làm thay đổi. Điều kiện để giữ tính chất này là **thứ tự**: chọn hết → mới
+train. Nếu sau này ai đó cập nhật backbone giữa các vòng (LoRA rồi vòng sau chọn
+trên embedding mới) thì xung đột kích hoạt, và khi đó `probe_consistency` với
+`disagreement` không được dùng cùng lúc. Với `center` (đã chốt) thì không có vấn
+đề này trong cả hai trường hợp.
 
 ### 6.3 Điều phải báo cáo dù kết quả xấu
 

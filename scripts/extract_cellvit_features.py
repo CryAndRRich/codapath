@@ -76,6 +76,13 @@ def parse_args():
     parser.add_argument("--max_cells_per_patch", type=int, default=None)
     parser.add_argument("--qc_count", type=int, default=16)
     parser.add_argument(
+        "--skip_crop_dino", action="store_true",
+        help="Do not compute the masked-crop DINOv2 features. Halves runtime and "
+             "drops cell_dino_features.npy (~2/3 of the cache) — but a run with "
+             "cell_source='crop_dino' then has nothing to read, so that ablation "
+             "would need re-extraction.",
+    )
+    parser.add_argument(
         "--save_instance_maps", action="store_true",
         help="Also store CellViT's per-pixel instance map for every patch, "
              "zlib-compressed. This is the raw segmentation output, kept for "
@@ -218,7 +225,7 @@ def main() -> None:
             min_cell_area=extraction.get("min_cell_area", 10),
             max_cells_per_patch=max_cells_per_patch,
         )
-        crop_dino = DINOCellCropEncoder(
+        crop_dino = None if args.skip_crop_dino else DINOCellCropEncoder(
             vit_name,
             device,
             batch_size=(
@@ -261,15 +268,34 @@ def main() -> None:
             # with batches that did not: the blob would be missing patches and
             # its offsets index would silently misalign with the patch order.
             "save_instance_maps": bool(args.save_instance_maps),
+            # Same reasoning as save_instance_maps: batches written with and
+            # without the crop features cannot be assembled into one cache.
+            "skip_crop_dino": bool(args.skip_crop_dino),
         }
         state_path = os.path.join(build_dir, "state.json")
         if os.path.exists(state_path):
             with open(state_path, "r", encoding="utf-8") as f:
                 previous_state = json.load(f)
-            if previous_state != build_state:
+            comparable, previous = dict(build_state), dict(previous_state)
+            if args.assemble_only:
+                # Assembly writes no batch, so the flags that describe HOW
+                # batches were produced do not have to be repeated on the
+                # assembly call — it reads what the shards actually contain.
+                # Demanding them here would turn a two-command workflow into a
+                # trap: the natural `--assemble_only` invocation would be
+                # rejected for "settings differ" after hours of extraction.
+                for axis in ("save_instance_maps", "skip_crop_dino"):
+                    comparable.pop(axis, None)
+                    previous.pop(axis, None)
+            if comparable != previous:
+                differing = sorted(
+                    key for key in set(comparable) | set(previous)
+                    if comparable.get(key) != previous.get(key)
+                )
                 raise RuntimeError(
-                    "Partial extraction settings differ from this run. Inspect "
-                    f"{state_path}, then rerun with --overwrite to restart."
+                    "Partial extraction settings differ from this run "
+                    f"({', '.join(differing)}). Inspect {state_path}, then "
+                    "rerun with --overwrite to restart."
                 )
             print(f"[nucleus] Resuming partial extraction from {build_dir}")
         else:
@@ -345,19 +371,30 @@ def main() -> None:
                         os.path.join(qc_dir, f"{start + local_idx:06d}.png"),
                         patch.rgb, patch.instance_map,
                     )
-                for instance_id, bbox in zip(patch.instance_ids, patch.bboxes):
-                    crops.append(masked_nucleus_crop(
-                        patch.rgb, patch.instance_map, int(instance_id), bbox,
-                        padding=float(extraction.get("crop_padding", 0.25)),
-                    ))
+                if not args.skip_crop_dino:
+                    # Cropping is not free either: it copies and masks a region
+                    # per nucleus, so skip it with the forward pass it feeds.
+                    for instance_id, bbox in zip(patch.instance_ids, patch.bboxes):
+                        crops.append(masked_nucleus_crop(
+                            patch.rgb, patch.instance_map, int(instance_id), bbox,
+                            padding=float(extraction.get("crop_padding", 0.25)),
+                        ))
                 batch_cellvit.append(patch.embeddings)
                 batch_confidence.append(patch.confidence)
                 batch_bboxes.append(patch.bboxes)
 
-            encoded_crops = crop_dino.encode(crops)
             batch_cells = sum(len(patch.instance_ids) for patch in patches)
-            if len(encoded_crops) != batch_cells:
-                raise RuntimeError("Crop-DINO rows do not align with CellViT cells")
+            if args.skip_crop_dino:
+                # Zero columns, not zero rows: every shard keeps the same key
+                # set and the same row count, so the assembly pass needs no
+                # special case and a misaligned shard still fails its check.
+                encoded_crops = np.empty((batch_cells, 0), dtype=np.float16)
+            else:
+                encoded_crops = crop_dino.encode(crops)
+                if len(encoded_crops) != batch_cells:
+                    raise RuntimeError(
+                        "Crop-DINO rows do not align with CellViT cells"
+                    )
             temporary_shard_path = f"{shard_path}.tmp.npz"
             np.savez(
                 temporary_shard_path,
@@ -451,11 +488,43 @@ def main() -> None:
                 f"Batch files carry {cellvit_dim}-d CellViT tokens but the loaded "
                 f"model produces {cellvit.embedding_dim}-d"
             )
-        if crop_dino is not None and crop_dino_dim != crop_dino.feature_dim:
+        # Zero columns is how a --skip_crop_dino shard records itself. Deciding
+        # from the DATA rather than the flag keeps --assemble_only correct when
+        # the flag is not repeated on the assembly call.
+        has_crop_dino = crop_dino_dim > 0
+        if crop_dino is not None and has_crop_dino and crop_dino_dim != crop_dino.feature_dim:
             raise RuntimeError(
                 f"Batch files carry {crop_dino_dim}-d crop-DINO features but the "
                 f"loaded model produces {crop_dino.feature_dim}-d"
             )
+        if not has_crop_dino:
+            print(
+                "[nucleus] shards carry no crop-DINO features "
+                "(--skip_crop_dino); cell_dino_features.npy will not be written"
+            )
+        # Assembly is the disk peak of the whole run: the merged memmaps live in
+        # .build while save_cellvit_cache writes a second copy into the cache
+        # directory, so both exist at once. Check for room BEFORE writing
+        # anything, using the widths just read rather than assumed ones, so a
+        # shortfall is a clear message here instead of an ENOSPC part-way
+        # through a multi-GiB write that leaves a half-built cache behind.
+        row_bytes = 2 * cellvit_dim + 2 * crop_dino_dim + 4 + 16  # dim 0 when skipped
+        needed = 2 * int(total_cells) * row_bytes
+        free = shutil.disk_usage(cache_root).free
+        print(
+            f"[nucleus] assembly needs ~{needed / 2**30:.2f} GiB "
+            f"(memmap + cache copy), free {free / 2**30:.2f} GiB"
+        )
+        if free < needed:
+            raise RuntimeError(
+                f"Not enough disk to assemble: need ~{needed / 2**30:.2f} GiB, "
+                f"have {free / 2**30:.2f} GiB free at {cache_root}. The .build "
+                "shards are intact, so free space and re-run with "
+                "--assemble_only; do NOT restart extraction. On Kaggle the "
+                "usual culprit is the .npy mmap export, which is scratch for "
+                "the forward pass and is not read during assembly."
+            )
+
         cellvit_memmap = np.lib.format.open_memmap(
             os.path.join(build_dir, "cellvit.npy"), mode="w+", dtype=np.float16,
             shape=(total_cells, cellvit_dim),
@@ -463,7 +532,7 @@ def main() -> None:
         crop_dino_memmap = np.lib.format.open_memmap(
             os.path.join(build_dir, "crop_dino.npy"), mode="w+", dtype=np.float16,
             shape=(total_cells, crop_dino_dim),
-        )
+        ) if has_crop_dino else None
         confidence_memmap = np.lib.format.open_memmap(
             os.path.join(build_dir, "confidence.npy"), mode="w+", dtype=np.float32,
             shape=(total_cells,),
@@ -483,7 +552,8 @@ def main() -> None:
                     raise RuntimeError(f"Misaligned extraction shard: {shard_path}")
                 end = cursor + count
                 cellvit_memmap[cursor:end] = shard["cellvit"]
-                crop_dino_memmap[cursor:end] = shard["crop_dino"]
+                if has_crop_dino:
+                    crop_dino_memmap[cursor:end] = shard["crop_dino"]
                 confidence_memmap[cursor:end] = shard["confidence"]
                 bboxes_memmap[cursor:end] = shard["bboxes"]
                 cursor = end
@@ -492,7 +562,8 @@ def main() -> None:
         for array in (
             cellvit_memmap, crop_dino_memmap, confidence_memmap, bboxes_memmap
         ):
-            array.flush()
+            if array is not None:
+                array.flush()
 
         # Merge the per-batch instance-map blobs in patch order. Done here, in
         # the same pass that rebuilt `offsets`, so the sidecar's patch order is
@@ -522,14 +593,29 @@ def main() -> None:
                 f"{len(sample_ids)} patches "
                 f"({sidecar_bytes / max(1, len(sample_ids)):.0f} B/patch)"
             )
+            # The per-batch blobs are now duplicated inside the merged sidecar.
+            # Drop them before save_cellvit_cache doubles the feature arrays:
+            # assembly is the disk peak of the whole run, and on a ~20 GB Kaggle
+            # quota that peak is what fails.
+            for map_path in blob_paths:
+                for path in (map_path, map_path + ".idx.npy"):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
 
+        free_before_save = shutil.disk_usage(cache_root).free
+        print(
+            f"[nucleus] writing cache | free disk "
+            f"{free_before_save / 2**30:.1f} GiB"
+        )
         save_cellvit_cache(
             cache_path,
             offsets=np.asarray(offsets, dtype=np.int64),
             confidence=confidence_memmap,
             sample_ids=sample_ids,
             cellvit_embeddings=cellvit_memmap,
-            cell_dino_features=crop_dino_memmap,
+            cell_dino_features=crop_dino_memmap,   # None when skipped
             bboxes=bboxes_memmap,
             manifest={
                 "dataset": args.dataset,

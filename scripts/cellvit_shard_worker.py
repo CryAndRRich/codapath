@@ -38,6 +38,7 @@ def run_cellvit_shard(
     assemble_only: bool = False,
     overwrite: bool = False,
     save_instance_maps: bool = False,
+    skip_crop_dino: bool = False,
     device_string: str = "cuda:0",
 ) -> None:
     """Extract one shard (or assemble all of them) in a child process.
@@ -57,6 +58,8 @@ def run_cellvit_shard(
         # Boolean flags cannot ride in `options`, which is rendered as
         # --key value pairs; they are appended here alongside the other switches.
         extra.append("--save_instance_maps")
+    if skip_crop_dino:
+        extra.append("--skip_crop_dino")
     command = _command(options, extra)
     print("[cellvit-shard]", " ".join(command))
     subprocess.check_call(command, cwd=PROJECT_DIR)
@@ -67,6 +70,7 @@ def build_shard_jobs(
     shard_count: int,
     overwrite: bool = False,
     save_instance_maps: bool = False,
+    skip_crop_dino: bool = False,
 ) -> List[Tuple[str, dict]]:
     """`(label, kwargs)` pairs for `run_variants_parallel`, one per shard.
 
@@ -84,6 +88,7 @@ def build_shard_jobs(
                 shard_count=shard_count,
                 overwrite=overwrite,
                 save_instance_maps=save_instance_maps,
+                skip_crop_dino=skip_crop_dino,
             ),
         )
         for index in range(shard_count)
