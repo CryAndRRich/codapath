@@ -228,11 +228,37 @@ def test_baseline_notebook_does_not_fit_palm():
     assert "_fit_palm" not in source
 
 
-def test_baseline_notebook_archive_slug_names_the_sampler():
-    """Two baselines archived without the sampler in the slug would collide on
-    publish -- `dataset-metadata.json` derives from what THIS run produced."""
+def test_baseline_notebook_archives_exactly_like_the_extraction_notebooks():
+    """One zip at the top of /kaggle/working, loose files deleted.
+
+    A "Save & Run All" session has no terminal and no kaggle CLI, so the Output
+    tab is the only way a file leaves it -- printing `kaggle datasets create`
+    is advice nobody in that session can follow. Leaving the originals beside
+    the zip also doubles the download and can push a session over the ~20 GB
+    Output quota, at which point the tab shows NOTHING, including the files
+    that were fine. Both extraction notebooks already do it this way.
+    """
     source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
-    assert 'SLUG = f"{DATASET}-baseline-{SAMPLER}"' in source
+    assert "results_archive_stem(DATASET, SAMPLER, SEEDS)" in source
+    assert 'shutil.make_archive(str(ARCHIVE), "zip", root_dir=SOURCE)' in source
+    # The loose checkpoints must go once the zip exists.
+    assert "shutil.rmtree(SOURCE, ignore_errors=True)" in source
+    # The CLI path is unusable in the session this notebook runs in.
+    assert "kaggle datasets create" not in source
+    assert "dataset-metadata.json" not in source
+
+
+def test_every_publishing_notebook_writes_its_zip_outside_the_source_tree():
+    """`make_archive` writing inside the directory it archives packs a partial
+    copy of itself on a second run, so each notebook asserts the two are
+    distinct rather than trusting the layout."""
+    for name in (
+        "run_al_baseline.ipynb",
+        "extract_visual_features.ipynb",
+        "extract_nucleus_features.ipynb",
+    ):
+        source = _all_source(NOTEBOOK_DIR / name)
+        assert "SOURCE.resolve() != WORKING.resolve()" in source, name
 
 
 def test_cellvit_wheel_is_installed_with_no_deps():

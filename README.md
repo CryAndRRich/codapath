@@ -264,9 +264,21 @@ budget.
 
 Publishing `/kaggle/working/<name>` as a Kaggle Dataset remounts it one level
 deeper (`.../<name>/<name>`), so the notebooks *search* for their caches instead
-of trusting a hard-coded path, and print what they found. Each notebook also
-writes a `dataset-metadata.json` next to its archive with a slug derived from
-the dataset and seed, so publishing needs no hand-typed paths.
+of trusting a hard-coded path, and print what they found.
+
+Every notebook that produces something ends the same way: **one zip at the top
+of `/kaggle/working`, with the loose files deleted.** A "Save & Run All" session
+has no terminal and no kaggle CLI, so the Output tab is the only way a file
+leaves it — and leaving the originals beside the zip doubles the download and
+can push the session over the ~20 GB Output quota, at which point the tab shows
+*nothing at all*, including the files that were fine. The name carries the axes
+that make two archives non-interchangeable (`utils/archive.py`):
+
+| Notebook | Archive name |
+|---|---|
+| `extract_visual_features.ipynb` | `visual-dinov2_{datasets}_{seeds}_{backbone}` |
+| `extract_nucleus_features.ipynb` | `cellvit-nucleus_{dataset}_seed{seed}_{ckpt}_{encoder}_{cap}` |
+| `run_al_baseline.ipynb`, `run_al_sampler.ipynb` | `{dataset}_{sampler}_seed{seeds}` |
 
 **A run needs two Kaggle Datasets attached, and the feature cache cannot stand
 in for the raw images.** `DATA_ROOT` is the raw dataset (`pathmnist_224.npz`,

@@ -48,6 +48,18 @@ def visual_archive_stem(datasets, seeds, vit_name: str) -> str:
     return f"visual-dinov2_{dataset_tag}_{seed_tag}_{vit_name.replace('/', '_')}"
 
 
+def results_archive_stem(dataset: str, sampler: str, seeds) -> str:
+    """Archive name for one sampler's AL results on one dataset.
+
+    Same three axes that make two result sets non-interchangeable, in the same
+    order the cache stems use: what was run on, what ran, and which split.
+    Seeds are a list because a notebook runs several back to back and they all
+    land in the same archive; a single seed still reads as plain `seed42`.
+    """
+    seed_tag = "seed" + "-".join(str(seed) for seed in sorted(seeds))
+    return f"{dataset}_{sampler}_{seed_tag}"
+
+
 def nucleus_archive_stem(
     dataset: str,
     seed: int,
