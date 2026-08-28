@@ -54,6 +54,13 @@ def parse_args():
     parser.add_argument("--cellvit_batch_size", type=int, default=2)
     parser.add_argument("--dino_crop_batch_size", type=int, default=32)
     parser.add_argument("--max_estimated_hours", type=float, default=None)
+    parser.add_argument(
+        "--shards", type=int, default=1,
+        help="How many GPUs the real extraction will split across. Preflight "
+             "benchmarks ONE GPU, so without this the estimate is the "
+             "single-card figure and the safety gate rejects runs that would "
+             "comfortably finish on two.",
+    )
     parser.add_argument("--max_cells_per_patch", type=int, default=None)
     parser.add_argument(
         "--skip_crop_dino", action="store_true",
@@ -119,6 +126,8 @@ def main() -> None:
         raise ValueError("dino_crop_batch_size must be positive")
     if args.max_estimated_hours is not None and args.max_estimated_hours <= 0:
         raise ValueError("max_estimated_hours must be positive")
+    if args.shards < 1:
+        raise ValueError("shards must be positive")
     if args.max_cells_per_patch is not None and args.max_cells_per_patch < 1:
         raise ValueError("max_cells_per_patch must be positive")
     with open(args.config, "r", encoding="utf-8") as f:
@@ -326,9 +335,16 @@ def main() -> None:
     crop_dino_hours = (
         len(raw_dataset) * mean_cells * seconds_per_crop / 3600
     )
-    estimated_hours = cellvit_hours + crop_dino_hours
+    gpu_hours = cellvit_hours + crop_dino_hours
+    # What the session will actually take. Extraction splits whole batches over
+    # the shards, and the shards are independent processes on separate cards, so
+    # wall clock is GPU-hours divided by the number of cards. Measured against
+    # real runs: the one-GPU figure overestimated a two-GPU session by 1.3-1.5x
+    # (pathmnist 4.5h -> 3.0h, histoset 5.2h -> 4.0h), which is this factor plus
+    # the pilot's warm-up overhead.
+    estimated_hours = gpu_hours / args.shards
     print(
-        f"[estimate] warmed pilot runtime≈{estimated_hours:.1f} h "
+        f"[estimate] warmed pilot runtime≈{gpu_hours:.1f} GPU-h "
         f"at CellViT/DINO batches={args.cellvit_batch_size}/"
         f"{args.dino_crop_batch_size}"
     )
@@ -336,18 +352,28 @@ def main() -> None:
         f"[estimate] runtime breakdown: CellViT≈{cellvit_hours:.1f} h + "
         f"crop-DINO≈{crop_dino_hours:.1f} h"
     )
+    if args.shards > 1:
+        print(
+            f"[estimate] wall clock over {args.shards} GPUs "
+            f"≈{estimated_hours:.1f} h (this is what the 12-hour Kaggle limit "
+            "applies to)"
+        )
     disk_cap = max(
         1,
         int(0.8 * free_disk / (3 * len(raw_dataset) * bytes_per_cell)),
     )
     cap_candidates = [disk_cap]
+    budget_gpu_hours = (
+        None if args.max_estimated_hours is None
+        else args.max_estimated_hours * args.shards
+    )
     if (
-        args.max_estimated_hours is not None
-        and args.max_estimated_hours > cellvit_hours
+        budget_gpu_hours is not None
+        and budget_gpu_hours > cellvit_hours
         and seconds_per_crop > 0
     ):
         time_cap = int(
-            (args.max_estimated_hours - cellvit_hours)
+            (budget_gpu_hours - cellvit_hours)
             * 3600
             / (len(raw_dataset) * seconds_per_crop)
         )
@@ -367,11 +393,17 @@ def main() -> None:
         args.max_estimated_hours is not None
         and estimated_hours > args.max_estimated_hours
     ):
+        detail = (
+            f" ({gpu_hours:.1f} GPU-h over {args.shards} GPUs)"
+            if args.shards > 1 else ""
+        )
         raise RuntimeError(
-            f"Estimated extraction time {estimated_hours:.1f} h exceeds the "
-            f"configured safety limit {args.max_estimated_hours:.1f} h. "
+            f"Estimated extraction time {estimated_hours:.1f} h{detail} exceeds "
+            f"the configured safety limit {args.max_estimated_hours:.1f} h. "
             "Reduce max_cells_per_patch, raise the limit knowingly, or use a "
-            "longer-running GPU environment."
+            "longer-running GPU environment. Note the estimate is a warmed "
+            "single-batch pilot and has measured 1.3-1.5x pessimistic against "
+            "real runs."
         )
     if detected == 0:
         print(

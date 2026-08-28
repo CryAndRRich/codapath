@@ -195,3 +195,35 @@ def test_extra_requirements_cover_what_no_deps_leaves_out():
     extra = (PROJECT / "requirements-cellvit-extra.txt").read_text(encoding="utf-8")
     for package in ("einops", "transformers", "PyYAML", "Pillow", "tqdm"):
         assert package in extra, package
+
+
+def test_preflight_gate_is_measured_in_wall_clock_not_gpu_hours():
+    """The pilot benchmarks one GPU; the run uses every visible one.
+
+    Without --shards the gate compares GPU-hours against a wall-clock limit and
+    rejects jobs that finish comfortably: skintissue estimated 14.5 GPU-h, which
+    is ~7.2 h over two T4s, well inside both the 10 h limit and Kaggle's 12 h
+    session cap.
+    """
+    source = (PROJECT / "scripts" / "preflight_cellvit.py").read_text(encoding="utf-8")
+    assert '"--shards"' in source
+    assert "estimated_hours = gpu_hours / args.shards" in source
+    # The cap recommendation must reason in the same units as the gate, or it
+    # suggests a cell cap that does not correspond to the limit being enforced.
+    assert "budget_gpu_hours" in source
+
+    notebook_source = _all_source(NOTEBOOK_DIR / "extract_nucleus_features.ipynb")
+    assert "--shards" in notebook_source
+    # The count passed must be the one the real run will use, not a constant.
+    assert "PREFLIGHT_SHARDS" in notebook_source
+    assert "visible_gpu_count" in notebook_source
+
+
+def test_nucleus_notebook_can_store_cell_embeddings_without_crop_dino():
+    """cell_source defaults to cellvit_embedding, so the crop encoder is a
+    second forward pass whose output the default run never reads."""
+    source = _all_source(NOTEBOOK_DIR / "extract_nucleus_features.ipynb")
+    assert "SKIP_CROP_DINO" in source
+    assert "--skip_crop_dino" in source
+    # Instance maps are the visualisation sidecar and must stay available.
+    assert "SAVE_INSTANCE_MAPS" in source
