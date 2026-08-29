@@ -173,11 +173,27 @@ def default_num_workers(data_path: str) -> int:
     return 0 if data_path.endswith(".npz") else 2
 
 
+def default_transform() -> transforms.Compose:
+    """The frozen-DINOv2 protocol's own transform: 224x224 + ImageNet stats.
+
+    Pulled out to a named function, not just an inline default, so a caller
+    that wants THIS transform specifically (rather than "whatever the default
+    happens to be") can ask for it by name — `RawRGBDataset` bypasses it
+    entirely, and `features/visual.py` never has to know its exact values.
+    """
+    return transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+
 def get_data_loaders(data_path: str,
                      seed: int,
                      verbose: bool = False,
                      mmap_cache_dir: str = None,
-                     num_workers: int = None) -> Tuple[DataLoader, DataLoader, List[str]]:
+                     num_workers: int = None,
+                     transform: transforms.Compose = None) -> Tuple[DataLoader, DataLoader, List[str]]:
     """Build the fixed-order train/test loaders for a dataset path.
 
     `mmap_cache_dir` applies to .npz datasets only. Pass it when several
@@ -189,12 +205,16 @@ def get_data_loaders(data_path: str,
     `num_workers` defaults to `default_num_workers(data_path)`. Workers never
     affect *which* samples come out or in what order — both loaders are
     `shuffle=False` over a fixed split — so this is a throughput knob only.
+
+    `transform` defaults to `default_transform()` (224x224 + ImageNet stats,
+    the frozen-DINOv2 protocol). A caller that needs a different resolution or
+    normalization -- CONCH is 448x448 with OpenAI CLIP stats -- passes its own
+    `preprocess` here instead of hand-rolling one; the sample ORDER and the
+    fingerprint computed from it are untouched either way, because both come
+    from `sample_id`, not from pixels or the transform.
     """
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    if transform is None:
+        transform = default_transform()
     if num_workers is None:
         num_workers = default_num_workers(data_path)
 

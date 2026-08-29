@@ -241,9 +241,58 @@ in results and manifests.
 
 ---
 
+## CONCH extraction
+
+`extract_vlm_features.ipynb` produces the second encoder Protocol B needs.
+CONCH is CoCa-based (image + text tower; the public checkpoint has its
+captioning decoder stripped), gated on Hugging Face, verified against
+`repos/CONCH` and the paper directly (`PLAN_IMPLEMENT.md` §10).
+
+**Two image embedding spaces, not interchangeable**
+(`features/vlm.py::extract_vlm_image_features`):
+
+| Space | Call | Used for |
+|---|---|---|
+| `RAW_SPACE` | `encode_image(x, proj_contrast=False, normalize=False)` | linear probe, coverage kernel, disagreement probes |
+| `PROJ_SPACE` | `encode_image(x, proj_contrast=True, normalize=True)` | comparing an image against text (round-1 cold start) |
+
+`encode_image`'s own defaults are `PROJ_SPACE`, not `RAW_SPACE` — the mistake
+this module exists to make impossible is asking for one and silently getting
+the other. Both are written from the same forward pass; 448×448 (CONCH's
+resolution) is 4× the pixels of DINOv2's 224×224, so a second pass would
+double the notebook's expensive part.
+
+**448×448, OpenAI CLIP normalization, its own tokenizer** — never DINOv2's
+224+ImageNet transform or a hand-rolled `Normalize`. The notebook always uses
+the `preprocess` object `create_model_from_pretrained` returns.
+`data/loaders.py::get_data_loaders` accepts a `transform=` override for
+exactly this; not passing one still gives every other caller the original
+224+ImageNet behavior, byte for byte.
+
+**`logit_scale` is learned**, read off the loaded checkpoint
+(`model.logit_scale.exp()`), never a hard-coded temperature.
+
+**Text prototypes** — one 512-d vector per class, cached separately by
+`(dataset, description style)` since they don't depend on the seed or split.
+`DESCRIPTION_STYLE = "conch_official"` uses the paper authors' own 22-template
+× 4–5-classname CRC100K prompt ensemble (vendored, CC BY-NC-ND 4.0, in
+`config/prompts/`; PathMNIST only — its 9 classes match `config.yaml`'s
+`datasets.pathmnist.descriptions` order 1:1, checked in code via
+`assert_class_order_matches_prompts`). `"manual"` reads `config.yaml`
+directly; `"llm_*"` reads a file `generate_class_description.ipynb` wrote.
+
+**Zero-shot sanity check**, printed and asserted `> 0.70` at the end of the
+notebook — not a reproduction of the paper's 79.1% on CRC100K (PathMNIST is
+224-native, resized up to 448 here), but a check that transform,
+normalization, tokenizer and projection are all correct. A wrong one of those
+does not crash — it silently produces near-random accuracy with no other
+symptom.
+
+---
+
 ## Notebooks (Kaggle)
 
-Five, one per pipeline stage. Each clones and verifies the pinned branch,
+Six, one per pipeline stage. Each clones and verifies the pinned branch,
 installs from `requirements.txt`, and zips its output so a session downloads as
 one file.
 
@@ -251,8 +300,9 @@ one file.
 |---|---|
 | `extract_visual_features.ipynb` | DINOv2 features, once per (dataset, seed) |
 | `extract_nucleus_features.ipynb` | CellViT cache; runs preflight first |
+| `extract_vlm_features.ipynb` | CONCH image features (both embedding spaces) + text prototypes |
 | `run_al_baseline.ipynb` | one of the 11 published baselines; no CellViT, no VLM |
-| `run_al_sampler.ipynb` | `scalpel`, this project's own method, several configs back to back |
+| `run_al_sampler.ipynb` | `scalpel`, this project's own method |
 | `evaluate_al_sampler.ipynb` | reload saved probes and rebuild the comparison table |
 
 `run_al_baseline.ipynb` and `run_al_sampler.ipynb` are deliberately separate
@@ -276,9 +326,10 @@ that make two archives non-interchangeable (`utils/archive.py`):
 
 | Notebook | Archive name |
 |---|---|
-| `extract_visual_features.ipynb` | `visual-dinov2_{datasets}_{seeds}_{backbone}` |
+| `extract_visual_features.ipynb` | `visual-dinov2_{dataset}_seed{seed}_{backbone}` |
 | `extract_nucleus_features.ipynb` | `cellvit-nucleus_{dataset}_seed{seed}_{ckpt}_{encoder}_{cap}` |
-| `run_al_baseline.ipynb`, `run_al_sampler.ipynb` | `{dataset}_{sampler}_seed{seeds}` |
+| `extract_vlm_features.ipynb` | `vlm_{dataset}_seed{seed}_{vlm}_{description_style}` |
+| `run_al_baseline.ipynb`, `run_al_sampler.ipynb` | `{dataset}_{sampler}_seed{seed}` |
 
 **A run needs two Kaggle Datasets attached, and the feature cache cannot stand
 in for the raw images.** `DATA_ROOT` is the raw dataset (`pathmnist_224.npz`,

@@ -64,6 +64,19 @@ def results_archive_stem(dataset: str, sampler: str, seed: int) -> str:
     return f"{dataset}_{sampler}_seed{seed}"
 
 
+def vlm_archive_stem(dataset: str, seed: int, vlm_name: str, style: str) -> str:
+    """Archive name for a VLM (e.g. CONCH) feature + text-prototype cache.
+
+    `style` is in the name because it is NOT a tuning knob on top of a fixed
+    cache -- it names a different text prototype, computed from a different
+    description file, living in a different `{dataset}_{style}_text.npy`. Two
+    styles are two artifacts, not two configurations of one artifact, so
+    archiving one under a name that could mean either would make the wrong
+    one indistinguishable from the right one.
+    """
+    return f"vlm_{dataset}_seed{seed}_{vlm_name.replace('/', '_')}_{style}"
+
+
 def nucleus_archive_stem(
     dataset: str,
     seed: int,

@@ -795,15 +795,63 @@ không phải sắp xếp tuỳ ý — mỗi bước ghi rõ nó chặn cái gì
      `loader.dataset` thành `loader.DATASET` và `manifest["dataset"]` thành
      `manifest["DATASET"]`. `ast.parse` không bắt được vì vẫn đúng cú pháp.
      Đã rà lại từng cell và sửa; bài học: đừng regex trên code, viết lại cell.
-5. **`data/loaders.py` nhận `transform`** (§4.1) — *chặn đường của mọi thứ
-   CONCH.* Nhỏ (một tham số + default cũ giữ nguyên) nhưng phải làm trước, vì
-   không có nó thì không extract được CONCH ở 448. Kèm test
-   `test_custom_transform_does_not_change_sample_order` — đây là test bảo vệ
-   toàn bộ cache DINOv2 đã publish.
-6. **`features/vlm.py` + `extract_vlm_features.ipynb`** (§1.2, §4) — cộng
-   `vlm_archive_stem`, và cell kiểm tra zero-shot (§4.2) thay cho test tự động.
-   Chạy được ngay sau bước 4; chưa cần LLM description vì đã có prompt chính
-   thức của CONCH làm `conch_official`.
+5. ~~**`data/loaders.py` nhận `transform`**~~ (§4.1) — **XONG**.
+   `get_data_loaders` thêm tham số `transform=None`, mặc định gọi
+   `default_transform()` (hàm mới, đúng transform cũ 224+ImageNet, tách ra để
+   gọi tên được tường minh). Không truyền = hành vi y hệt trước, đã verify
+   bit-for-bit (shape, giá trị pixel). `default_transform` export qua
+   `data/__init__.py`.
+   **Không sửa bất kỳ notebook/script nào khác** — `main.py`, cả 4 notebook,
+   3 script trong `scripts/` đều gọi `get_data_loaders(...)` không có
+   `transform=`, nên tất cả rơi vào default, không cần đổi.
+   7 test mới (`tests/test_loaders_transform.py`), quan trọng nhất:
+   `test_custom_transform_does_not_change_sample_order` — đổi transform (448 +
+   OpenAI norm, mô phỏng CONCH) **không** làm đổi `sample_id`, fingerprint,
+   nhãn, hay `class_names` so với transform mặc định. Đây là test bảo vệ toàn
+   bộ cache DINOv2 đã publish: `features/visual.py` xác thực cache bằng
+   fingerprint tính từ `sample_id`, không phải từ pixel.
+6. ~~**`features/vlm.py` + `extract_vlm_features.ipynb`**~~ (§1.2, §4) —
+   **XONG**.
+   - `features/vlm.py` mới: hai không gian embedding đặt tên rõ (`RAW_SPACE`/
+     `PROJ_SPACE`), naming cache đúng quy ước `features/visual.py`, ensemble
+     prompt chính thức (normalize từng cái rồi mean rồi normalize lại — đúng
+     công thức gốc, không phải mean-rồi-normalize-một-lần), `zero_shot_logits`
+     thuần numpy (test được không cần `conch`). **Import `conch` trễ (bên
+     trong hàm)**, giống hệt pattern `_load_cell_view` dùng cho `cellvit` —
+     module tự import sạch dù máy local không có `conch`/`open_clip`.
+   - `get_or_extract_vlm_features` nhận `model=` thay vì tự load lại: notebook
+     đã phải load model trước để lấy `preprocess` (dataloader cần transform
+     đúng của CONCH), nên truyền model đó vào tránh load 2 lần trên cache
+     miss. Cache hit thì hoàn toàn không đụng tới model.
+   - **File prompt CONCH chính thức đã vendor vào repo**
+     (`config/prompts/crc100k_prompts_all_per_class.json`, license CC
+     BY-NC-ND 4.0 — hỏi và được xác nhận trước khi copy, ghi rõ nguồn +
+     license trong `config/prompts/README.md`). Cần thiết vì notebook Kaggle
+     không có sẵn `repos/CONCH` (nó nằm ngoài git repo, chỉ có trên máy local).
+   - `extract_vlm_features.ipynb` (14 cell): EDIT cell không có list nào
+     (đúng §2.0), assert thứ tự lớp trước khi dùng `conch_official`, assert
+     `DATASET=="pathmnist"` khi dùng `conch_official`, cell zero-shot in
+     accuracy + `assert > 0.70` (không phải test tự động — xem §4.2), archive
+     đúng khuôn 4 notebook kia.
+   - `vlm_archive_stem(dataset, seed, vlm_name, style)` thêm vào
+     `utils/archive.py`.
+   - **Dọn theo đường**: `open_clip_torch` trong `requirements.txt` là rác từ
+     thời BiomedCLIP/CODAPath cũ — không có `import open_clip` nào thật trong
+     repo (`conch.open_clip_custom` là module khác, thuộc package `conch`).
+     Đã xoá, và sửa comment sai tương ứng trong
+     `extract_nucleus_features.ipynb`.
+   - **Verify bằng chạy thật, không chỉ đọc code**: dựng package `conch` giả
+     (CoCa deterministic, đúng chữ ký `encode_image(normalize, proj_contrast)`,
+     `logit_scale`, tokenizer) và chạy **cả 14 cell của notebook thật** (bỏ
+     qua cell 1-3 git/pip vì không chạy được local) trên dữ liệu PathMNIST giả
+     lập — extract ra đúng shape 2 không gian, cache resume đúng (lần 2 load
+     lại, không gọi `encode_image`), text prototype resume đúng, zero-shot
+     assert bắn đúng khi model giả không có tín hiệu thật, archive ra đúng 8
+     file tên đúng.
+   29 test mới (`test_vlm_features.py` 18 mới hoàn toàn + `test_kaggle_notebooks.py`
+   9 + `test_archive_naming.py` 2). `test_import_graph.py` không cần sửa vì
+   import trễ đã sạch từ đầu — tự chạy qua, không cần test riêng. 366 test
+   pass, pyflakes sạch.
 7. **`generate_class_description.ipynb`** (§3) — cần trước khi `USE_TEXT` với
    style `llm_*` chạy được. Độc lập với bước 5, có thể đổi chỗ.
 8. **`evaluate_al_sampler.ipynb` đọc encoder từ metadata** (§2.1) — **phải xong

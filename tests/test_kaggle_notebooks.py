@@ -10,6 +10,7 @@ NOTEBOOK_DIR = PROJECT / "notebooks"
 EXPECTED_NOTEBOOKS = {
     "extract_visual_features.ipynb",
     "extract_nucleus_features.ipynb",
+    "extract_vlm_features.ipynb",
     "run_al_sampler.ipynb",
     "run_al_baseline.ipynb",
     "evaluate_al_sampler.ipynb",
@@ -299,9 +300,92 @@ def test_every_publishing_notebook_writes_its_zip_outside_the_source_tree():
         "run_al_baseline.ipynb",
         "extract_visual_features.ipynb",
         "extract_nucleus_features.ipynb",
+        "extract_vlm_features.ipynb",
     ):
         source = _all_source(NOTEBOOK_DIR / name)
         assert "SOURCE.resolve() != WORKING.resolve()" in source, name
+
+
+def test_vlm_notebook_installs_the_conch_package_not_just_open_clip():
+    """`pip install open_clip_torch` alone is not enough -- CONCH has its own
+    tokenizer and factory (features/vlm.py module docstring). Missing this
+    line means every cell past it fails on the very first import."""
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    assert "git+https://github.com/mahmoodlab/CONCH.git" in source
+
+
+def test_vlm_notebook_writes_both_embedding_spaces_in_one_pass():
+    """The two CONCH embedding spaces (probe space vs. text-comparison space)
+    are not interchangeable, and re-running the whole dataloader for the
+    second one would double the cost of the notebook's expensive part
+    (448x448, 4x DINOv2's pixels). Both must come from ONE call."""
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    assert "get_or_extract_vlm_features(" in source
+    assert "cached['train']" in source or 'cached["train"]' in source
+    assert "cached['proj_train']" in source or 'cached["proj_train"]' in source
+
+
+def test_vlm_notebook_uses_the_factorys_own_preprocess():
+    """§10.3's trap: hand-rolling a Normalize() for CONCH silently uses the
+    wrong (ImageNet, not OpenAI CLIP) statistics. The notebook must pass
+    `transform=` built from `load_conch`'s own returned preprocess, never
+    construct its own transforms.Normalize for this model."""
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    assert "load_conch(" in source
+    assert "transform=conch_preprocess" in source
+    assert "transforms.Normalize" not in source
+
+
+def test_vlm_notebook_reads_logit_scale_from_the_loaded_checkpoint():
+    """A hard-coded temperature (e.g. 0.05) is the mistake §10.6 documents:
+    `logit_scale` is a LEARNED parameter, and the official zero-shot code
+    reads it off the checkpoint, not a config constant."""
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    assert "conch_model.logit_scale.exp()" in source
+    assert "logit_scale=0.05" not in source
+    assert "logit_scale = 0.05" not in source
+
+
+def test_vlm_notebook_asserts_class_order_before_using_official_prompts():
+    """A silent class-order mismatch does not crash -- it permutes the
+    confusion matrix and reports a wrong number that looks plausible. This
+    must be checked in code, not assumed."""
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    assert "assert_class_order_matches_prompts(" in source
+
+
+def test_vlm_notebook_rejects_the_official_prompts_on_a_non_pathmnist_dataset():
+    """The official CONCH prompt set is CRC100K-specific (9 classes) and only
+    exists for PathMNIST; HistoSet/SkinTissue must not silently reuse it."""
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    assert 'assert DATASET == "pathmnist"' in source
+
+
+def test_vlm_notebook_asserts_a_loose_not_exact_zeroshot_threshold():
+    """79.1% is the paper's number on CRC100K at its native scale; PathMNIST
+    is resized 224->448 here, so an exact reproduction is not the bar (see
+    PLAN_IMPLEMENT.md 4.2). The notebook must assert a looser bound, not the
+    exact published figure, and must not silently skip the check."""
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    assert "zero_shot_accuracy > 0.70" in source
+    assert "0.791" not in source
+
+
+def test_vlm_notebook_keeps_dataset_seed_vlm_and_style_singular():
+    """Same rule as every other notebook (§2.0): one configuration, one zip.
+    A description STYLE is an extra axis this notebook has that the others
+    don't, and it must follow the same rule."""
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    for plural in ("SEEDS", "DATASETS", "VLMS", "STYLES", "DESCRIPTION_STYLES"):
+        assert plural not in source, f"still sweeps {plural} in one run"
+    assert "DESCRIPTION_STYLE = " in source
+
+
+def test_vlm_notebook_archive_stem_includes_the_description_style():
+    """Two styles are two artifacts (different text prototype file), so the
+    archive name must distinguish them -- not just dataset/seed/VLM."""
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    assert "vlm_archive_stem(DATASET, SEED, VLM, DESCRIPTION_STYLE)" in source
 
 
 def test_cellvit_wheel_is_installed_with_no_deps():

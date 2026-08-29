@@ -5,6 +5,7 @@ from .archive import (
     results_archive_stem,
     slugify,
     visual_archive_stem,
+    vlm_archive_stem,
 )
 from .logging import tee_stdout
 from .runtime import clear_memory, set_seed
@@ -17,4 +18,5 @@ __all__ = [
     "slugify",
     "tee_stdout",
     "visual_archive_stem",
+    "vlm_archive_stem",
 ]

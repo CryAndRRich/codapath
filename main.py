@@ -171,6 +171,7 @@ def run(
     model_cfg: Dict,
     feature_cache_dir: str = "features",
     cellvit_cache_dir: str = "cellvit_features",
+    mmap_cache_dir: Optional[str] = None,
     run_name: Optional[str] = None,
     shard_tag: Optional[str] = None,
 ) -> None:
@@ -199,8 +200,21 @@ def run(
         set_seed(random_seed)
 
         dataset_key = os.path.basename(save_dir)
+        # `mmap_cache_dir` matters here even though this function never looks at
+        # a pixel: it opens the dataset for labels, sample IDs and the cache
+        # fingerprint, and NPZDataset reads a .npz eagerly. PathMNIST-224 is
+        # ~15 GiB of uint8, so two AL workers sharing a Kaggle session hold
+        # ~30 GiB between them and one is killed before the sampler starts.
+        # num_workers=0: an AL run never reads a pixel. The loaders exist for
+        # labels, sample IDs and the cache fingerprint, and on a cache hit
+        # `get_or_extract_features` only asks them for `len(dataset)`. Workers
+        # would be per-loader processes held alive by persistent_workers for the
+        # whole run — 8 of them across two GPU workers and two loaders — paying
+        # startup and memory for batches nobody iterates. The extraction
+        # notebooks, which DO decode images, choose their own count.
         train_loader, test_loader, class_names = get_data_loaders(
-            data_path, random_seed, verbose
+            data_path, random_seed, verbose,
+            mmap_cache_dir=mmap_cache_dir, num_workers=0,
         )
         train_dataset, test_dataset = train_loader.dataset, test_loader.dataset
         train_sample_ids = get_sample_ids(train_dataset)
