@@ -296,15 +296,20 @@ cache is only valid for the seed it was built with.
 
 ### Two GPUs
 
-`run_al_baseline.ipynb` and `run_al_sampler.ipynb` both split their variants
-across both cards of a Kaggle **T4 x2** session, one worker process per GPU
-(`utils/parallel.py`). Set `PARALLEL = False` for serial.
+**One run, one configuration, one zip.** Every notebook takes a single value
+per axis — one dataset, one seed, one sampler, one config — and ends in one
+archive whose name states all of it. A run covering several configurations
+would put them under a single archive name that cannot say which result is
+which, so sweeping is done by running the notebook again.
 
-Splitting by variant only helps when there is more than one variant, and the
-common case — one sampler, one seed — is a single job that can occupy only one
-card. `run_al_baseline.ipynb` therefore also splits the **budget list**
-(`SPLIT_BUDGETS`), which is sound precisely for the samplers where every budget
-is already an independent run: `spec.prefix_exact == False`. The flag itself
+That costs nothing in speed, because both cards of a Kaggle **T4 x2** session
+are used *within* one configuration: the run notebooks split the **budget
+list** (`SPLIT_BUDGETS`), and the extraction notebooks shard one extraction
+(`utils/parallel.py`, one worker process per GPU). Set `PARALLEL = False` for
+serial.
+
+Budget splitting is sound precisely for the samplers where every budget is
+already an independent run: `spec.prefix_exact == False`. The flag itself
 decides, so a new sampler cannot drift out of sync with a hand-kept list. A
 prefix-exact sampler (`random`, `coreset`, `tcm`) derives its whole sweep from
 one selection pass, so sharding it would repeat that pass per shard; `main.run`
@@ -325,9 +330,15 @@ would interleave and destroy reproducibility. Each worker pins one card via
 `main.run_on_worker` rather than a `torch.device`.
 
 Work is dealt out round-robin up front and a worker that finishes early does
-not steal from a slower one, so order the variants to alternate expensive and
-cheap ones if the imbalance matters. A crashing variant is reported with its
-traceback and does not take the others down. Feature-cache writes go through a
+not steal from a slower one. A crashing job is reported with its traceback and
+does not take the others down.
+
+Both GPUs share one output stream, so their progress lines interleave and a
+budget's numbers can appear anywhere in the log. Each run notebook therefore
+ends with a summary cell that re-reads the saved `<run>_results.pt` and prints
+one ordered row per budget — accuracy, precision, recall, macro-F1 — so the
+table is correct however the log came out, and re-running that cell alone
+reprints it without recomputing anything. Feature-cache writes go through a
 temporary file and an atomic rename, because two workers can miss the cache and
 extract simultaneously.
 

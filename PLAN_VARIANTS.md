@@ -226,6 +226,11 @@ ensemble phải theo đúng bản gốc — normalize **từng** (classname × t
 cả hai chiều, rồi normalize lại. Chỉ PathMNIST có file này; HistoSet/SkinTissue
 không có.
 
+Hai chi tiết đã kiểm bằng file thật (`PLAN_IMPLEMENT.md` §4.3): nội dung JSON
+**lồng dưới khoá `"0"`**, và thứ tự 9 lớp của nó **khớp 1-1** với thứ tự
+`datasets.pathmnist.descriptions` trong `config.yaml`, nên so với nhãn số của
+PathMNIST không cần bảng ánh xạ.
+
 ---
 
 ## 3. Không cold start — chỉ coverage vòng 1

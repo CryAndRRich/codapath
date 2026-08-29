@@ -164,14 +164,17 @@ def test_baseline_notebook_never_requests_a_vlm_or_text_prior():
 def test_baseline_notebook_resolves_features_by_name_not_hardcoded_path():
     source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
     assert "from utils.kaggle import find_data_root, find_visual_cache" in source
-    assert "find_visual_cache(DATASET, SEEDS[0], vit_name, hint=FEATURE_DIR)" in source
+    assert "find_visual_cache(DATASET, SEED, vit_name, hint=FEATURE_DIR)" in source
 
 
 def test_baseline_notebook_supports_resume_and_both_gpus():
     source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
     assert "run_variants_parallel(" in source
     assert "main.run_on_worker" in source
-    assert "_results.pt" in source and "skipped" in source
+    # Resume is keyed on the MERGED results file, which only exists once the
+    # whole sweep finished -- a run killed mid-sweep must re-run, not be
+    # mistaken for done.
+    assert 'f"{RUN}_results.pt").is_file()' in source
 
 
 def test_baseline_notebook_keeps_raw_images_and_features_as_separate_mounts():
@@ -192,6 +195,46 @@ def test_baseline_notebook_keeps_raw_images_and_features_as_separate_mounts():
     # The raw-image loader must still be reached; the cache only replaces the
     # backbone forward pass, never the dataset.
     assert 'DATA_PATHS[DATASET]' in source
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "run_al_baseline.ipynb",
+        "run_al_sampler.ipynb",
+        "extract_visual_features.ipynb",
+        "extract_nucleus_features.ipynb",
+    ],
+)
+def test_one_configuration_per_run(name):
+    """A run produces one archive, so it must describe one configuration.
+
+    A list of seeds, datasets or variants would put several results under a
+    single archive name that cannot say which result is which -- the same
+    collision `_default_run_name` guards against, one level up. Sweeping is
+    done by running the notebook again, which costs nothing: both GPUs are used
+    by splitting the budget list (or sharding one extraction), not by bundling
+    configurations into one session.
+    """
+    source = _all_source(NOTEBOOK_DIR / name)
+    for plural in ("SEEDS", "DATASETS", "VARIANTS"):
+        assert plural not in source, f"{name} still sweeps {plural} in one run"
+    assert "SEED = " in source
+
+
+@pytest.mark.parametrize("name", ["run_al_baseline.ipynb", "run_al_sampler.ipynb"])
+def test_run_notebooks_print_an_ordered_results_table(name):
+    """Two GPUs share one output stream, so their progress lines interleave and
+    a budget's numbers can appear anywhere. The summary cell re-reads the saved
+    results file instead of trusting the log, so the table is ordered no matter
+    how the run printed.
+    """
+    source = _all_source(NOTEBOOK_DIR / name)
+    assert 'torch.load(results_path, weights_only=False)' in source
+    assert "for budget in sorted(linear):" in source
+    # Metrics only: the per-step acquisition scores stay in the saved files.
+    for metric in ("accuracy", "precision", "recall", "macro F1"):
+        assert metric in source
 
 
 def test_baseline_notebook_splits_budgets_by_the_prefix_exact_flag():
@@ -239,7 +282,7 @@ def test_baseline_notebook_archives_exactly_like_the_extraction_notebooks():
     that were fine. Both extraction notebooks already do it this way.
     """
     source = _all_source(NOTEBOOK_DIR / "run_al_baseline.ipynb")
-    assert "results_archive_stem(DATASET, SAMPLER, SEEDS)" in source
+    assert "results_archive_stem(DATASET, SAMPLER, SEED)" in source
     assert 'shutil.make_archive(str(ARCHIVE), "zip", root_dir=SOURCE)' in source
     # The loose checkpoints must go once the zip exists.
     assert "shutil.rmtree(SOURCE, ignore_errors=True)" in source

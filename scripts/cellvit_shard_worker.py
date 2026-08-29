@@ -61,8 +61,26 @@ def run_cellvit_shard(
     if skip_crop_dino:
         extra.append("--skip_crop_dino")
     command = _command(options, extra)
-    print("[cellvit-shard]", " ".join(command))
-    subprocess.check_call(command, cwd=PROJECT_DIR)
+    label = "assembly" if assemble_only else f"shard {shard_index}/{shard_count}"
+    print(f"[cellvit-shard] {label}:", " ".join(command))
+
+    # Capture rather than inherit stderr. Two shards run concurrently and both
+    # write to the notebook's single stream, so an inherited traceback is
+    # interleaved with the other shard's progress lines and, in a long run, is
+    # scrolled or truncated away entirely — leaving only CalledProcessError with
+    # no cause. Re-raising with the child's own output attached is what makes a
+    # failed shard diagnosable.
+    process = subprocess.run(
+        command, cwd=PROJECT_DIR, text=True,
+        stdout=None,                 # progress still streams live
+        stderr=subprocess.PIPE,
+    )
+    if process.returncode != 0:
+        details = (process.stderr or "").strip() or "(child produced no stderr)"
+        raise RuntimeError(
+            f"CellViT {label} failed with exit status {process.returncode}.\n"
+            f"--- child stderr ---\n{details}\n--- end child stderr ---"
+        )
 
 
 def build_shard_jobs(

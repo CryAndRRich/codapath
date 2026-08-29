@@ -36,28 +36,32 @@ def slugify(stem: str, limit: int = SLUG_LIMIT) -> str:
     return f"{head}-{digest}"
 
 
-def visual_archive_stem(datasets, seeds, vit_name: str) -> str:
+def visual_archive_stem(dataset: str, seed: int, vit_name: str) -> str:
     """Archive name for a DINOv2 visual-feature cache.
 
     Seed is in the name because ImageFolder splits are drawn from a seeded
     generator, so a cache is only valid for the seed that built it; the backbone
     is in the name because the sampler resolves caches by filename.
+
+    One dataset and one seed, not lists: a notebook run produces exactly one
+    archive, so a name that could describe several would be describing
+    something the run cannot produce.
     """
-    dataset_tag = "-".join(sorted(datasets))
-    seed_tag = "seed" + "-".join(str(seed) for seed in sorted(seeds))
-    return f"visual-dinov2_{dataset_tag}_{seed_tag}_{vit_name.replace('/', '_')}"
+    return f"visual-dinov2_{dataset}_seed{seed}_{vit_name.replace('/', '_')}"
 
 
-def results_archive_stem(dataset: str, sampler: str, seeds) -> str:
+def results_archive_stem(dataset: str, sampler: str, seed: int) -> str:
     """Archive name for one sampler's AL results on one dataset.
 
     Same three axes that make two result sets non-interchangeable, in the same
     order the cache stems use: what was run on, what ran, and which split.
-    Seeds are a list because a notebook runs several back to back and they all
-    land in the same archive; a single seed still reads as plain `seed42`.
+
+    One seed, not a list. A run that swept several configurations would produce
+    one archive covering all of them, and the name could not say which result
+    inside belonged to which configuration -- so the sweep lives in repeated
+    notebook runs, and each one names itself completely.
     """
-    seed_tag = "seed" + "-".join(str(seed) for seed in sorted(seeds))
-    return f"{dataset}_{sampler}_{seed_tag}"
+    return f"{dataset}_{sampler}_seed{seed}"
 
 
 def nucleus_archive_stem(
