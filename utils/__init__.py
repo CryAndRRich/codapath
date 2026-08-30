@@ -1,6 +1,7 @@
 """Seeding, memory, and run-logging helpers shared by every entry point."""
 
 from .archive import (
+    main_archive_stem,
     nucleus_archive_stem,
     results_archive_stem,
     slugify,
@@ -12,6 +13,7 @@ from .runtime import clear_memory, set_seed
 
 __all__ = [
     "clear_memory",
+    "main_archive_stem",
     "nucleus_archive_stem",
     "results_archive_stem",
     "set_seed",

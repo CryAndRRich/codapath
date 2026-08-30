@@ -64,6 +64,25 @@ def results_archive_stem(dataset: str, sampler: str, seed: int) -> str:
     return f"{dataset}_{sampler}_seed{seed}"
 
 
+def main_archive_stem(dataset: str, sampler: str, seed: int, encoder: str = "dinov2") -> str:
+    """Archive name for `run_al_main.ipynb`'s AL results.
+
+    Same shape as `results_archive_stem`, plus `encoder` -- the axis
+    `results_archive_stem` never needed because every baseline runs on
+    DINOv2 only. A DINOv2 `scalpel` run and a CONCH `scalpel` run of the same
+    config are two different protocols (different feature space at every
+    stage: coverage kernel, disagreement probes, evaluation probe --
+    PLAN_IMPLEMENT.md §6.2), so they must not share an archive name. Only
+    appended when non-default, so an unchanged DINOv2 run's archive name
+    matches what `results_archive_stem` would have produced -- mirroring how
+    `_default_run_name` only appends `encoder` when it is not `"dinov2"`.
+    """
+    stem = f"{dataset}_{sampler}_seed{seed}"
+    if encoder != "dinov2":
+        stem = f"{stem}_{encoder.replace('/', '_')}"
+    return stem
+
+
 def vlm_archive_stem(dataset: str, seed: int, vlm_name: str, style: str) -> str:
     """Archive name for a VLM (e.g. CONCH) feature + text-prototype cache.
 

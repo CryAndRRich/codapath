@@ -65,6 +65,8 @@ __all__ = [
     "load_conch",
     "extract_vlm_image_features",
     "get_or_extract_vlm_features",
+    "extract_vlm_features_shard",
+    "assemble_vlm_feature_shards",
     "load_official_conch_prompts",
     "assert_class_order_matches_prompts",
     "encode_text_prototypes",
@@ -162,29 +164,68 @@ def extract_vlm_image_features(
     model,
     device: torch.device,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """One forward pass, both embedding spaces.
+    """ONE trunk pass per batch, both embedding spaces derived from it.
 
     Returns `(raw, proj)`: `raw` is `proj_contrast=False, normalize=False`
     (768 for CONCH's captioning head width is NOT this -- it is the 512-d
     pre-projection vector `forward_no_head` returns, matching `embed_dim` in
     `conch_ViT-B-16.json`); `proj` is `proj_contrast=True, normalize=True`.
 
-    Both are computed from the SAME forward pass through the vision tower --
-    re-running the whole dataloader a second time for the other space would
-    double a cost that is already the expensive part of this notebook (448x448
-    is 4x the pixels of DINOv2's 224x224).
+    **This calls `model.visual.forward_no_head` ONCE per batch, not
+    `model.encode_image` twice.** An earlier version called `encode_image`
+    for RAW and again for PROJ, and its docstring claimed this was "the SAME
+    forward pass" -- it was not: `CoCa.encode_image` re-enters
+    `self.visual(images)` (`forward_no_head` or the full `forward`) on every
+    call, so that version ran the 12-layer ViT-B trunk on 448x448 pixels
+    TWICE per batch, the single most expensive step in this notebook.
+
+    Reading `conch/open_clip_custom/vision_tower.py::VisualModel.forward` and
+    `.forward_no_head` side by side shows they share every step up to the
+    pooled, un-normalized, un-projected vector (`forward_no_head`'s return
+    value): `trunk(x)` -> `attn_pool_contrast(x)[:, 0]` -> `ln_contrast(...)`.
+    `forward` (PROJ_SPACE) then does exactly one more matmul,
+    `pooled @ proj_contrast`, followed by L2-normalize. So PROJ is derived
+    from RAW here instead of recomputed -- `raw @ model.visual.proj_contrast`
+    then `F.normalize`, using the model's OWN weight rather than a
+    reimplementation, which is why this is bit-exact (verified against a real
+    `_build_vision_tower` to 0.0 absolute difference in both spaces) and not
+    an approximation.
+
+    This depends on `conch_ViT-B-16.json`'s `attentional_pool_contrast: true`
+    (the only vendored config, and the one this project uses) taking the
+    `attn_pool_contrast` branch in both methods; `use_attentional_pool_contrast`
+    is checked below and this function raises rather than silently falling
+    back to the slow path for a config where the assumption does not hold --
+    a silent fallback would look like a working run at a cost nobody asked
+    for.
     """
+    import torch.nn.functional as F
     from tqdm import tqdm
 
     model = model.to(device)
     model.eval()
 
+    visual = getattr(model, "visual", None)
+    if visual is None or not getattr(visual, "use_attentional_pool_contrast", False):
+        raise AttributeError(
+            "extract_vlm_image_features assumes model.visual.use_attentional_pool_contrast "
+            "is True (conch_ViT-B-16.json's config) so RAW and PROJ can share one trunk "
+            "pass via forward_no_head + proj_contrast. This checkpoint's vision tower does "
+            "not have that shape -- extend this function for it rather than silently "
+            "falling back to two full forward passes."
+        )
+
     raw_batches: List[np.ndarray] = []
     proj_batches: List[np.ndarray] = []
     for images, _ in tqdm(dataloader, desc="Extracting VLM features", leave=False):
         images = images.to(device, non_blocking=True)
-        raw = model.encode_image(images, normalize=False, proj_contrast=False)
-        proj = model.encode_image(images, normalize=True, proj_contrast=True)
+        # RAW_SPACE: exactly what encode_image(proj_contrast=False, normalize=False)
+        # returns -- the trunk + attention-pool + layernorm, nothing more.
+        raw = visual.forward_no_head(images, normalize=False)
+        # PROJ_SPACE: the one additional step encode_image(proj_contrast=True,
+        # normalize=True) takes past that same `raw` vector -- see the
+        # docstring above for the exact line-by-line correspondence.
+        proj = F.normalize(raw @ visual.proj_contrast, dim=-1)
         raw_batches.append(raw.cpu().numpy().astype(np.float32))
         proj_batches.append(proj.cpu().numpy().astype(np.float32))
 
@@ -298,6 +339,201 @@ def get_or_extract_vlm_features(
     })
     print(f"[vlm] Saved cache -> {paths['train']} + {paths['proj_train']}")
     return {"train": train_raw, "test": test_raw, "proj_train": train_proj, "proj_test": test_proj}
+
+
+# --------------------------------------------------------------------------
+# Sharded extraction -- one process per GPU on a Kaggle T4 x2 session.
+# --------------------------------------------------------------------------
+#
+# Mirrors `features/visual.py`'s DINOv2 sharding, with ONE structural
+# difference: a VLM produces TWO arrays per split (RAW_SPACE and PROJ_SPACE)
+# from the same forward pass, so a shard file holds both. Splitting them
+# across separate shard passes would double the 448x448 forward cost, which
+# is the entire expense of this notebook.
+#
+# `_shard_bounds` is IMPORTED from features/visual.py rather than redefined:
+# the contiguous-split rule (and its remainder handling) must be the single
+# definition both extractors share, or a future edit to one silently produces
+# a different partition than the other while every shape check still passes.
+
+
+def _vlm_shard_dir(cache_dir: str, base: str, split: str, shard_count: int) -> str:
+    return os.path.join(cache_dir, f".vlm_shards_{base}_{split}_of{shard_count}")
+
+
+def extract_vlm_features_shard(
+    train_loader,
+    test_loader,
+    dataset_key: str,
+    seed: int,
+    vlm_name: str,
+    device: torch.device,
+    shard_index: int,
+    shard_count: int,
+    cache_dir: str = "vlm_features",
+    model=None,
+    hf_token: Optional[str] = None,
+) -> None:
+    """Extract one contiguous row range of train AND test into a shard file.
+
+    Each shard writes ONE `.npz` per split holding both spaces (`raw`, `proj`)
+    -- not two `.npy` files -- so a shard is either complete for both spaces
+    or absent. A half-written pair (raw present, proj missing) is exactly the
+    partial state `get_or_extract_vlm_features` already refuses to trust, and
+    at the shard level it would be assembled into a cache that loads and is
+    wrong.
+
+    A finished shard is skipped, so a session that dies half way through
+    resumes instead of repeating a 448x448 pass it already paid for.
+
+    The model is loaded ONCE per worker and reused across both splits. It is
+    passed in by the caller when the caller already has one (the notebook
+    needs `preprocess` to build the loaders, so it always does).
+    """
+    from features.visual import _shard_bounds
+
+    if shard_count < 1:
+        raise ValueError("shard_count must be positive")
+
+    paths = vlm_feature_cache_paths(cache_dir, dataset_key, seed, vlm_name)
+    if all(os.path.exists(paths[key]) for key in ("train", "test", "proj_train", "proj_test")):
+        print(f"[vlm] shard {shard_index}: complete cache exists, nothing to do")
+        return
+
+    base = f"{dataset_key}_seed{seed}_{_safe_name(vlm_name)}"
+    owns_model = model is None
+    for split, loader in (("train", train_loader), ("test", test_loader)):
+        shard_dir = _vlm_shard_dir(cache_dir, base, split, shard_count)
+        os.makedirs(shard_dir, exist_ok=True)
+        shard_path = os.path.join(shard_dir, f"{shard_index:03d}.npz")
+        start, stop = _shard_bounds(len(loader.dataset), shard_index, shard_count)
+
+        if os.path.exists(shard_path):
+            with np.load(shard_path) as existing:
+                rows_ok = (
+                    "raw" in existing and "proj" in existing
+                    and existing["raw"].shape[0] == stop - start
+                    and existing["proj"].shape[0] == stop - start
+                )
+            if rows_ok:
+                print(f"[vlm] shard {shard_index} {split}: reusing rows [{start}:{stop})")
+                continue
+            print(f"[vlm] shard {shard_index} {split}: stale/partial shard, recomputing")
+
+        if model is None:
+            model, _ = load_conch(vlm_name, device, hf_token=hf_token)
+
+        subset = torch.utils.data.Subset(loader.dataset, range(start, stop))
+        shard_loader = torch.utils.data.DataLoader(
+            subset,
+            batch_size=loader.batch_size,
+            shuffle=False,
+            num_workers=loader.num_workers,
+            pin_memory=True,
+        )
+        raw, proj = extract_vlm_image_features(shard_loader, model, device)
+        if raw.shape[0] != stop - start:
+            raise RuntimeError(
+                f"shard {shard_index} {split}: extracted {raw.shape[0]} rows, "
+                f"expected {stop - start}"
+            )
+        temporary = f"{shard_path}.tmp{os.getpid()}"
+        np.savez(temporary, raw=raw, proj=proj)
+        os.replace(temporary if temporary.endswith(".npz") else temporary + ".npz", shard_path)
+        print(f"[vlm] shard {shard_index} {split}: wrote rows [{start}:{stop}) {raw.shape}")
+        del raw, proj
+
+    if owns_model and model is not None:
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def assemble_vlm_feature_shards(
+    dataset_key: str,
+    seed: int,
+    vlm_name: str,
+    shard_count: int,
+    n_train: int,
+    n_test: int,
+    cache_dir: str = "vlm_features",
+    train_fingerprint: Optional[str] = None,
+    test_fingerprint: Optional[str] = None,
+    keep_shards: bool = False,
+) -> Dict[str, np.ndarray]:
+    """Concatenate per-GPU shards into the standard two-space cache.
+
+    Both manifests are written LAST and only after every array is complete and
+    its row count checks out -- the same rule the serial path follows, and the
+    reason a reader can trust a manifest's existence as proof of a whole
+    cache. A missing shard raises rather than concatenating a short array.
+    """
+    from features.visual import _shard_bounds
+
+    paths = vlm_feature_cache_paths(cache_dir, dataset_key, seed, vlm_name)
+    base = f"{dataset_key}_seed{seed}_{_safe_name(vlm_name)}"
+
+    assembled: Dict[str, np.ndarray] = {}
+    for split, expected_rows in (("train", n_train), ("test", n_test)):
+        shard_dir = _vlm_shard_dir(cache_dir, base, split, shard_count)
+        raw_parts, proj_parts = [], []
+        for shard_index in range(shard_count):
+            shard_path = os.path.join(shard_dir, f"{shard_index:03d}.npz")
+            if not os.path.exists(shard_path):
+                raise FileNotFoundError(
+                    f"Missing {split} shard {shard_index} at {shard_path}. Every "
+                    "shard must finish before assembly; re-run the extraction "
+                    "cell to fill the gap."
+                )
+            start, stop = _shard_bounds(expected_rows, shard_index, shard_count)
+            with np.load(shard_path) as part:
+                raw, proj = part["raw"], part["proj"]
+                if raw.shape[0] != stop - start or proj.shape[0] != stop - start:
+                    raise RuntimeError(
+                        f"{split} shard {shard_index} has {raw.shape[0]}/"
+                        f"{proj.shape[0]} rows, expected {stop - start}"
+                    )
+                raw_parts.append(raw.copy())
+                proj_parts.append(proj.copy())
+        assembled[split] = np.vstack(raw_parts)
+        assembled[f"proj_{split}"] = np.vstack(proj_parts)
+        del raw_parts, proj_parts
+
+    for key in ("train", "test", "proj_train", "proj_test"):
+        _atomic_save_npy(paths[key], assembled[key])
+
+    _atomic_save_json(paths["manifest"], {
+        "schema_version": 1,
+        "dataset": dataset_key,
+        "seed": seed,
+        "backbone": vlm_name,
+        "space": RAW_SPACE,
+        "train_fingerprint": train_fingerprint,
+        "test_fingerprint": test_fingerprint,
+        "train_shape": list(assembled["train"].shape),
+        "test_shape": list(assembled["test"].shape),
+        "shard_count": shard_count,
+    })
+    _atomic_save_json(paths["proj_manifest"], {
+        "schema_version": 1,
+        "dataset": dataset_key,
+        "seed": seed,
+        "backbone": vlm_name,
+        "space": PROJ_SPACE,
+        "train_fingerprint": train_fingerprint,
+        "test_fingerprint": test_fingerprint,
+        "train_shape": list(assembled["proj_train"].shape),
+        "test_shape": list(assembled["proj_test"].shape),
+        "shard_count": shard_count,
+    })
+    print(f"[vlm] Assembled {shard_count} shards -> {paths['train']} + {paths['proj_train']}")
+
+    if not keep_shards:
+        import shutil
+
+        for split in ("train", "test"):
+            shutil.rmtree(_vlm_shard_dir(cache_dir, base, split, shard_count), ignore_errors=True)
+    return assembled
 
 
 # --------------------------------------------------------------------------

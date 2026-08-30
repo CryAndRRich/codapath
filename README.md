@@ -241,6 +241,40 @@ in results and manifests.
 
 ---
 
+## Class descriptions
+
+`generate_class_description.ipynb` writes `config/descriptions/{dataset}_{style}.json`
+**once**, committed to the repo — the text prior `extract_vlm_features.ipynb`'s
+`DESCRIPTION_STYLE="llm_*"` reads. It calls `gemini-2.5-flash` (pinned; see
+below) and needs no GPU and no dataset image, only a Gemini API key (Kaggle
+Secret `GEMINI_API_KEY`, same pattern as `extract_vlm_features.ipynb`'s
+`HF_TOKEN`).
+
+**A hosted model call is not bit-for-bit reproducible**, even at
+`temperature=0.0` — Google does not guarantee determinism across requests, let
+alone across months as the weights served behind a fixed model name change.
+The reproducible unit is the **committed JSON file**, not "re-run the
+notebook and expect the same text": the notebook refuses to overwrite an
+existing file unless `OVERWRITE=True`, and prints this caveat before calling
+the API.
+
+**`gemini-3.x` is rejected in code**, not just avoided by default —
+`temperature`/`topK`/`topP` are documented as deprecated and silently ignored
+on `gemini-3.7-flash`, `3.6-flash`, `3.5-flash-lite`. Using one of those would
+make `TEMPERATURE=0.0` a silent no-op: the call still succeeds, so nothing
+would flag that the setting this project's reproducibility claim depends on
+was never applied.
+
+Three styles (`STYLE` in the EDIT cell): `llm_short` (one dense sentence),
+`llm_morphology` (2–4 sentences on cell shape/arrangement/texture/staining),
+`llm_multi` (`NUM_PER_CLASS` differently-phrased variants per class, encoded
+as an ensemble the same way `conch_official`'s templates are). `"manual"`
+needs no file — `features/descriptions.py::load_descriptions` reads
+`datasets.<dataset>.descriptions` from `config.yaml` directly, and is the
+control every LLM style has to beat.
+
+---
+
 ## CONCH extraction
 
 `extract_vlm_features.ipynb` produces the second encoder Protocol B needs.
@@ -292,25 +326,64 @@ symptom.
 
 ## Notebooks (Kaggle)
 
-Six, one per pipeline stage. Each clones and verifies the pinned branch,
-installs from `requirements.txt`, and zips its output so a session downloads as
-one file.
+Seven, one per pipeline stage. Each clones and verifies the pinned branch and
+installs its own dependencies; every notebook except
+`generate_class_description.ipynb` zips its output so a session downloads as
+one file (that one writes a single small JSON straight into the repo instead —
+see "Class descriptions" above).
 
 | Notebook | Purpose |
 |---|---|
+| `generate_class_description.ipynb` | frozen LLM class descriptions, generated once, committed |
 | `extract_visual_features.ipynb` | DINOv2 features, once per (dataset, seed) |
 | `extract_nucleus_features.ipynb` | CellViT cache; runs preflight first |
 | `extract_vlm_features.ipynb` | CONCH image features (both embedding spaces) + text prototypes |
 | `run_al_baseline.ipynb` | one of the 11 published baselines; no CellViT, no VLM |
-| `run_al_sampler.ipynb` | `scalpel`, this project's own method |
+| `run_al_main.ipynb` | `scalpel`, this project's own method — either image encoder |
 | `evaluate_al_sampler.ipynb` | reload saved probes and rebuild the comparison table |
 
-`run_al_baseline.ipynb` and `run_al_sampler.ipynb` are deliberately separate
+`run_al_baseline.ipynb` and `run_al_main.ipynb` are deliberately separate
 notebooks rather than one with a bigger menu: a baseline run only needs the
 DINOv2 visual cache, and asserting that at the top of its own notebook
 (`sampling.specs.BASELINE_SAMPLERS`) catches picking `scalpel` there before any
 GPU time is spent, instead of failing deep inside `main.py` on the first
 budget.
+
+**`run_al_main.ipynb`'s `IMAGE_ENCODER` (`"dinov2"` | `"conch"`) decides the
+ONE feature space the whole run uses** — the coverage kernel, the disagreement
+probes inside `scalpel`, and the final evaluation probe
+(`PLAN_IMPLEMENT.md` §6.2). Unlike DINOv2, a CONCH run never extracts its own
+features: `main.py` only READS an already-published cache from
+`extract_vlm_features.ipynb` (`_load_vlm_features`), and raises with an
+actionable message if it is missing — loading the `conch` package, an HF
+token and a slow 448×448 forward pass inside a 2-GPU AL sweep would duplicate
+what the extraction notebook already does. `USE_TEXT` (the round-1 cold-start
+text prior) is present in the EDIT cell but **not yet implemented** — setting
+it True raises `NotImplementedError` naming exactly what is missing
+(`sampling/scalpel/sampler.py` round 1 is still plain MaxHerding, `U=1`; see
+`CLAUDE.md`'s contribution #1) rather than silently running without it.
+
+**`USE_LORA`/`AUX_LOSS`/`AUGMENT` are the final-training pass** (§6.4/§6.5),
+run AFTER a budget's points are already selected — never inside selection
+itself, which still always trains on the frozen embedding cache. **Every
+budget in the sweep gets its own final-training pass**, not just the largest
+(the confirmed full-curve choice: the research question is whether LoRA
+helps more at low or high budgets). The encoder is loaded exactly ONCE per
+run, reused across every budget's pass.
+
+| Piece | What it does |
+|---|---|
+| `training/lora.py` | Hand-rolled LoRA (no `peft` locally). `LinearLoRA` wraps DINOv2's separate `query`/`value` `nn.Linear` layers; `MultiheadAttentionLoRA` replaces CONCH's fused `nn.MultiheadAttention` with a hand-written forward that re-derives Q/K/V from the same `in_proj_weight` plus a low-rank delta on Q and V (K is never adapted). Both verified against the real modules they wrap: `r=0` is bit-for-bit identical to the frozen original. |
+| `training/losses.py` | `center_loss`, `supcon_loss`, `triplet_loss`, one shared `(features, logits, labels) -> scalar` signature. `supcon`/`triplet` **raise** on any batch with fewer than 2 samples of a present class — a silent near-zero loss on a thin batch is exactly the failure mode this project has already lost debugging time to once (see the minmax-on-a-constant-vector lesson). |
+| `data/augment.py` | `flip_rotate` only — deliberately no color jitter, since this project already lost a method to a stain-shortcut failure from color augmentation on H&E tiles. |
+| `training/finetune.py` | `finetune_and_evaluate` — reads raw pixels for just the selected indices (`RawRGBDataset`, no dataset-wide decode), trains encoder + probe end-to-end when `use_lora=True`, or just the probe (encoder frozen under `inference_mode`) when only `augment` is active. Test-set scoring always uses the frozen embedding cache, never a re-extracted adapted-encoder cache. |
+
+A probe from this pass records `metadata["final_train_cfg"]` (and
+`results["final_train_cfg"]`) — present only when the pass actually ran, so a
+reader can tell "this run never had a final-training axis" apart from "this
+run's final-training axes were all off." No second results key: §2.0 already
+settled this — `USE_LORA=False` and `USE_LORA=True` are two notebook runs
+with two distinct zip names, so nothing can collide inside `results["linear"]`.
 
 Publishing `/kaggle/working/<name>` as a Kaggle Dataset remounts it one level
 deeper (`.../<name>/<name>`), so the notebooks *search* for their caches instead
@@ -329,7 +402,8 @@ that make two archives non-interchangeable (`utils/archive.py`):
 | `extract_visual_features.ipynb` | `visual-dinov2_{dataset}_seed{seed}_{backbone}` |
 | `extract_nucleus_features.ipynb` | `cellvit-nucleus_{dataset}_seed{seed}_{ckpt}_{encoder}_{cap}` |
 | `extract_vlm_features.ipynb` | `vlm_{dataset}_seed{seed}_{vlm}_{description_style}` |
-| `run_al_baseline.ipynb`, `run_al_sampler.ipynb` | `{dataset}_{sampler}_seed{seed}` |
+| `run_al_baseline.ipynb` | `{dataset}_{sampler}_seed{seed}` |
+| `run_al_main.ipynb` | `{dataset}_{sampler}_seed{seed}[_{encoder}]` — `encoder` appended only when not `dinov2` |
 
 **A run needs two Kaggle Datasets attached, and the feature cache cannot stand
 in for the raw images.** `DATA_ROOT` is the raw dataset (`pathmnist_224.npz`,
@@ -411,7 +485,7 @@ Per budget, under `checkpoints/<dataset>/`:
 | File | Contents |
 |---|---|
 | `<run>_selected_budget_<B>.pt` | selected indices, sample ids, labels, per-class counts, sampler config, per-step trace, sanity report, timings, fingerprints |
-| `<run>_probe_budget_<B>.pt` | the probe's linear weights, plus run/budget/seed metadata |
+| `<run>_probe_budget_<B>.pt` | the probe's linear weights, plus run/budget/seed/**encoder** metadata |
 | `<run>_predictions_budget_<B>.pt` | test-set class probabilities and true labels |
 | `<run>_results.pt` | accuracy / precision / recall / macro-F1 and timings for every budget |
 | `<run>.log` | everything printed during the run |
@@ -432,7 +506,27 @@ re-running the sweep.
 `<run>` defaults to the sampler name, extended for `scalpel` with the config
 axes that would otherwise overwrite each other
 (`scalpel_disagreement`, `scalpel_visual_margin`, …), and suffixed `_s<seed>`
-for any seed other than the config default.
+for any seed other than the config default. `_default_run_name` also accepts
+`encoder` (default `"dinov2"`, a non-default value appends e.g. `_conch`) and
+`use_text` (appends `_text` when true) so a future CONCH run of the same
+sampler+config gets a name distinct from its DINOv2 counterpart — without
+this, the two protocols would silently overwrite every file the first one
+wrote, and the notebook's resume check would skip the second protocol's run
+entirely, mistaking the first protocol's leftover results file for a
+finished run of the second. Neither parameter is wired into `run()` yet
+(that is `run_al_main.ipynb`'s job); calling `_default_run_name` with no
+encoder/use_text — as every current notebook does — produces exactly the
+same name it always has.
+
+**A probe checkpoint states which feature space it was trained on.**
+`metadata["encoder"]` (the backbone name) and `metadata["encoder_kind"]`
+(`"dinov2"` today) let `evaluate_al_sampler.ipynb` build the matching test
+features for each run instead of assuming one encoder for everything —
+without this, a checkpoint trained on a different feature space either
+crashes on a shape mismatch or, if the two widths ever coincided, would be
+silently scored against the wrong features. A checkpoint written before this
+field existed has no `encoder_kind` key and is read as DINOv2, so nothing
+already published needs to be regenerated.
 
 Everything a later plot needs is written **during** the run, because none of it
 survives otherwise: the per-step acquisition score exists only inside the greedy

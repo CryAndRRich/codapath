@@ -8,14 +8,33 @@ feature_cache_dir: "features"
 cellvit_cache_dir: "cellvit_features"
 
 models:
-  vit: "facebook/dinov2-base"              
-  vlm_primary: "hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
-  vlm_secondary: "vinid/plip"
-  biomedbert: "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
+  vit: "facebook/dinov2-base"
+  # Read by main.py::run() when image_encoder="conch"
+  # (features/vlm.py::load_conch, extract_vlm_features.ipynb use the same
+  # name). The three lines this replaced (vlm_primary/vlm_secondary/
+  # biomedbert -- BiomedCLIP/PLIP/PubMedBERT) were CODAPath-era leftovers:
+  # nothing in the codebase reads them, superseded by CONCH (features/vlm.py).
+  vlm: "MahmoodLab/CONCH"
 
 training:
   probe_epochs: 100
   probe_lr: 0.001
+
+# §6.4/§6.5: the final-training pass main.py::run()'s final_train_cfg
+# controls, run AFTER a budget's points are selected. Not read automatically
+# by main.py -- run_al_main.ipynb's EDIT cell builds FINAL_TRAIN_CFG from its
+# own USE_LORA/AUX_LOSS/AUGMENT variables and passes it explicitly, the same
+# way sampler_cfg is built from `samplers.<name>` plus OVERRIDES. This block
+# exists so a config file alone documents the available axes and their
+# defaults, without main.py silently defaulting to a shape a reader has to
+# infer from training/finetune.py's own signature.
+final_training:
+  use_lora: false
+  lora_r: 8
+  lora_alpha: 16.0
+  aux_loss: "none"        # none | center | supcon | triplet
+  aux_weight: 0.5          # fixed at 0.5 for every aux_loss kind, once used
+  augment: "none"          # none | flip_rotate
 
 samplers:
   random: {}

@@ -8,13 +8,22 @@ import yaml
 PROJECT = Path(__file__).resolve().parents[1]
 NOTEBOOK_DIR = PROJECT / "notebooks"
 EXPECTED_NOTEBOOKS = {
+    "generate_class_description.ipynb",
     "extract_visual_features.ipynb",
     "extract_nucleus_features.ipynb",
     "extract_vlm_features.ipynb",
-    "run_al_sampler.ipynb",
+    "run_al_main.ipynb",
     "run_al_baseline.ipynb",
     "evaluate_al_sampler.ipynb",
 }
+
+# generate_class_description.ipynb calls no GPU code and reads no dataset
+# image -- it only calls a text API and writes a small JSON file straight
+# into the repo (PLAN_IMPLEMENT.md §3: "generated once, committed, no
+# archive/zip needed"). It is the one notebook exempt from both the
+# /kaggle/input requirement and the zip-your-output requirement below.
+NO_DATASET_NOTEBOOKS = {"generate_class_description.ipynb"}
+NO_ARCHIVE_NOTEBOOKS = {"evaluate_al_sampler.ipynb", "generate_class_description.ipynb"}
 
 
 def _source(cell):
@@ -39,7 +48,8 @@ def test_notebook_cells_are_valid_python_and_pin_the_branch(name):
     notebook = json.loads(path.read_text(encoding="utf-8"))
     source = _all_source(path)
     assert 'REPO_BRANCH = "namhai"' in source
-    assert "/kaggle/input" in source
+    if name not in NO_DATASET_NOTEBOOKS:
+        assert "/kaggle/input" in source
     for index, cell in enumerate(notebook["cells"]):
         if cell["cell_type"] != "code":
             continue
@@ -50,7 +60,7 @@ def test_notebook_cells_are_valid_python_and_pin_the_branch(name):
         ast.parse(body, filename=f"{name}:cell-{index}")
 
 
-@pytest.mark.parametrize("name", sorted(EXPECTED_NOTEBOOKS - {"evaluate_al_sampler.ipynb"}))
+@pytest.mark.parametrize("name", sorted(EXPECTED_NOTEBOOKS - NO_ARCHIVE_NOTEBOOKS))
 def test_producing_notebooks_zip_their_output(name):
     """Kaggle output is only convenient to retrieve as a single archive, and the
     console scrollback is gone once the session ends."""
@@ -101,7 +111,7 @@ def test_extraction_notebooks_verify_the_cache_before_archiving_it(name):
 def test_run_notebook_matches_the_controlled_budget_protocol():
     config = yaml.safe_load((PROJECT / "config" / "config.yaml").read_text(encoding="utf-8"))
     assert config["cumulative_budget"] == [25, 50, 75, 100, 125, 150, 175, 200]
-    source = _all_source(NOTEBOOK_DIR / "run_al_sampler.ipynb")
+    source = _all_source(NOTEBOOK_DIR / "run_al_main.ipynb")
     assert 'SAMPLER = "scalpel"' in source
     # Work is dispatched through the GPU-worker entry point, which resolves its
     # own device: `main.run` takes a torch.device the parent cannot pin.
@@ -122,7 +132,7 @@ def test_run_notebook_matches_the_controlled_budget_protocol():
 def test_run_notebook_offers_the_disagreement_ablation():
     """`visual_margin` is the control that isolates what the cell view adds, so
     it should be one keystroke away rather than something to remember."""
-    source = _all_source(NOTEBOOK_DIR / "run_al_sampler.ipynb")
+    source = _all_source(NOTEBOOK_DIR / "run_al_main.ipynb")
     assert '"uncertainty_mode": "visual_margin"' in source
 
 
@@ -141,7 +151,7 @@ def test_baseline_notebook_never_touches_cellvit():
     """The whole point of this notebook is to run from the published DINOv2
     cache alone. If a CellViT cache path, a `find_cellvit_cache` import, or
     the extraction requirements file creeps back in, the split from
-    run_al_sampler.ipynb has been undone by accident.
+    run_al_main.ipynb has been undone by accident.
 
     This does not forbid the word "CellViT" outright: the assert cell
     legitimately explains the sampler it rejects and why, in a comment and in
@@ -202,7 +212,7 @@ def test_baseline_notebook_keeps_raw_images_and_features_as_separate_mounts():
     "name",
     [
         "run_al_baseline.ipynb",
-        "run_al_sampler.ipynb",
+        "run_al_main.ipynb",
         "extract_visual_features.ipynb",
         "extract_nucleus_features.ipynb",
     ],
@@ -223,7 +233,7 @@ def test_one_configuration_per_run(name):
     assert "SEED = " in source
 
 
-@pytest.mark.parametrize("name", ["run_al_baseline.ipynb", "run_al_sampler.ipynb"])
+@pytest.mark.parametrize("name", ["run_al_baseline.ipynb", "run_al_main.ipynb"])
 def test_run_notebooks_print_an_ordered_results_table(name):
     """Two GPUs share one output stream, so their progress lines interleave and
     a budget's numbers can appear anywhere. The summary cell re-reads the saved
@@ -298,6 +308,7 @@ def test_every_publishing_notebook_writes_its_zip_outside_the_source_tree():
     distinct rather than trusting the layout."""
     for name in (
         "run_al_baseline.ipynb",
+        "run_al_main.ipynb",
         "extract_visual_features.ipynb",
         "extract_nucleus_features.ipynb",
         "extract_vlm_features.ipynb",
@@ -495,3 +506,205 @@ def test_nucleus_notebook_can_store_cell_embeddings_without_crop_dino():
     assert "--skip_crop_dino" in source
     # Instance maps are the visualisation sidecar and must stay available.
     assert "SAVE_INSTANCE_MAPS" in source
+
+
+def test_description_notebook_pins_a_gemini_2x_model_not_3x():
+    """temperature/topK/topP are deprecated and silently ignored on
+    gemini-3.7-flash/3.6-flash/3.5-flash-lite -- generating with
+    temperature=0.0 against one of those is a silent no-op, not an error.
+    The notebook must reject the whole 3.x family in code, not just default
+    away from it."""
+    source = _all_source(NOTEBOOK_DIR / "generate_class_description.ipynb")
+    assert 'MODEL = "gemini-2.5-flash"' in source
+    assert 'not MODEL.startswith("gemini-3")' in source
+
+
+def test_description_notebook_refuses_to_overwrite_without_the_flag():
+    """The written file is a frozen artifact, committed to the repo -- a
+    silent overwrite would invalidate every cached text prototype built from
+    the old text with nothing pointing at why results changed."""
+    source = _all_source(NOTEBOOK_DIR / "generate_class_description.ipynb")
+    assert "OVERWRITE = False" in source
+    assert "out_path.is_file() and not OVERWRITE" in source
+    assert "FileExistsError" in source
+
+
+def test_description_notebook_does_not_zip_or_touch_a_dataset_mount():
+    """This notebook calls a text API and writes one small JSON file straight
+    into the repo -- no GPU cache, no /kaggle/input dataset, no archive."""
+    source = _all_source(NOTEBOOK_DIR / "generate_class_description.ipynb")
+    assert "make_archive" not in source
+    assert "/kaggle/input" not in source
+    assert "DATA_ROOT" not in source
+
+
+def test_description_notebook_keeps_dataset_and_style_singular():
+    source = _all_source(NOTEBOOK_DIR / "generate_class_description.ipynb")
+    for plural in ("DATASETS", "STYLES", "MODELS"):
+        assert plural not in source, f"still sweeps {plural} in one run"
+    assert "STYLE = " in source
+
+
+def test_description_notebook_reads_the_api_key_from_a_kaggle_secret_fallback():
+    """API_KEY left blank in the EDIT cell must not just crash uninformatively
+    -- it should try a Kaggle Secret first, matching the HF_TOKEN pattern
+    extract_vlm_features.ipynb already uses for a gated credential."""
+    source = _all_source(NOTEBOOK_DIR / "generate_class_description.ipynb")
+    assert "UserSecretsClient" in source
+    assert "GEMINI_API_KEY" in source
+
+
+def test_description_notebook_installs_the_genai_package():
+    source = _all_source(NOTEBOOK_DIR / "generate_class_description.ipynb")
+    assert "google-genai" in source
+
+
+def test_evaluate_notebook_reads_encoder_from_probe_metadata_not_hardcoded():
+    """PLAN_IMPLEMENT.md §2.1: the notebook previously built ONE DINOv2
+    extractor and reused it for every RUN_NAMES entry, so a probe trained on
+    a different encoder would be scored against the wrong test features. It
+    must read encoder/encoder_kind off each checkpoint's own metadata."""
+    source = _all_source(NOTEBOOK_DIR / "evaluate_al_sampler.ipynb")
+    assert 'metadata.get("encoder"' in source
+    assert 'metadata.get("encoder_kind"' in source
+    # Must not silently drop back to a single hard-coded DINOv2 extractor
+    # call outside the per-encoder branch below.
+    assert "test_features_by_encoder" in source
+
+
+def test_evaluate_notebook_branches_on_encoder_kind_not_a_name_substring():
+    """Guessing from the encoder name (e.g. `"dinov2" in encoder`) breaks the
+    moment a VLM's HF repo id happens to contain a misleading substring --
+    the branch must be decided by the explicit `encoder_kind` field."""
+    source = _all_source(NOTEBOOK_DIR / "evaluate_al_sampler.ipynb")
+    assert '"dinov2" in encoder' not in source
+    assert 'kind == "dinov2"' in source
+    assert 'kind == "vlm"' in source
+
+
+def test_evaluate_notebook_asserts_probe_and_test_feature_width_match():
+    """A dimension mismatch must fail loudly with an actionable message, not
+    crash deep inside a matmul or -- if two spaces ever shared a width --
+    silently score a probe on features it was never trained on."""
+    source = _all_source(NOTEBOOK_DIR / "evaluate_al_sampler.ipynb")
+    assert "probe.fc.in_features == test_features.shape[1]" in source
+
+
+def test_evaluate_notebook_loads_vlm_test_features_from_raw_space_only():
+    """PROJ_SPACE is for comparing an image against text, not for a linear
+    probe -- every probe in this project trains on RAW_SPACE. Reading the
+    wrong one would not crash (both are 512-d for CONCH) and would silently
+    score every VLM probe on features it never saw during training."""
+    source = _all_source(NOTEBOOK_DIR / "evaluate_al_sampler.ipynb")
+    assert 'np.load(paths["test"])' in source
+    assert 'paths["proj_test"]' not in source
+
+
+def test_evaluate_notebook_resolves_vlm_cache_by_name_not_hardcoded_path():
+    source = _all_source(NOTEBOOK_DIR / "evaluate_al_sampler.ipynb")
+    assert "find_vlm_cache(" in source
+    assert "vlm_feature_cache_paths(" in source
+
+
+def test_main_notebook_still_rejects_use_text():
+    """USE_TEXT is the round-1 cold-start text prior -- still not
+    implemented (CLAUDE.md contribution #1) even though the final-training
+    axes below it now are. This must keep raising."""
+    source = _all_source(NOTEBOOK_DIR / "run_al_main.ipynb")
+    assert "if USE_TEXT:" in source
+    assert "raise NotImplementedError(" in source
+    assert "contribution #1" in source
+
+
+def test_main_notebook_final_training_axes_are_wired_not_raising():
+    """USE_LORA/AUX_LOSS/AUGMENT went from "not yet implemented, raises" to
+    actually wired into main.run() once step 11 landed -- the notebook must
+    build and pass a real final_train_cfg, not still refuse every non-default
+    value."""
+    source = _all_source(NOTEBOOK_DIR / "run_al_main.ipynb")
+    assert "FINAL_TRAIN_CFG = {" in source
+    assert '"use_lora": USE_LORA' in source
+    assert '"aux_loss": AUX_LOSS' in source
+    assert '"augment": AUGMENT' in source
+    assert "final_train_cfg=FINAL_TRAIN_CFG" in source
+    # The old blanket raise for these three axes must be gone.
+    assert "USE_LORA / AUX_LOSS / AUGMENT are the final-training axes" not in source
+
+
+def test_main_notebook_still_gates_supcon_and_triplet_on_batch_size():
+    source = _all_source(NOTEBOOK_DIR / "run_al_main.ipynb")
+    assert 'AUX_LOSS in ("supcon", "triplet")' in source
+    assert "2 * dataset_info[\"num_classes\"]" in source
+
+
+# --- extract_vlm_features.ipynb: 2-GPU sharding ---
+#
+# The RAM failure this pins is silent: without the parent-side mmap export,
+# two workers each eagerly read a ~15 GiB .npz, one is OOM-killed inside
+# np.load before printing anything, and the notebook restarts with no
+# traceback naming the cause. Asserting on the CALL (via ast) rather than on
+# a substring, because a comment explaining the export would satisfy a text
+# search just as well -- the same failure mode as the --no-deps guard.
+
+
+def _vlm_notebook_code() -> str:
+    path = NOTEBOOK_DIR / "extract_vlm_features.ipynb"
+    payload = json.loads(path.read_text())
+    return "\n".join(
+        "\n".join(
+            line for line in "".join(cell["source"]).splitlines()
+            if not line.strip().startswith(("%", "!"))
+        )
+        for cell in payload["cells"] if cell["cell_type"] == "code"
+    )
+
+
+def _called_function_names(source: str) -> set:
+    tree = ast.parse(source)
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                names.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                names.add(func.attr)
+    return names
+
+
+def test_vlm_notebook_exports_the_mmap_before_sharding():
+    """A 2-GPU run on a .npz MUST map the pixels, or one worker is OOM-killed
+    silently. Assert the export call exists, not that a comment mentions it."""
+    source = _vlm_notebook_code()
+    assert "export_npz_to_npy" in _called_function_names(source), (
+        "extract_vlm_features.ipynb must call export_npz_to_npy in the parent "
+        "before launching shard workers"
+    )
+
+
+def test_vlm_notebook_passes_the_mmap_dir_to_the_workers():
+    """Exporting is useless if the workers are not told to use it."""
+    source = _vlm_notebook_code()
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "build_vlm_shard_jobs"):
+            keywords = {kw.arg for kw in node.keywords}
+            assert "mmap_cache_dir" in keywords, (
+                "build_vlm_shard_jobs must receive mmap_cache_dir, or each "
+                "worker reads the .npz eagerly"
+            )
+            assert "batch_size" in keywords, "batch_size (the VRAM knob) must be passed"
+            return
+    raise AssertionError("extract_vlm_features.ipynb never calls build_vlm_shard_jobs")
+
+
+def test_vlm_notebook_shards_over_visible_gpus_and_assembles():
+    source = _vlm_notebook_code()
+    called = _called_function_names(source)
+    assert "visible_gpu_count" in called, "SHARDS must come from the visible GPU count"
+    assert "run_variants_parallel" in called, "shards must actually run in parallel"
+    assert "assemble_vlm_feature_shards" in called, (
+        "sharded output must be assembled into the single cache layout "
+        "run_al_main.ipynb reads"
+    )

@@ -30,6 +30,7 @@ re-fitting it there costs seconds against re-running the sweep.
 """
 
 import argparse
+import json
 import os
 import time
 from typing import Dict, List, Optional
@@ -46,10 +47,12 @@ from evaluation.sanity import (
     check_selection,
     format_report as format_sanity_report,
 )
+from features.vlm import RAW_SPACE, vlm_feature_cache_paths
 from features.visual import get_or_extract_features
 from sampling import get_sampler
 from sampling.specs import spec_for
 from training.checkpoint import save_probe
+from training.finetune import finetune_and_evaluate, needs_pixels
 from training.probe import train_probe
 from utils import clear_memory, set_seed, tee_stdout
 from utils.progress import Stopwatch, format_duration
@@ -91,18 +94,52 @@ def _prefix_trace(master: Optional[SelectionTrace], budget: int):
     return clipped
 
 
-def _default_run_name(sampler_name: str, sampler_cfg: Dict) -> str:
-    """Encode the config axes that would otherwise overwrite each other."""
-    if sampler_name != "scalpel":
-        return sampler_name
-    parts = [sampler_name, sampler_cfg.get("uncertainty_mode", "disagreement")]
-    pooling = sampler_cfg.get("cell_pooling", "mean")
-    if pooling != "mean":
-        parts.append(pooling)
-    if sampler_cfg.get("missing_impute", "mean") != "mean":
-        parts.append(sampler_cfg["missing_impute"])
-    if float(sampler_cfg.get("consistency_weight", 0.0)) > 0.0:
-        parts.append(f"cons{sampler_cfg['consistency_weight']}".replace(".", "p"))
+def _default_run_name(
+    sampler_name: str,
+    sampler_cfg: Dict,
+    *,
+    encoder: str = "dinov2",
+    use_text: bool = False,
+) -> str:
+    """Encode the config axes that would otherwise overwrite each other.
+
+    `encoder` and `use_text` default to the values every run had before
+    `features/vlm.py` existed, so a caller that does not pass them gets
+    EXACTLY the old name back (`test_default_run_name_is_unchanged`) --
+    every already-published baseline/scalpel run stays resumable and
+    unorphaned.
+
+    Without these two params in the signature at all, a DINOv2 run and a
+    CONCH run of the same sampler+config could not be told apart by name:
+    `_default_run_name('uncertainty_herding', {})` returns
+    `'uncertainty_herding'` regardless of which encoder produced it, so the
+    second protocol to run would overwrite every file the first wrote --
+    `_results.pt`, `_selected_budget_*.pt`, `_probe_budget_*.pt`,
+    `_predictions_budget_*.pt`, its log -- and the notebook's resume check
+    (`<name>_results.pt exists`) would then silently SKIP the second
+    protocol's run entirely, mistaking the first protocol's leftover file
+    for a finished run of the second (PLAN_IMPLEMENT.md §6.2).
+
+    `use_text` is included even though no sampler reads a text prior yet
+    (that is `run_al_main.ipynb`'s job, step 10): the round-1 cold-start
+    text prior is a config-driven axis of a run, not of the sampler
+    function's own kwargs, so it has to be nameable the same way `encoder`
+    is, from the same call site, before that call site exists.
+    """
+    parts = [sampler_name]
+    if sampler_name == "scalpel":
+        parts.append(sampler_cfg.get("uncertainty_mode", "disagreement"))
+        pooling = sampler_cfg.get("cell_pooling", "mean")
+        if pooling != "mean":
+            parts.append(pooling)
+        if sampler_cfg.get("missing_impute", "mean") != "mean":
+            parts.append(sampler_cfg["missing_impute"])
+        if float(sampler_cfg.get("consistency_weight", 0.0)) > 0.0:
+            parts.append(f"cons{sampler_cfg['consistency_weight']}".replace(".", "p"))
+    if encoder != "dinov2":
+        parts.append(encoder)
+    if use_text:
+        parts.append("text")
     return "_".join(parts)
 
 
@@ -127,7 +164,21 @@ def _load_cell_view(
 
     cell_source = sampler_cfg.get("cell_source", "cellvit_embedding")
     if cell_source == "crop_dino" and cache.manifest.get("dino_backbone") != visual_backbone:
-        raise ValueError("Crop-DINO cache backbone does not match the run backbone")
+        # `crop_dino` embeddings are produced by a DINOv2 forward pass over
+        # each nucleus crop (nucleus/crop_dino.py); the manifest records
+        # exactly which DINOv2 checkpoint. Any run whose own visual_backbone
+        # is not that same checkpoint -- including every CONCH run, whose
+        # `visual_backbone` is a CONCH model id -- would be mixing a CONCH
+        # image space with a DINOv2 cell space, which `sampling/scalpel`
+        # assumes are the same space (PLAN_IMPLEMENT.md §6.3).
+        raise ValueError(
+            f"cell_source='crop_dino' was extracted with DINOv2 backbone "
+            f"{cache.manifest.get('dino_backbone')!r}, but this run's "
+            f"visual_backbone is {visual_backbone!r} -- mixing a different "
+            "image encoder (e.g. CONCH) with crop_dino cell embeddings mixes "
+            "two incompatible feature spaces. Use cell_source='cellvit_embedding' "
+            "instead, which is encoder-independent."
+        )
 
     pooling = sampler_cfg.get("cell_pooling", "mean")
     reliability_mode = sampler_cfg.get("reliability_mode", "valid")
@@ -154,6 +205,74 @@ def _load_cell_view(
     return view, cache.manifest
 
 
+def _load_vlm_features(
+    vlm_cache_dir: str,
+    dataset_key: str,
+    random_seed: int,
+    vlm_name: str,
+    n_train: int,
+    n_test: int,
+    train_fingerprint: str,
+    test_fingerprint: str,
+):
+    """Read a VLM's RAW_SPACE image features from an already-built cache.
+
+    Unlike DINOv2, an AL run never extracts CONCH features itself: doing so
+    would need the `conch` package, an HF token and a 448x448 forward pass
+    inside a function that a 2-GPU AL sweep already calls per worker, all to
+    duplicate what `extract_vlm_features.ipynb` already does. So this is a
+    READ only -- `extract_vlm_features.ipynb` must have published the cache
+    first, and a missing or mismatched cache raises rather than falling back
+    to extraction.
+
+    Only RAW_SPACE (`proj_contrast=False, normalize=False`) is read -- the
+    space every probe and coverage kernel in this project trains on.
+    PROJ_SPACE is never read here; using it would not crash (both are 512-d
+    for CONCH) but would silently train on features meant only for comparing
+    an image against text.
+    """
+    paths = vlm_feature_cache_paths(vlm_cache_dir, dataset_key, random_seed, vlm_name)
+    if not (os.path.exists(paths["train"]) and os.path.exists(paths["test"])
+             and os.path.exists(paths["manifest"])):
+        raise FileNotFoundError(
+            f"No CONCH feature cache for {dataset_key}_seed{random_seed}_{vlm_name} "
+            f"under {vlm_cache_dir!r}. Run extract_vlm_features.ipynb with "
+            f"DATASET={dataset_key!r}, SEED={random_seed}, VLM={vlm_name!r} first -- "
+            "an AL run reads this cache, it does not build it."
+        )
+
+    with open(paths["manifest"], "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if manifest.get("dataset") != dataset_key or manifest.get("seed") != random_seed:
+        raise ValueError(
+            f"CONCH cache manifest at {paths['manifest']} does not match this run "
+            f"(dataset={dataset_key!r}, seed={random_seed}): got {manifest}"
+        )
+    if manifest.get("space") != RAW_SPACE:
+        raise ValueError(
+            f"{paths['manifest']} declares space={manifest.get('space')!r}, expected "
+            f"{RAW_SPACE!r} -- an AL run must never train on PROJ_SPACE features"
+        )
+    if manifest.get("train_fingerprint") != train_fingerprint or \
+            manifest.get("test_fingerprint") != test_fingerprint:
+        raise ValueError(
+            f"{paths['manifest']} was built from a different train/test split "
+            "(sample-order fingerprint mismatch) than this run's dataset -- "
+            "re-run extract_vlm_features.ipynb against the current data."
+        )
+
+    train_features = np.load(paths["train"])
+    test_features = np.load(paths["test"])
+    if train_features.shape[0] != n_train or test_features.shape[0] != n_test:
+        raise ValueError(
+            f"CONCH cache row count does not match this dataset: cache has "
+            f"{train_features.shape[0]} train / {test_features.shape[0]} test rows, "
+            f"expected {n_train} / {n_test}"
+        )
+    print(f"[vlm] Loaded RAW_SPACE cache -> {paths['train']}")
+    return train_features.astype(np.float32), test_features.astype(np.float32)
+
+
 def run(
     data_path: str,
     sampler_name: str,
@@ -174,9 +293,57 @@ def run(
     mmap_cache_dir: Optional[str] = None,
     run_name: Optional[str] = None,
     shard_tag: Optional[str] = None,
+    image_encoder: str = "dinov2",
+    vlm_cache_dir: str = "vlm_features",
+    hf_token: Optional[str] = None,
+    final_train_cfg: Optional[Dict] = None,
 ) -> None:
+    """
+    `image_encoder` ("dinov2" | "conch") decides the ONE feature space every
+    stage of this run uses -- the coverage kernel, the disagreement probes
+    inside `scalpel`, and the final evaluation probe -- because a run mixing
+    encoders across stages is not a comparable protocol
+    (PLAN_IMPLEMENT.md §6.2). `"conch"` reads `RAW_SPACE` (proj_contrast=False,
+    normalize=False) from `features/vlm.py::get_or_extract_vlm_features`, never
+    `PROJ_SPACE` -- that space is only for comparing an image against text, and
+    using it here would not crash (both are 512-d) but would silently train
+    every probe on features it was never meant for.
+
+    `final_train_cfg`, if given, is a dict with any of `use_lora` (bool),
+    `lora_r` (int), `lora_alpha` (float), `aux_loss`
+    ("none"|"center"|"supcon"|"triplet"), `aux_weight` (float), `augment`
+    ("none"|"flip_rotate") -- the PLAN_IMPLEMENT.md §6.4 final-training pass,
+    run AFTER each budget's points are selected, never during selection
+    itself. `None` (the default) and a dict where `training.finetune.needs_pixels`
+    is False are identical: both keep the exact fast path this project has
+    always run -- `training.probe.train_probe` on the frozen embedding
+    cache, no pixel loaded. Confirmed choice (PLAN_IMPLEMENT.md §6.4): the
+    final-training pass runs at EVERY budget in the sweep, not only the
+    largest -- a full learning curve, not a single point, because the
+    research question is whether LoRA helps more at low or high budgets.
+    """
+    if image_encoder not in ("dinov2", "conch"):
+        raise ValueError(f"image_encoder must be 'dinov2' or 'conch', got {image_encoder!r}")
+
+    # A token left unset falls back to the ambient environment, which is how
+    # `huggingface_hub.login()` (extract_vlm_features.ipynb) and a Kaggle
+    # Secret both make themselves visible. Resolved here rather than at the
+    # `load_conch` call so the two share one rule.
+    hf_token = hf_token or os.environ.get("HF_TOKEN") or None
+
+    final_train_cfg = dict(final_train_cfg or {})
+    ft_use_lora = bool(final_train_cfg.get("use_lora", False))
+    ft_lora_r = int(final_train_cfg.get("lora_r", 8))
+    ft_lora_alpha = float(final_train_cfg.get("lora_alpha", 16.0))
+    ft_aux_loss = final_train_cfg.get("aux_loss", "none")
+    ft_aux_weight = float(final_train_cfg.get("aux_weight", 0.5))
+    ft_augment = final_train_cfg.get("augment", "none")
+    run_final_training = needs_pixels(ft_use_lora, ft_augment)
+
     spec = spec_for(sampler_name)
-    output_name = _safe_run_name(run_name or _default_run_name(sampler_name, sampler_cfg))
+    output_name = _safe_run_name(
+        run_name or _default_run_name(sampler_name, sampler_cfg, encoder=image_encoder)
+    )
 
     # A budget-sharded run splits `cumulative_budget` across processes. The
     # per-budget files are already named by budget and so never collide, but
@@ -224,13 +391,66 @@ def run(
         train_labels = _dataset_labels(train_dataset)
         test_labels = _dataset_labels(test_dataset)
 
-        visual_backbone = model_cfg.get("vit", "facebook/dinov2-base")
-        train_features, test_features = get_or_extract_features(
-            train_loader, test_loader, dataset_key, random_seed, visual_backbone,
-            device, cache_dir=feature_cache_dir,
-            train_fingerprint=train_fingerprint, test_fingerprint=test_fingerprint,
-        )
+        # `image_encoder` decides which cache this run reads -- never both:
+        # the coverage kernel, the disagreement probes, and the evaluation
+        # probe all live in whichever ONE space `visual_backbone` names below.
+        # The loaders above still use the default DINOv2 transform regardless
+        # of `image_encoder`, because nothing here decodes a pixel through
+        # them either way (see the num_workers=0 comment above) -- they exist
+        # only for labels, sample IDs and the fingerprint, all of which come
+        # from `sample_id`, not pixels (tests/test_loaders_transform.py pins
+        # this).
+        if image_encoder == "conch":
+            visual_backbone = model_cfg.get("vlm", "MahmoodLab/CONCH")
+            train_features, test_features = _load_vlm_features(
+                vlm_cache_dir, dataset_key, random_seed, visual_backbone,
+                n_train=len(train_dataset), n_test=len(test_dataset),
+                train_fingerprint=train_fingerprint, test_fingerprint=test_fingerprint,
+            )
+        else:
+            visual_backbone = model_cfg.get("vit", "facebook/dinov2-base")
+            train_features, test_features = get_or_extract_features(
+                train_loader, test_loader, dataset_key, random_seed, visual_backbone,
+                device, cache_dir=feature_cache_dir,
+                train_fingerprint=train_fingerprint, test_fingerprint=test_fingerprint,
+            )
         clear_memory()
+
+        # Final-training encoder (§6.4) -- loaded ONCE here, reused across
+        # every budget's final-training pass, never per-budget: reloading a
+        # checkpoint 8 times (once per budget in the sweep) would dominate
+        # this pass's cost far more than the pass itself does. `None` when
+        # this run does not need pixels at all -- the frozen `train_probe`
+        # path below never touches it.
+        ft_encoder_model = None
+        ft_conch_preprocess = None
+        if run_final_training:
+            if image_encoder == "dinov2":
+                from transformers import Dinov2Model
+
+                ft_encoder_model = Dinov2Model.from_pretrained(visual_backbone)
+                if ft_use_lora:
+                    from training.lora import apply_lora_to_dinov2
+
+                    apply_lora_to_dinov2(ft_encoder_model, r=ft_lora_r, alpha=ft_lora_alpha)
+                else:
+                    ft_encoder_model.requires_grad_(False)
+            else:
+                from features.vlm import load_conch
+
+                ft_encoder_model, ft_conch_preprocess = load_conch(
+                    visual_backbone, device, hf_token=hf_token
+                )
+                if ft_use_lora:
+                    from training.lora import apply_lora_to_conch
+
+                    apply_lora_to_conch(ft_encoder_model, r=ft_lora_r, alpha=ft_lora_alpha)
+                else:
+                    ft_encoder_model.requires_grad_(False)
+            print(
+                f"[final-train] encoder={visual_backbone} use_lora={ft_use_lora} "
+                f"aux_loss={ft_aux_loss} augment={ft_augment}"
+            )
 
         # The probe always trains on visual_backbone features, and every
         # sampler currently selects in that same space -- no sampler declares
@@ -353,12 +573,41 @@ def run(
 
             if verbose:
                 print(f"\n── {output_name} | budget={budget} ──")
-            probe = train_probe(
-                labeled_features, labeled_labels, num_classes, probe_epochs, probe_lr, device
-            )
-            accuracy, precision, recall, f1 = evaluate_probe(
-                probe, test_features, test_labels, device
-            )
+            if run_final_training:
+                # §6.4: every budget gets its own final-training pass (the
+                # confirmed full-curve choice), reusing the ONE encoder
+                # loaded above rather than reloading it per budget.
+                probe, ft_metrics = finetune_and_evaluate(
+                    train_dataset=train_dataset,
+                    selected_indices=selected_indices,
+                    labels=train_labels,
+                    test_features=test_features,
+                    test_labels=test_labels,
+                    num_classes=num_classes,
+                    device=device,
+                    probe_epochs=probe_epochs,
+                    probe_lr=probe_lr,
+                    image_encoder=image_encoder,
+                    use_lora=ft_use_lora,
+                    lora_r=ft_lora_r,
+                    lora_alpha=ft_lora_alpha,
+                    aux_loss=ft_aux_loss,
+                    aux_weight=ft_aux_weight,
+                    augment=ft_augment,
+                    encoder_model=ft_encoder_model,
+                    conch_preprocess=ft_conch_preprocess,
+                )
+                accuracy, precision, recall, f1 = (
+                    ft_metrics["acc"], ft_metrics["precision"],
+                    ft_metrics["recall"], ft_metrics["f1"],
+                )
+            else:
+                probe = train_probe(
+                    labeled_features, labeled_labels, num_classes, probe_epochs, probe_lr, device
+                )
+                accuracy, precision, recall, f1 = evaluate_probe(
+                    probe, test_features, test_labels, device
+                )
             results[budget] = {
                 "acc": accuracy, "precision": precision, "recall": recall, "f1": f1,
                 "selection_seconds": selection_seconds,
@@ -375,6 +624,24 @@ def run(
                     "dataset": dataset_key,
                     "class_names": list(class_names),
                     "metrics": results[budget],
+                    # Which feature space this probe was trained on. Without
+                    # this, evaluate_al_sampler.ipynb has no way to tell a
+                    # DINOv2 run (768-d) from a CONCH run (512-d, RAW_SPACE)
+                    # apart — a dimension mismatch crashes, but if two spaces
+                    # ever coincide in width it would silently score a probe
+                    # against the wrong test features (PLAN_IMPLEMENT.md §2.1).
+                    # `encoder_kind` is explicit rather than inferred from the
+                    # `encoder` string (e.g. guessing "dinov2" is in the name)
+                    # so a reader never has to pattern-match a HF repo id to
+                    # know which cache-loading path applies.
+                    "encoder": visual_backbone,
+                    "encoder_kind": image_encoder,
+                    # Only present when this probe went through the §6.4
+                    # final-training pass -- absent (not a False-valued key)
+                    # for the ordinary frozen-embedding path, so a reader can
+                    # tell "this run never had a final-training axis" apart
+                    # from "this run's final-training axes were all off".
+                    **({"final_train_cfg": final_train_cfg} if run_final_training else {}),
                 },
             )
             # Test-set predictions are what a confusion matrix or a per-class
@@ -396,6 +663,9 @@ def run(
             sweep_watch.advance()
             print(f"[sweep] {sweep_watch.line()}")
 
+        del ft_encoder_model
+        clear_memory()
+
         _save(
             os.path.join(save_dir, f"{output_name}{shard_suffix}_results.pt"),
             {
@@ -416,6 +686,9 @@ def run(
                 "train_fingerprint": train_fingerprint,
                 "test_fingerprint": test_fingerprint,
                 "cellvit_manifest": cellvit_manifest,
+                # Present only when the final-training pass ran, same
+                # reasoning as the probe metadata's own final_train_cfg key.
+                **({"final_train_cfg": final_train_cfg} if run_final_training else {}),
             },
         )
         worst = max(
@@ -536,6 +809,38 @@ def main() -> None:
     parser.add_argument("--feature_cache_dir", default=None)
     parser.add_argument("--cellvit_cache_dir", default=None)
     parser.add_argument("--run_name", default=None)
+    parser.add_argument(
+        "--image_encoder", default="dinov2", choices=["dinov2", "conch"],
+        help="which frozen image encoder this run's whole pipeline uses",
+    )
+    parser.add_argument(
+        "--vlm_cache_dir", default=None,
+        help="directory extract_vlm_features.ipynb published its cache into "
+             "(only read when --image_encoder=conch)",
+    )
+    parser.add_argument(
+        "--hf_token", default=None,
+        help="Hugging Face token for the gated CONCH checkpoint. Only needed "
+             "when --image_encoder=conch AND the final-training pass loads the "
+             "model (--use_lora / --augment); reading the feature cache needs "
+             "no token. Defaults to the HF_TOKEN environment variable, which "
+             "is preferred -- a token on the command line lands in shell "
+             "history and in `ps` output.",
+    )
+    parser.add_argument(
+        "--use_lora", action="store_true",
+        help="fine-tune image_encoder's attention via LoRA in the final-"
+             "training pass (§6.4); needs raw pixels, runs after selection",
+    )
+    parser.add_argument("--lora_r", type=int, default=None)
+    parser.add_argument("--lora_alpha", type=float, default=None)
+    parser.add_argument(
+        "--aux_loss", default=None, choices=["none", "center", "supcon", "triplet"],
+    )
+    parser.add_argument("--aux_weight", type=float, default=None)
+    parser.add_argument(
+        "--augment", default=None, choices=["none", "flip_rotate"],
+    )
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
         "--set", nargs="*", default=[], metavar="KEY=VALUE",
@@ -554,6 +859,23 @@ def main() -> None:
     training_cfg = config.get("training", {})
     sampler_cfg = dict(config.get("samplers", {}).get(args.sampler, {}))
     sampler_cfg.update(_parse_overrides(args.set))
+
+    # CLI flags override config.yaml's final_training defaults, same
+    # precedence as every other --flag/config pair here (probe_epochs,
+    # feature_cache_dir, ...).
+    final_train_defaults = config.get("final_training", {})
+    final_train_cfg = {
+        "use_lora": args.use_lora or bool(final_train_defaults.get("use_lora", False)),
+        "lora_r": args.lora_r if args.lora_r is not None else final_train_defaults.get("lora_r", 8),
+        "lora_alpha": args.lora_alpha if args.lora_alpha is not None
+            else final_train_defaults.get("lora_alpha", 16.0),
+        "aux_loss": args.aux_loss if args.aux_loss is not None
+            else final_train_defaults.get("aux_loss", "none"),
+        "aux_weight": args.aux_weight if args.aux_weight is not None
+            else final_train_defaults.get("aux_weight", 0.5),
+        "augment": args.augment if args.augment is not None
+            else final_train_defaults.get("augment", "none"),
+    }
 
     seed = args.seed if args.seed is not None else config.get("random_seed", 42)
     save_dir = args.save_dir or os.path.join(config.get("output_dir", "checkpoints"), args.dataset)
@@ -586,6 +908,10 @@ def main() -> None:
         feature_cache_dir=args.feature_cache_dir or config.get("feature_cache_dir", "features"),
         cellvit_cache_dir=args.cellvit_cache_dir or config.get("cellvit_cache_dir", "cellvit_features"),
         run_name=args.run_name,
+        image_encoder=args.image_encoder,
+        vlm_cache_dir=args.vlm_cache_dir or config.get("vlm_cache_dir", "vlm_features"),
+        hf_token=args.hf_token or os.environ.get("HF_TOKEN") or None,
+        final_train_cfg=final_train_cfg,
     )
 
 

@@ -14,14 +14,13 @@ files, per the naming convention `features/visual.py` and
 `scripts/extract_cellvit_features.py` actually use. Nothing here changes that
 convention; it only searches for it.
 
-This module is the READ side only. Archive WRITING is deliberately not here:
-`extract_visual_features.ipynb` and `extract_nucleus_features.ipynb` already
-write to `/kaggle/working` top-level and delete the loose cache afterward (no
-terminal exists in a "Save & Run All" session, so the zip must be the only
-thing left for the Output tab to show), while `run_al_sampler.ipynb` writes to
-an `archive/` subdirectory and keeps the originals. Those two patterns differ
-on purpose for different constraints, and unifying them is a separate decision
-this module should not make silently.
+This module is the READ side only. Archive WRITING lives in `utils/archive.py`
+instead: every publishing notebook (both extraction notebooks,
+`run_al_baseline.ipynb`, `run_al_main.ipynb`, `extract_vlm_features.ipynb`)
+writes to `/kaggle/working` top-level and deletes the loose cache afterward --
+no terminal exists in a "Save & Run All" session, so the zip must be the only
+thing left for the Output tab to show. `kaggle.py` is the READ side,
+`archive.py` is the WRITE side; keeping them separate mirrors that split.
 """
 
 from __future__ import annotations
@@ -33,6 +32,7 @@ __all__ = [
     "find_dir_containing",
     "find_data_root",
     "find_visual_cache",
+    "find_vlm_cache",
     "find_cellvit_cache",
 ]
 
@@ -117,6 +117,34 @@ def find_visual_cache(
     if found is None:
         return None
     if not (found / f"{base}_manifest.json").is_file():
+        return None
+    return found
+
+
+def find_vlm_cache(
+    dataset: str,
+    seed: int,
+    vlm_name: str,
+    hint: Optional[str] = None,
+) -> Optional[Path]:
+    """Directory containing `{dataset}_seed{seed}_{vlm_safe}_train.npy` **and**
+    its manifest -- the naming convention `features/vlm.py::vlm_feature_cache_paths`
+    writes. Same shape as `find_visual_cache`; kept separate rather than shared
+    because the VLM cache has a second manifest (`_proj_manifest.json`) the
+    DINOv2 cache does not, and this must not silently accept one without it.
+
+    `vlm_name` is sanitized the same way `features/vlm.py::_safe_name` does
+    (`/` and `:` both replaced), since a VLM name like `MahmoodLab/CONCH`
+    cannot appear in a filename as-is.
+    """
+    safe_vlm = vlm_name.replace("/", "_").replace(":", "_")
+    base = f"{dataset}_seed{seed}_{safe_vlm}"
+    found = find_dir_containing(f"{base}_train.npy", hint=hint)
+    if found is None:
+        return None
+    if not (found / f"{base}_manifest.json").is_file():
+        return None
+    if not (found / f"{base}_proj_manifest.json").is_file():
         return None
     return found
 

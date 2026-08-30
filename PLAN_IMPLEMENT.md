@@ -852,23 +852,279 @@ không phải sắp xếp tuỳ ý — mỗi bước ghi rõ nó chặn cái gì
    9 + `test_archive_naming.py` 2). `test_import_graph.py` không cần sửa vì
    import trễ đã sạch từ đầu — tự chạy qua, không cần test riêng. 366 test
    pass, pyflakes sạch.
-7. **`generate_class_description.ipynb`** (§3) — cần trước khi `USE_TEXT` với
-   style `llm_*` chạy được. Độc lập với bước 5, có thể đổi chỗ.
-8. **`evaluate_al_sampler.ipynb` đọc encoder từ metadata** (§2.1) — **phải xong
-   TRƯỚC khi chạy run CONCH đầu tiên**, không phải sau. Hiện nó hard-code
-   `DINOv2Extractor`, nên một run Protocol B sẽ bị chấm bằng feature DINOv2:
-   probe 512-d gặp feature 768-d thì crash (còn may), nhưng nếu chiều tình cờ
-   khớp thì ra số vô nghĩa mà không có gì báo. Rẻ, và bỏ quên thì tốn cả session
-   GPU mới phát hiện.
-9. **`_default_run_name` + encoder tường minh** (§6.2) — cũng nên làm sớm và
-   độc lập: nó chỉ là đổi chữ ký + test, nhưng bỏ quên thì Protocol B ghi đè
-   Protocol A **và bị resume skip lặng lẽ**. Làm trước bước 9 để `run_al_main`
-   sinh tên đúng ngay từ đầu.
-10. **`run_al_main` phần chọn mẫu** (§6.1–6.3) — encoder + text, chưa train
-   cuối. Xoá `run_al_sampler.ipynb` ở bước này (nó bị thay thế), cập nhật
-   `EXPECTED_NOTEBOOKS`.
-11. **Train cuối** (§6.4, §6.5) — LoRA, loss phụ, augment. Phần nhiều code
-    nhất, và là phần duy nhất phụ thuộc vào tất cả những bước trên.
+7. ~~**`generate_class_description.ipynb`**~~ (§3) — **XONG**. Cần trước khi
+   `USE_TEXT` với style `llm_*` chạy được.
+   - `features/descriptions.py` mới: `load_descriptions(dataset, style, config=None)`
+     — `style="manual"` đọc thẳng `datasets.<dataset>.descriptions` trong
+     `config.yaml`, không cần file, là control mọi style LLM phải vượt qua.
+     Style khác đọc `config/descriptions/{dataset}_{style}.json`, raise
+     `FileNotFoundError` có hướng dẫn cụ thể nếu chưa chạy notebook, raise
+     `ValueError` nếu thứ tự lớp trong file lệch khỏi `config.yaml` hiện tại
+     (im lặng lệch thì mọi text prototype dựng trên đó sai mà không có gì báo).
+   - `generate_descriptions(...)` gọi Gemini qua package `google-genai` (SDK
+     mới, không phải `google-generativeai` cũ đang bị Google ngừng phát
+     triển) — **import trễ trong hàm**, đúng pattern `conch` ở bước 6, vì
+     `google-genai` không cài local. Raise `ValueError` trước khi gọi mạng nếu
+     `model.startswith("gemini-3")` (temperature/topK/topP bị deprecated và
+     **bỏ qua âm thầm** ở `gemini-3.7-flash`/`3.6-flash`/`3.5-flash-lite` —
+     dùng nhầm là `TEMPERATURE=0.0` thành no-op mà không có lỗi nào báo), nếu
+     `style="manual"` (style này không gọi API, đi qua `load_descriptions`),
+     hoặc `style` không hợp lệ. Ba prompt template (`llm_short`,
+     `llm_morphology`, `llm_multi`) đặt trong module (không nhúng trong
+     notebook) để test được đúng chuỗi gửi đi mà không phải chạy notebook.
+   - `description_sha256` tính hash y hệt convention đã có ở
+     `features/vlm.py::description_sha256` (JSON theo key đã sort) — cố tình
+     KHÔNG import chéo giữa hai module (không module nào thật sự cần phần còn
+     lại của module kia), chỉ giữ cùng công thức hash để trường `sha256` của
+     file mô tả và trường `description_sha256` của manifest VLM so được trực
+     tiếp với nhau.
+   - `notebooks/generate_class_description.ipynb` (11 cell): **không** archive/
+     zip — ghi thẳng 1 file JSON nhỏ vào `config/descriptions/`, commit thẳng
+     vào repo, đúng như §3 nói ("sinh một lần, không cần archive"). Không đụng
+     `/kaggle/input` (không cần GPU, không cần ảnh gốc). EDIT cell số ít
+     (`DATASET`, `STYLE`, không list). `OVERWRITE=False` mặc định — refuse ghi
+     đè file đã có, raise `FileExistsError` giải thích rõ vì sao. API key đọc
+     qua Kaggle Secret `GEMINI_API_KEY` nếu `API_KEY` để trống (cùng pattern
+     `HF_TOKEN` ở `extract_vlm_features.ipynb`). In cảnh báo rõ: hosted
+     inference không tái lập bit-for-bit dù `temperature=0.0`, file JSON đã
+     ghi mới là artifact tái lập, không phải lời gọi API.
+   - `config/descriptions/README.md` mới — giải thích quy ước file, nhắc lại
+     "đây là frozen artifact, không hand-edit JSON vì sha256 sẽ không khớp
+     nội dung nữa".
+   - **Sửa test hạ tầng chung, không chỉ thêm test mới**: notebook này không
+     zip và không đụng `/kaggle/input`, nên hai test chung
+     (`test_producing_notebooks_zip_their_output`,
+     `test_notebook_cells_are_valid_python_and_pin_the_branch`) trước đó giả
+     định MỌI notebook đều làm cả hai việc đó — đổi từ literal
+     `{"evaluate_al_sampler.ipynb"}` sang hai set đặt tên
+     (`NO_ARCHIVE_NOTEBOOKS`, `NO_DATASET_NOTEBOOKS`) rồi thêm
+     `generate_class_description.ipynb` vào đúng set, không nới lỏng assert
+     cho các notebook còn lại.
+   25 test mới (`tests/test_descriptions.py` 14 test hoàn toàn mới +
+   `tests/test_kaggle_notebooks.py` 6 test riêng cho notebook này). Test quan
+   trọng nhất là mô phỏng gọi API bằng client giả (`_FakeClient`/`_FakeModels`
+   dựng thủ công, không phải mock thư viện thật) chạy qua đúng
+   `generate_descriptions` thật — xác nhận đúng số lần gọi (1 lớp = 1 call,
+   trừ `llm_multi` = `NUM_PER_CLASS` call), `temperature` được truyền đúng
+   xuống `GenerateContentConfig`, và `response.text` được strip đúng vào
+   `descriptions`. 391 test pass (1 skip, môi trường-gated, có từ trước),
+   pyflakes sạch.
+8. ~~**`evaluate_al_sampler.ipynb` đọc encoder từ metadata**~~ (§2.1) —
+   **XONG**.
+   - **`main.py`**: `_probe_budget_<B>.pt`'s `metadata` giờ ghi thêm
+     `"encoder"` (tên backbone, đã có sẵn biến `visual_backbone`) và
+     `"encoder_kind"` (`"dinov2"` — luôn vậy hiện tại, vì `run()` chưa có
+     nhánh VLM, đó là việc bước 10). `encoder_kind` là field **tường minh**,
+     không phải suy luận từ chuỗi tên — quyết định này hỏi thẳng người dùng
+     giữa hai cách (thêm field rõ vs. đoán qua substring `"dinov2" in name`),
+     chọn field rõ vì suy luận theo tên vỡ ngay khi một VLM tương lai có tên
+     HF repo tình cờ chứa chuỗi gây nhầm.
+   - **`utils/kaggle.py`**: thêm `find_vlm_cache(dataset, seed, vlm_name, hint)`
+     — cùng khuôn `find_visual_cache`, nhưng đòi cả `_manifest.json` **và**
+     `_proj_manifest.json` cùng tồn tại (cache VLM có hai không gian, thiếu
+     một cái là cache dở dang, không được trả về như đã đủ).
+   - **`evaluate_al_sampler.ipynb`** (viết lại toàn bộ, vẫn 13 cell nhưng nội
+     dung 3 cell đổi hẳn): đọc `metadata["encoder"]`/`metadata["encoder_kind"]`
+     của TỪNG probe trong `RUN_NAMES` (không còn giả định một encoder chung
+     cho cả danh sách), gom theo encoder khác nhau, chỉ dựng
+     `DINOv2Extractor` cho nhóm `encoder_kind="dinov2"`, đọc thẳng
+     `vlm_feature_cache_paths(...)["test"]` (RAW_SPACE, không phải
+     `proj_test` — dùng nhầm không crash vì cùng 512-d nhưng chấm sai không
+     gì báo) cho nhóm `encoder_kind="vlm"`. Thêm
+     `assert probe.fc.in_features == test_features.shape[1]` tường minh
+     trước khi chấm — đây chính là chỗ §2.1 cảnh báo: không có assert này,
+     lệch chiều crash sâu trong matmul (đỡ) hoặc, nếu hai không gian tình cờ
+     trùng chiều, ra số vô nghĩa mà không gì báo.
+   - Checkpoint cũ không có `encoder_kind` (mọi run đã publish trước bước
+     này) vẫn đọc được — fallback `metadata.get("encoder_kind", "dinov2")`,
+     không cần chạy lại run nào.
+   - 8 test mới (3 `tests/test_probe_metadata.py` hoàn toàn mới — verify
+     `main.py` ghi đúng field, ghi đúng default khi không truyền
+     `model_cfg["vit"]`, và checkpoint kiểu cũ không có field vẫn load được
+     — cộng 5 `tests/test_kaggle_notebooks.py` assert trên cơ chế thật trong
+     notebook: có đọc field, branch theo `encoder_kind` chứ không phải
+     substring tên, có assert chiều, đọc đúng `paths["test"]` không phải
+     `paths["proj_test"]`, gọi `find_vlm_cache`/`vlm_feature_cache_paths`
+     thay vì đường dẫn cứng). Verify thêm bằng mô phỏng thủ công: 3 checkpoint
+     giả (cũ không field / mới dinov2 / giả định vlm 512-d), xác nhận đọc
+     đúng cả 3, và assert chiều bắt đúng lỗi khi cố chấm probe VLM bằng
+     feature DINOv2 768-d. 399 test pass (1 skip), pyflakes sạch.
+9. ~~**`_default_run_name` + encoder tường minh**~~ (§6.2) — **XONG**.
+   - Chữ ký cũ `(sampler_name, sampler_cfg)` không cách nào encode encoder,
+     vì encoder không phải input — thêm hai tham số **keyword-only**
+     `encoder: str = "dinov2"`, `use_text: bool = False`. Mặc định giữ đúng
+     hành vi cũ (`test_default_run_name_is_unchanged`): mọi lời gọi hiện có
+     (`main.run`, cả hai notebook run) không truyền hai tham số này nên ra
+     **đúng tên như trước**, không có run baseline/scalpel nào đã publish bị
+     mồ côi.
+   - `encoder != "dinov2"` thì nối `_<encoder>` vào cuối; `use_text=True` thì
+     nối `_text`. Áp dụng sau phần đặc thù `scalpel` (uncertainty_mode/
+     cell_pooling/missing_impute/consistency_weight) — hai trục mới này áp
+     dụng cho MỌI sampler, không riêng `scalpel`, vì Protocol B đổi encoder
+     của toàn bộ pipeline (coverage kernel, probe_v, linear head cuối — §6.2),
+     không chỉ của phương pháp chính.
+   - **Chưa wire vào `main.run()`** — đúng phạm vi bước 9: chỉ đổi chữ ký +
+     test để sẵn sàng, chưa có ai gọi với `encoder="conch"` thật (đó là việc
+     `run_al_main.ipynb` ở bước 10, khi `IMAGE_ENCODER` từ cell EDIT thực sự
+     tồn tại để truyền vào). `run()` bên trong vẫn gọi
+     `_default_run_name(sampler_name, sampler_cfg)` y hệt, không đổi.
+   - `tests/test_run_name.py` mới (7 test): `test_default_run_name_is_unchanged`
+     ghim từng dạng tên cũ (`scalpel_disagreement_rff`,
+     `..._cons0p5`,...) đúng plan yêu cầu;
+     `test_run_name_encodes_every_axis_no_collisions` sinh tên cho tích Đề-các
+     đầy đủ (6 sampler-config mẫu × 2 encoder × 2 use_text = 24 tổ hợp), assert
+     **không tổ hợp nào trùng tên** — đây là cơ chế đúng nghĩa bắt được lỗi
+     §6.2 mô tả (`uncertainty_herding` DINOv2 và CONCH ra cùng tên); thêm
+     `test_protocol_a_and_protocol_b_no_longer_collide` tái hiện trực tiếp
+     tình huống §6.2 nêu (cùng sampler, cùng config, khác encoder → tên phải
+     khác, và Protocol A không đổi tên). Tổng test pass tăng thêm 7.
+10. ~~**`run_al_main` phần chọn mẫu**~~ (§6.1–6.3) — **XONG**. Encoder switch
+    thật, `USE_TEXT`/`USE_LORA`/`AUX_LOSS`/`AUGMENT` có mặt trong cell EDIT
+    nhưng raise `NotImplementedError` nếu đổi khỏi mặc định (đã hỏi và xác
+    nhận cách này — cell EDIT không phải sửa lại lần nữa ở bước 11/khi
+    contribution #1 xong).
+    - **`main.py::run()`** thêm `image_encoder` ("dinov2"|"conch"),
+      `vlm_cache_dir`, `hf_token`. `image_encoder` quyết định **cả pipeline**
+      dùng chung một không gian đặc trưng (coverage kernel, probe
+      disagreement, probe đánh giá cuối) — đúng §6.2, không có chuyện vòng 1
+      CONCH rồi vòng 2 về DINOv2.
+    - **CONCH KHÔNG tự trích xuất trong `run()`** — quyết định có hỏi và xác
+      nhận: hàm mới `_load_vlm_features` chỉ ĐỌC cache `.npy` +
+      `_manifest.json` đã publish sẵn từ `extract_vlm_features.ipynb`, raise
+      `FileNotFoundError` có hướng dẫn cụ thể nếu thiếu. Lý do: nạp package
+      `conch` + HF token + forward pass 448px chậm bên trong hàm mà sweep
+      2-GPU đã gọi mỗi worker sẽ vừa phức tạp hóa `main.py` vừa lặp lại đúng
+      thứ notebook extract riêng đã làm. Chỉ đọc `RAW_SPACE` — đọc nhầm
+      `PROJ_SPACE` không crash (cùng 512-d) nhưng train probe trên không gian
+      sai mà không gì báo, nên có assert riêng trên `manifest["space"]`.
+    - `_load_cell_view`'s check `crop_dino` (đã có từ trước) giờ raise message
+      chi tiết hơn, giải thích rõ lý do khi `visual_backbone` là CONCH: trộn
+      cell space DINOv2 với image space CONCH — đúng §6.3.
+    - Metadata probe (`encoder_kind`) giờ đọc từ `image_encoder` thật thay vì
+      hard-code `"dinov2"` (bước 8 để placeholder chờ bước này).
+    - `_default_run_name(..., encoder=image_encoder)` — wire tham số đã thêm
+      ở bước 9 vào lời gọi thật trong `run()`.
+    - **`utils/archive.py`** thêm `main_archive_stem(dataset, sampler, seed,
+      encoder="dinov2")` — cùng khuôn `results_archive_stem`, chỉ nối
+      `_{encoder}` khi khác `"dinov2"`, để một run DINOv2 vẫn ra đúng tên cũ
+      còn CONCH có tên riêng không đè lên nhau (bản ghi §6.5 ở tầng archive
+      của đúng vấn đề §6.2 tại tầng run_name).
+    - **`notebooks/run_al_main.ipynb`** (12 cell, thay `run_al_sampler.ipynb`
+      đã xoá): cell EDIT có đủ 6 trục (`IMAGE_ENCODER`, `USE_TEXT`,
+      `DESCRIPTION_STYLE`, `CELL_POOLING`, `USE_LORA`, `AUX_LOSS`,
+      `AUX_WEIGHT`, `AUGMENT`); `SAMPLER` khoá cứng `"scalpel"` (baseline vẫn
+      ở `run_al_baseline.ipynb` riêng). Assert §6.1 (`USE_TEXT` cần
+      `IMAGE_ENCODER="conch"`, chiều ngược lại không assert vì CONCH +
+      không-text là ablation hợp lệ) rồi raise `NotImplementedError` ngay cả
+      khi điều kiện đúng — vì contribution #1 thật sự chưa có code đọc text.
+      Tương tự cho `USE_LORA`/`AUX_LOSS`/`AUGMENT`. Thêm `find_vlm_cache` mới
+      trong `utils/kaggle.py` (cùng khuôn `find_visual_cache`, đòi cả
+      `_manifest.json` **và** `_proj_manifest.json`) để notebook dò cache
+      CONCH giống hệt cách dò cache DINOv2, không cần đường dẫn cứng.
+    - **Dọn theo đường**: xoá `run_al_sampler.ipynb`, cập nhật
+      `EXPECTED_NOTEBOOKS` (7→7, tên đổi), sửa mọi chỗ nhắc
+      `run_al_sampler.ipynb` còn sót (`extract_visual_features.ipynb`,
+      `extract_nucleus_features.ipynb`, `evaluate_al_sampler.ipynb`,
+      `utils/kaggle.py`'s docstring — cái này hoá ra đã lỗi thời từ bước 3b,
+      vẫn mô tả pattern archive `archive/`-subdirectory cũ dù code đã thống
+      nhất từ lâu, tiện sửa luôn).
+    - **Verify bằng chạy thật**: dựng cache CONCH giả (`.npy` + manifest đúng
+      format) và gọi thẳng `main.run(image_encoder="conch", ...)` — chạy hết
+      một budget, ra đúng `feat_dim=512`, `encoder_kind="conch"`. Verify 3
+      đường lỗi: thiếu cache → `FileNotFoundError`; fingerprint lệch →
+      `ValueError`; `manifest["space"]="proj"` (cố tình sai) → `ValueError`
+      nhắc "PROJ_SPACE". Verify `crop_dino` + CONCH bị chặn bằng cách mock
+      `load_cellvit_cache` (không dựng cache CellViT thật, không cần thiết
+      cho việc đang test).
+    - **9 test mới**: 7 `tests/test_probe_metadata.py` (nhánh CONCH của
+      `main.run` — đọc cache đúng, 3 đường lỗi, `crop_dino` bị chặn, tên run
+      không trùng DINOv2) + 2 `tests/test_archive_naming.py`
+      (`main_archive_stem`). Test cũ trong `tests/test_kaggle_notebooks.py`
+      (branch-pin, `EXPECTED_NOTEBOOKS`, tên notebook trong parametrize) đều
+      **sửa tại chỗ** để trỏ `run_al_main.ipynb` thay vì `run_al_sampler.ipynb`
+      — không cần viết mới, các test đó vẫn đúng cơ chế, chỉ đổi tên file
+      đích. 416 test pass (từ 407), pyflakes sạch toàn repo (kể cả sau khi
+      xoá `run_al_sampler.ipynb` — không còn import/tham chiếu nào trỏ tới
+      file đã xoá).
+11. ~~**Train cuối**~~ (§6.4, §6.5) — **XONG**. Đã chốt: train cuối chạy ở
+    **mọi budget** (đường cong đầy đủ, ~8x chi phí — không phải chỉ budget
+    lớn nhất).
+    - **Phát hiện quan trọng khi code, không có trong plan gốc**: LoRA cho
+      CONCH phức tạp hơn ước tính "60-80 dòng wrap nn.Linear" nhiều — đã đọc
+      trực tiếp `repos/CONCH/conch/open_clip_custom/transformer.py` và xác
+      nhận vision tower của CONCH dùng `nn.MultiheadAttention` (QKV gộp
+      chung `in_proj_weight`, một `nn.Parameter` thô, không phải 3
+      `nn.Linear` riêng như `Dinov2SelfAttention`). Đã hỏi và xác nhận: viết
+      thêm cơ chế LoRA riêng cho `nn.MultiheadAttention`
+      (`MultiheadAttentionLoRA`) thay vì chỉ làm DINOv2 rồi raise cho CONCH.
+    - **`training/lora.py`** (mới): `LinearLoRA` wrap `nn.Linear` chuẩn
+      (`y = base(x) + (alpha/r)(x A^T B^T)`, `B` khởi tạo 0 nên r>0 cũng
+      là no-op ở bước 0). `MultiheadAttentionLoRA` tách `in_proj_weight`
+      thành Q/K/V (đúng cách `nn.MultiheadAttention.forward` nội bộ làm),
+      chỉ thêm delta cho Q và V (không cho K, đúng finding gốc paper LoRA),
+      tự viết forward qua `scaled_dot_product_attention` — verify bằng module
+      PyTorch thật: `r=0` khớp **0.0 sai số tuyệt đối** so với
+      `nn.MultiheadAttention` gốc. `apply_lora_to_dinov2`/`apply_lora_to_conch`
+      **freeze toàn bộ model TRƯỚC** khi wrap (bug tự phát hiện khi verify:
+      bản đầu chỉ freeze layer được wrap, layer khác — MLP, layernorm, `key`,
+      `output.dense` — vẫn `requires_grad=True` mặc định từ
+      `from_pretrained`, nên "LoRA-only" run sẽ âm thầm fine-tune luôn cả
+      backbone; verify lại sau fix: gradient chỉ chảy vào đúng 0.33% param
+      LoRA trên DINOv2-small thật).
+    - **`training/losses.py`** (mới): `center_loss`/`supcon_loss`/`triplet_loss`,
+      chữ ký chung `(features, logits, labels) -> scalar`. `center_loss`
+      KHÔNG raise trên batch mỏng (khoảng cách tới mean 1 điểm vẫn có nghĩa).
+      `supcon`/`triplet` raise `ValueError` khi lớp nào đó <2 mẫu trong batch
+      — verify đúng biên (2 mẫu/lớp không raise, 1 mẫu/lớp raise), verify
+      hướng đúng (feature cụm chặt theo lớp cho supcon loss thấp hơn feature
+      ngẫu nhiên).
+    - **`data/augment.py`** (mới): chỉ `flip_rotate`, không color jitter
+      (đúng bài học stain-shortcut đã mất 1 method trước đây). Verify: đổi
+      transform giữ nguyên **multiset màu pixel** (chứng minh hình học thuần
+      xoay/lật, không đổi thống kê màu).
+    - **`training/finetune.py`** (mới): `finetune_and_evaluate` đọc pixel
+      qua `RawRGBDataset` (chỉ `selected_indices`, không decode cả dataset),
+      train encoder+probe end-to-end khi `use_lora=True`, chỉ train probe
+      (encoder frozen dưới `inference_mode`) khi chỉ có augment. Test luôn
+      chấm bằng embedding cache đông lạnh, KHÔNG re-extract qua encoder đã
+      fine-tune — ghi rõ lý do trong docstring: cần cache test riêng cho mỗi
+      run mới có ý nghĩa, việc đó là phạm vi tương lai, không giả lập ngầm.
+    - **`main.py::run()`** thêm `final_train_cfg` (dict, mặc định `None` ≡
+      đường cũ hệt cũ). Load encoder model **một lần** trước vòng lặp budget
+      (verify: gọi `Dinov2Model.from_pretrained` đúng 1 lần cho sweep 2
+      budget). Metadata probe + `_results.pt` ghi thêm khoá `final_train_cfg`
+      **chỉ khi** pass này thực sự chạy (không phải khoá `False`-valued) —
+      để phân biệt "run chưa từng có trục train cuối" khỏi "run có trục
+      nhưng tắt hết".
+    - **`config/config.yaml`**: thêm block `final_training` (mặc định tắt
+      hết). Dọn rác cũ: `models.vlm_primary`/`vlm_secondary`/`biomedbert`
+      (BiomedCLIP/PLIP/PubMedBERT thời CODAPath) không ai đọc — xoá, thay
+      bằng `models.vlm: "MahmoodLab/CONCH"` (đúng tên `main.py` đã đọc từ
+      bước 10).
+    - **`notebooks/run_al_main.ipynb`**: bỏ raise `NotImplementedError` cho
+      `USE_LORA`/`AUX_LOSS`/`AUGMENT` (giữ nguyên raise cho `USE_TEXT` — vẫn
+      chưa implement), build `FINAL_TRAIN_CFG` dict, truyền vào
+      `base_kwargs`. Giữ nguyên assert supcon/triplet cần `2*num_classes`
+      mỗi budget nhỏ nhất.
+    - **`main.py`'s CLI (`main()`)** cũng thêm `--use_lora`/`--lora_r`/
+      `--lora_alpha`/`--aux_loss`/`--aux_weight`/`--augment`, đọc default từ
+      `config.yaml`'s `final_training` block — nhất quán với cách mọi flag
+      khác (`probe_epochs`,...) đã ưu tiên CLI > config.
+    - **Verify bằng chạy thật `main.run()` đầu-cuối**, không chỉ unit test:
+      dựng `.npz` giả + DINOv2-small thật (đã cache local), chạy với
+      `final_train_cfg={"use_lora": True, "aux_loss": "center", "augment":
+      "flip_rotate"}` — chạy hết, ghi đúng `feat_dim=384`,
+      `final_train_cfg` trong cả probe metadata và `_results.pt`.
+    - 48 test mới: `tests/test_lora.py` (14, gồm 2 test dùng checkpoint
+      DINOv2 thật — gate bằng thử load offline thật (`HF_HUB_OFFLINE=1`),
+      không chỉ check package đã cài, để không âm thầm phụ thuộc mạng khi
+      chạy trên máy không có cache), `tests/test_losses.py` (11),
+      `tests/test_augment.py` (6), `tests/test_finetune.py` (7, dùng encoder
+      giả nhỏ để chạy offline nhanh), `tests/test_final_training_wiring.py`
+      (4, verify wiring `main.py` — không load lại 2 lần, giữ đúng đường cũ
+      khi không cần pixel), cộng 3 `tests/test_kaggle_notebooks.py`.
+      464 test pass (1 skip, môi trường-gated, có từ trước), pyflakes sạch
+      toàn repo.
 
 **Ràng buộc thứ tự, tóm tắt:**
 
