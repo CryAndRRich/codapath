@@ -245,31 +245,35 @@ in results and manifests.
 
 `generate_class_description.ipynb` writes `config/descriptions/{dataset}_{style}.json`
 **once**, committed to the repo — the text prior `extract_vlm_features.ipynb`'s
-`DESCRIPTION_STYLE="llm_*"` reads. It calls `gemini-2.5-flash` (pinned; see
-below) and needs no GPU and no dataset image, only a Gemini API key (Kaggle
-Secret `GEMINI_API_KEY`, same pattern as `extract_vlm_features.ipynb`'s
-`HF_TOKEN`).
+`DESCRIPTION_STYLE="llm_*"` reads. `MODEL` in the EDIT cell picks whichever
+Gemini model is currently available to your API key — needs no GPU and no
+dataset image, only a Gemini API key (Kaggle Secret `GEMINI_API_KEY`, same
+pattern as `extract_vlm_features.ipynb`'s `HF_TOKEN`).
 
 **A hosted model call is not bit-for-bit reproducible**, even at
 `temperature=0.0` — Google does not guarantee determinism across requests, let
-alone across months as the weights served behind a fixed model name change.
-The reproducible unit is the **committed JSON file**, not "re-run the
-notebook and expect the same text": the notebook refuses to overwrite an
-existing file unless `OVERWRITE=True`, and prints this caveat before calling
-the API.
+alone across months as the weights served behind a fixed model name change,
+and a pinned model name can itself be retired (`gemini-2.5-flash`, this
+notebook's original default, returned `404 NOT_FOUND` for new callers as of
+2026-08). The reproducible unit is the **committed JSON file**, not "re-run
+the notebook and expect the same text": the notebook refuses to overwrite an
+existing file unless `OVERWRITE=True`, and the payload records `model`,
+`temperature`, `seed`, `generated_at` and a `sha256` of the generated text —
+proof of what that model actually returned once, not a promise it will again.
 
-**`gemini-3.x` is rejected in code**, not just avoided by default —
-`temperature`/`topK`/`topP` are documented as deprecated and silently ignored
-on `gemini-3.7-flash`, `3.6-flash`, `3.5-flash-lite`. Using one of those would
-make `TEMPERATURE=0.0` a silent no-op: the call still succeeds, so nothing
-would flag that the setting this project's reproducibility claim depends on
-was never applied.
+**No model family is blocked.** An earlier version rejected every
+`gemini-3.x` model because `temperature`/`topK`/`topP` were documented as
+deprecated and silently ignored there. That restriction is gone: pin whatever
+model is current, and if temperature genuinely has no effect on it, the
+written file is still exactly what that model returned — just potentially
+harder to reproduce on a later call, the same tradeoff already accepted above.
 
-Three styles (`STYLE` in the EDIT cell): `llm_short` (one dense sentence),
-`llm_morphology` (2–4 sentences on cell shape/arrangement/texture/staining),
-`llm_multi` (`NUM_PER_CLASS` differently-phrased variants per class, encoded
-as an ensemble the same way `conch_official`'s templates are). `"manual"`
-needs no file — `features/descriptions.py::load_descriptions` reads
+Two styles (`STYLE` in the EDIT cell): `llm_short` (one dense sentence),
+`llm_morphology` (2–4 sentences on cell shape/arrangement/texture/staining).
+A third style, `llm_multi` (`NUM_PER_CLASS` differently-phrased variants per
+class), was removed entirely — recoverable from git history if a
+multi-variant ensemble is needed again. `"manual"` needs no file —
+`features/descriptions.py::load_descriptions` reads
 `datasets.<dataset>.descriptions` from `config.yaml` directly, and is the
 control every LLM style has to beat.
 

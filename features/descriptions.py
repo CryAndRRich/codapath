@@ -7,22 +7,31 @@ meant to be called from `main.py` or any run notebook, only from
 `generate_class_description.ipynb`.
 
 **Frozen-artifact framing, not a reproducible computation.** A hosted model
-call (`gemini-2.5-flash`) is not bit-for-bit reproducible even at
-`temperature=0.0` -- Google's own docs note determinism is not guaranteed
-across requests, let alone across months as the served weights are updated
-behind a fixed model name. The reproducible unit here is the **written JSON
-file**, not "re-run the prompt" -- exactly the same relationship
+call is not bit-for-bit reproducible even at `temperature=0.0` -- Google's
+own docs note determinism is not guaranteed across requests, let alone across
+months as the served weights are updated behind a fixed model name, and a
+pinned model name can itself be retired (`gemini-2.5-flash`, this module's
+original pin, returned `404 NOT_FOUND ... no longer available to new users`
+as of 2026-08). The reproducible unit here is the **written JSON file**, not
+"re-run the prompt and expect the same text" -- exactly the same relationship
 `features/vlm.py`'s vendored `config/prompts/` file has to a live download.
 `load_descriptions` only ever reads a file already on disk; it never calls
-the API.
+the API. `generate_descriptions`'s returned payload records `model`,
+`temperature`, `seed` and `generated_at` alongside the text and its
+`sha256` -- proof that the named model produced exactly this text on this
+date, not a promise it will again.
 
-**`gemini-3.x` is deliberately excluded** (`assert not MODEL.startswith(...)`
-in the notebook, and mirrored here for anything using `generate_descriptions`
-directly): `temperature`/`topK`/`topP` are documented as deprecated and
-silently ignored on `gemini-3.7-flash`, `3.6-flash`, `3.5-flash-lite`. Passing
-`temperature=0.0` against one of those models is a silent no-op, not an
-error -- the call still succeeds, it just is not doing what the docstring of
-this module (and the paper text built from it) claims.
+**No model family is blocked.** An earlier version of this function rejected
+every `gemini-3.x` model, because Google's docs at the time said
+`temperature`/`topK`/`topP` were deprecated and silently ignored on that
+family. That restriction is gone: `gemini-2.5-flash` no longer exists for new
+callers at all, `gemini-3.x` is what Google now points callers to, and this
+module's whole point is a frozen, inspectable-after-the-fact artifact -- if
+`temperature` genuinely has no effect on some future model, the written
+`descriptions` are still exactly what that model actually returned, just
+possibly less reproducible on a re-run, which is the same tradeoff already
+made by not requiring bit-exact reproducibility above. Pick whatever `MODEL`
+is current and available; nothing here needs to be kept in sync with it.
 
 **`load_descriptions(dataset, "manual")` is the control arm** and needs no
 file at all: it reads `datasets.<dataset>.descriptions` straight out of
@@ -75,17 +84,9 @@ _PROMPT_TEMPLATES = {
         "pattern. 2-4 sentences. Output only the description, no preamble, "
         "no quotes."
     ),
-    "llm_multi": (
-        "You are a pathologist writing ONE short, visually distinctive "
-        "sentence describing the class {class_name!r} (dataset: {dataset}), "
-        "for a vision-language model's text encoder. This is variant "
-        "{variant_index} of {num_variants} -- phrase it differently from "
-        "the other variants (different visual emphasis or wording) while "
-        "staying accurate. Output only the sentence, no preamble, no quotes."
-    ),
 }
 
-VALID_STYLES = frozenset({"llm_short", "llm_morphology", "llm_multi"})
+VALID_STYLES = frozenset({"llm_short", "llm_morphology"})
 
 
 def description_path(dataset: str, style: str) -> str:
@@ -161,11 +162,9 @@ def generate_descriptions(
     model: str,
     temperature: float = 0.0,
     seed: int = 42,
-    num_per_class: int = 1,
     api_key: Optional[str] = None,
 ) -> dict:
-    """Call the Gemini API once per class (or `num_per_class` times, for
-    `style="llm_multi"`) and return the full payload
+    """Call the Gemini API once per class and return the full payload
     `generate_class_description.ipynb` writes to disk.
 
     Does NOT write the file itself -- the notebook owns the "refuse to
@@ -174,24 +173,11 @@ def generate_descriptions(
     meaning to overwrite a frozen artifact.
 
     Raises `ValueError` for `style not in VALID_STYLES` (this function never
-    handles `"manual"` -- that style has no API call, see `load_descriptions`)
-    and for `model.startswith("gemini-3")` (temperature/topK/topP are
-    deprecated and silently ignored on that family -- see module docstring).
+    handles `"manual"` -- that style has no API call, see `load_descriptions`).
+    No model family is rejected -- see module docstring.
     """
     if style not in VALID_STYLES:
         raise ValueError(f"style must be one of {sorted(VALID_STYLES)}, got {style!r}")
-    if model.startswith("gemini-3"):
-        raise ValueError(
-            f"model={model!r}: temperature/topK/topP are deprecated and silently "
-            "ignored on the gemini-3.x family (3.7-flash, 3.6-flash, 3.5-flash-lite) "
-            "-- generating with temperature=0.0 against one of these is a silent "
-            "no-op, not an error. Use a gemini-2.x model."
-        )
-    if style != "llm_multi" and num_per_class != 1:
-        raise ValueError(
-            f"num_per_class={num_per_class} only applies to style='llm_multi' "
-            f"(got style={style!r})"
-        )
 
     from google import genai
     from google.genai import types
@@ -199,26 +185,13 @@ def generate_descriptions(
     client = genai.Client(api_key=api_key or None)
     generation_config = types.GenerateContentConfig(temperature=temperature)
 
-    descriptions: Dict[str, object] = {}
+    descriptions: Dict[str, str] = {}
     for class_name in class_names:
-        if style == "llm_multi":
-            variants = []
-            for i in range(num_per_class):
-                prompt = _PROMPT_TEMPLATES[style].format(
-                    class_name=class_name, dataset=dataset,
-                    variant_index=i + 1, num_variants=num_per_class,
-                )
-                response = client.models.generate_content(
-                    model=model, contents=prompt, config=generation_config,
-                )
-                variants.append(response.text.strip())
-            descriptions[class_name] = variants
-        else:
-            prompt = _PROMPT_TEMPLATES[style].format(class_name=class_name, dataset=dataset)
-            response = client.models.generate_content(
-                model=model, contents=prompt, config=generation_config,
-            )
-            descriptions[class_name] = response.text.strip()
+        prompt = _PROMPT_TEMPLATES[style].format(class_name=class_name, dataset=dataset)
+        response = client.models.generate_content(
+            model=model, contents=prompt, config=generation_config,
+        )
+        descriptions[class_name] = response.text.strip()
 
     return {
         "dataset": dataset,
@@ -226,11 +199,8 @@ def generate_descriptions(
         "style": style,
         "temperature": temperature,
         "seed": seed,
-        "num_per_class": num_per_class,
         "prompt_template": _PROMPT_TEMPLATES[style],
         "generated_at": date.today().isoformat(),
         "descriptions": descriptions,
-        "sha256": _sha256_descriptions(
-            {k: (v if isinstance(v, str) else json.dumps(v, sort_keys=True)) for k, v in descriptions.items()}
-        ),
+        "sha256": _sha256_descriptions(descriptions),
     }

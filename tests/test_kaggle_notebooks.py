@@ -23,7 +23,11 @@ EXPECTED_NOTEBOOKS = {
 # archive/zip needed"). It is the one notebook exempt from both the
 # /kaggle/input requirement and the zip-your-output requirement below.
 NO_DATASET_NOTEBOOKS = {"generate_class_description.ipynb"}
-NO_ARCHIVE_NOTEBOOKS = {"evaluate_al_sampler.ipynb", "generate_class_description.ipynb"}
+# generate_class_description.ipynb DOES zip now (a convenience download for
+# several small committed-to-git JSON files, not a Kaggle-Dataset-bound GPU
+# cache) -- it is covered by test_producing_notebooks_zip_their_output like
+# every other notebook, so it is not listed here any more.
+NO_ARCHIVE_NOTEBOOKS = {"evaluate_al_sampler.ipynb"}
 
 
 def _source(cell):
@@ -508,41 +512,78 @@ def test_nucleus_notebook_can_store_cell_embeddings_without_crop_dino():
     assert "SAVE_INSTANCE_MAPS" in source
 
 
-def test_description_notebook_pins_a_gemini_2x_model_not_3x():
-    """temperature/topK/topP are deprecated and silently ignored on
-    gemini-3.7-flash/3.6-flash/3.5-flash-lite -- generating with
-    temperature=0.0 against one of those is a silent no-op, not an error.
-    The notebook must reject the whole 3.x family in code, not just default
-    away from it."""
+def test_description_notebook_blocks_no_model_family():
+    """No model name is rejected any more -- an earlier version blocked every
+    `gemini-3.x` model on the (then-current) claim that temperature/topK/topP
+    were silently ignored there. That check was removed after
+    `gemini-2.5-flash` (the notebook's original pin) was itself retired for
+    new callers (404 NOT_FOUND) while gemini-3.x was still blocked, which
+    would have left no working model at all. Pin whatever is current; the
+    written payload's own `model`/`temperature`/`sha256` fields are the
+    record of what actually happened, not a promise of reproducibility."""
     source = _all_source(NOTEBOOK_DIR / "generate_class_description.ipynb")
-    assert 'MODEL = "gemini-2.5-flash"' in source
-    assert 'not MODEL.startswith("gemini-3")' in source
+    assert 'MODEL = "gemini-2.5-flash"' not in source, (
+        "gemini-2.5-flash is retired for new callers -- it must not be the "
+        "notebook's default MODEL any more (a comment mentioning it as "
+        "history is fine; assigning it to MODEL is not)"
+    )
+    assert 'startswith("gemini-3")' not in source
+    assert "MODEL = " in source
 
 
 def test_description_notebook_refuses_to_overwrite_without_the_flag():
-    """The written file is a frozen artifact, committed to the repo -- a
-    silent overwrite would invalidate every cached text prototype built from
-    the old text with nothing pointing at why results changed."""
+    """Each (dataset, style) file is a frozen artifact, committed to the repo
+    -- a silent overwrite would invalidate every cached text prototype built
+    from the old text with nothing pointing at why results changed. This
+    notebook sweeps every (dataset, style) pair in one run (see
+    test_description_notebook_sweeps_every_dataset_and_style below), so an
+    existing file is SKIPPED with a printed reason and the sweep continues to
+    the remaining pairs, rather than raising and aborting the whole run over
+    one already-generated file."""
     source = _all_source(NOTEBOOK_DIR / "generate_class_description.ipynb")
     assert "OVERWRITE = False" in source
     assert "out_path.is_file() and not OVERWRITE" in source
-    assert "FileExistsError" in source
+    assert "skipped (exists)" in source
 
 
-def test_description_notebook_does_not_zip_or_touch_a_dataset_mount():
-    """This notebook calls a text API and writes one small JSON file straight
-    into the repo -- no GPU cache, no /kaggle/input dataset, no archive."""
+def test_description_notebook_does_not_touch_a_dataset_mount():
+    """This notebook calls a text API and writes small JSON files straight
+    into the repo -- no GPU cache, no /kaggle/input dataset. It DOES zip
+    (unlike every other check in this project's "no archive" family) because
+    the zip here is a convenience for downloading many small files at once,
+    not a Kaggle-Dataset-bound GPU cache -- see
+    test_description_notebook_zips_the_descriptions_directory."""
     source = _all_source(NOTEBOOK_DIR / "generate_class_description.ipynb")
-    assert "make_archive" not in source
     assert "/kaggle/input" not in source
     assert "DATA_ROOT" not in source
 
 
-def test_description_notebook_keeps_dataset_and_style_singular():
+def test_description_notebook_zips_the_descriptions_directory():
+    """Sweeping 3 datasets x 2 styles in one run produces 6 files -- zipped
+    once so they can be downloaded and unzipped straight into the repo
+    working copy, per the user's request, rather than copy-pasted one at a
+    time from Kaggle's Output tab."""
     source = _all_source(NOTEBOOK_DIR / "generate_class_description.ipynb")
-    for plural in ("DATASETS", "STYLES", "MODELS"):
-        assert plural not in source, f"still sweeps {plural} in one run"
-    assert "STYLE = " in source
+    assert "make_archive" in source
+    assert 'root_dir=DESCRIPTIONS_DIR' in source
+
+
+def test_description_notebook_sweeps_every_dataset_and_style():
+    """Unlike every GPU notebook here, this one deliberately sweeps ALL
+    datasets and styles in one run (see the intro cell for why: CPU-only,
+    tiny API calls, no multi-hour-session cost to looping) -- so DATASETS/
+    STYLES must be lists, not the singular DATASET/STYLE every other
+    notebook's EDIT cell uses."""
+    source = _all_source(NOTEBOOK_DIR / "generate_class_description.ipynb")
+    assert "DATASETS = [" in source
+    assert "STYLES = [" in source
+    assert '"pathmnist"' in source and '"histoset"' in source and '"skintissue"' in source
+    assert '"llm_short"' in source and '"llm_morphology"' in source
+    # llm_multi was removed from the whole project -- a comment MENTIONING it
+    # as history is fine (and expected, explaining the removal); it must not
+    # appear as a live STYLES entry or in the per-style dispatch logic.
+    styles_line = next(l for l in source.split("\n") if l.strip().startswith("STYLES = ["))
+    assert "llm_multi" not in styles_line
 
 
 def test_description_notebook_reads_the_api_key_from_a_kaggle_secret_fallback():
