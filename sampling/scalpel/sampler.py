@@ -65,6 +65,10 @@ def scalpel_sampling(**kwargs) -> List[int]:
     consistency_weight = float(kwargs.get("consistency_weight", 0.0))
     consistency_mode = kwargs.get("consistency_mode", "symmetric_js")
     diag = bool(kwargs.get("diag", True))
+    # Set by main.py only when AUGMENT != "none": a callable mapping pool
+    # indices to freshly augmented features for the visual probe's TRAINING
+    # rows. None keeps the frozen-cache behaviour exactly.
+    augmented_feature_provider = kwargs.get("augmented_feature_provider")
 
     if uncertainty_mode not in UNCERTAINTY_MODES:
         raise ValueError(f"uncertainty_mode must be one of {list(UNCERTAINTY_MODES)}")
@@ -120,6 +124,7 @@ def scalpel_sampling(**kwargs) -> List[int]:
                 probe_weight_decay=probe_weight_decay,
                 consistency_weight=consistency_weight,
                 consistency_mode=consistency_mode,
+                augmented_feature_provider=augmented_feature_provider,
             )
 
         if weights_np is None:

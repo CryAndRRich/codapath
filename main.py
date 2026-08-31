@@ -100,6 +100,7 @@ def _default_run_name(
     *,
     encoder: str = "dinov2",
     use_text: bool = False,
+    final_train_cfg: Optional[Dict] = None,
 ) -> str:
     """Encode the config axes that would otherwise overwrite each other.
 
@@ -140,6 +141,36 @@ def _default_run_name(
         parts.append(encoder)
     if use_text:
         parts.append("text")
+
+    # The §6.4 final-training axes. Without these in the name, a 48-combination
+    # sweep over (cell_pooling x use_lora x aux_loss x augment) collapses onto
+    # just 3 names -- 16 runs per name, each overwriting the previous one's
+    # `_results.pt`, `_probe_budget_*.pt` and log. Worse than losing them: the
+    # notebook's resume check is "does `<name>_results.pt` exist", so runs 2..16
+    # of each group would be SKIPPED entirely and the results table would look
+    # complete while holding 3 configurations instead of 48.
+    #
+    # Every part is appended only when it differs from the default, so a run
+    # that sets none of them keeps exactly the name it had before this
+    # parameter existed (`test_default_run_name_is_unchanged`).
+    final_train_cfg = final_train_cfg or {}
+    if bool(final_train_cfg.get("use_lora", False)):
+        rank = int(final_train_cfg.get("lora_r", 8))
+        alpha = float(final_train_cfg.get("lora_alpha", 16.0))
+        part = f"lora{rank}"
+        if alpha != 16.0:
+            part = f"{part}a{alpha}".replace(".", "p")
+        parts.append(part)
+    aux_loss = final_train_cfg.get("aux_loss", "none")
+    if aux_loss != "none":
+        part = f"aux{aux_loss}"
+        weight = float(final_train_cfg.get("aux_weight", 0.5))
+        if weight != 0.5:
+            part = f"{part}{weight}".replace(".", "p")
+        parts.append(part)
+    augment = final_train_cfg.get("augment", "none")
+    if augment != "none":
+        parts.append(f"aug{augment}")
     return "_".join(parts)
 
 
@@ -468,6 +499,50 @@ def run(
             sampler_inputs["cell_embeddings"] = view.patch_features
             sampler_inputs["cell_reliability"] = view.reliability
 
+        # AUGMENT reaches into the AL loop too, not just the final-training
+        # pass: with `augment != "none"` the per-round uncertainty probe
+        # trains on freshly augmented pixels of the LABELED set instead of
+        # frozen cache rows, so "augmented" means the same thing in both
+        # halves of a run. Only the probe's training rows change -- the
+        # coverage kernel, sigma adaptation and the pool-wide uncertainty
+        # scoring all still read the frozen cache, because augmenting ~90k
+        # pool rows every round costs ~27x what augmenting <=200 labeled rows
+        # does. `USE_LORA` deliberately does NOT reach in here: a LoRA-adapted
+        # encoder must never select the points it is later trained on.
+        selection_augment_provider = None
+        selection_encoder_model = None
+        if ft_augment != "none":
+            from training.finetune import make_augmented_feature_provider
+
+            # A SEPARATE, always-frozen encoder -- never `ft_encoder_model`.
+            # That one is LoRA-wrapped and `finetune_and_evaluate` trains it
+            # in place, once per budget, so reusing it here would let budget
+            # k's fine-tuned weights choose budget k+1's points: training
+            # leaking into selection, which no amount of frozen-cache
+            # coverage elsewhere would undo. Loading a second copy costs one
+            # checkpoint read per run and keeps the two roles honest.
+            if image_encoder == "dinov2":
+                from transformers import Dinov2Model
+
+                selection_encoder_model = Dinov2Model.from_pretrained(visual_backbone)
+                selection_encoder_model.requires_grad_(False)
+                selection_preprocess = None
+            else:
+                from features.vlm import load_conch
+
+                selection_encoder_model, selection_preprocess = load_conch(
+                    visual_backbone, device, hf_token=hf_token
+                )
+                selection_encoder_model.requires_grad_(False)
+
+            selection_augment_provider = make_augmented_feature_provider(
+                train_dataset, selection_encoder_model, device,
+                image_encoder=image_encoder, augment=ft_augment,
+                conch_preprocess=selection_preprocess,
+            )
+            print(f"[selection] uncertainty probe trains on augment={ft_augment!r} pixels "
+                  "(frozen encoder, separate from the final-training one)")
+
         common = dict(
             oracle_labels=train_labels,
             num_classes=num_classes,
@@ -475,6 +550,8 @@ def run(
             **sampler_inputs,
             **sampler_cfg,
         )
+        if selection_augment_provider is not None:
+            common["augmented_feature_provider"] = selection_augment_provider
 
         # One shared run only when the spec says a prefix is faithful. Every
         # budget below `prefix_exact_min_class_multiple * num_classes` still
@@ -664,6 +741,7 @@ def run(
             print(f"[sweep] {sweep_watch.line()}")
 
         del ft_encoder_model
+        del selection_encoder_model
         clear_memory()
 
         _save(

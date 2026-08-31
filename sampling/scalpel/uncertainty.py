@@ -43,6 +43,7 @@ def round_weights(
     probe_weight_decay: float = 1e-4,
     consistency_weight: float = 0.0,
     consistency_mode: str = "symmetric_js",
+    augmented_feature_provider=None,
 ) -> Tuple[Optional[np.ndarray], Dict[str, float]]:
     """Return `(per-pool weights in [0, 1], diagnostics)`.
 
@@ -53,6 +54,18 @@ def round_weights(
     `uncertainty_mode="visual_margin"` is the controlled ablation: identical
     machinery, but the weight is Uncertainty Herding's own calibrated margin.
     Comparing the two isolates what the cell view actually contributes.
+
+    `augmented_feature_provider`, when given, is
+    `training.finetune.make_augmented_feature_provider`'s closure: it maps a
+    list of pool indices to freshly AUGMENTED features for exactly those
+    rows. It replaces the frozen `visual_features[selected_index]` rows used
+    to TRAIN the visual probe (and to calibrate its temperature), so a run
+    with `AUGMENT != "none"` augments during selection too, not only in the
+    final-training pass. Everything else still reads the frozen cache: the
+    pool-wide `predict_logits` below, and the cell probe (CellViT embeddings
+    have no pixels behind them to augment). This module stays free of any
+    pixel/transform/encoder knowledge -- it only ever calls the opaque
+    callable.
     """
     from training.probe import train_dual_probe, train_probe
 
@@ -71,8 +84,29 @@ def round_weights(
     if not _has_two_classes(labels[selected_index]):
         return None, diagnostics
 
+    # The visual probe's TRAINING rows -- augmented when a provider is given,
+    # frozen otherwise. `visual_features` itself is never rebuilt: the
+    # pool-wide `predict_logits` further down must stay on the frozen cache
+    # (augmenting 90k rows per round is ~27x the cost of augmenting only the
+    # labeled set, which is the whole reason this is affordable).
+    if augmented_feature_provider is not None:
+        visual_train = augmented_feature_provider(selected_index.tolist())
+        if visual_train.shape[0] != len(selected_index):
+            raise ValueError(
+                f"augmented_feature_provider returned {visual_train.shape[0]} rows "
+                f"for {len(selected_index)} selected indices"
+            )
+        if visual_train.shape[1] != visual_features.shape[1]:
+            raise ValueError(
+                f"augmented_feature_provider returned width {visual_train.shape[1]}, "
+                f"but the frozen pool cache is {visual_features.shape[1]}-d -- the "
+                "probe trained on one cannot score the other"
+            )
+    else:
+        visual_train = visual_features[selected_index]
+
     tau_visual = calibrate_temperature(
-        visual_features, labels, selected_index.tolist(), num_classes,
+        visual_train, labels[selected_index], list(range(len(selected_index))), num_classes,
         probe_epochs, probe_lr, device,
     )
     cell_trainable = _has_two_classes(labels[cell_index])
@@ -89,7 +123,7 @@ def round_weights(
     want_cell = cell_trainable and uncertainty_mode == "disagreement"
     if want_cell and consistency_weight > 0.0:
         visual_probe, cell_probe = train_dual_probe(
-            visual_features[selected_index],
+            visual_train,
             cell_features[selected_index],
             labels[selected_index],
             num_classes,
@@ -104,7 +138,7 @@ def round_weights(
         )
     else:
         visual_probe = train_probe(
-            visual_features[selected_index], labels[selected_index], num_classes,
+            visual_train, labels[selected_index], num_classes,
             probe_epochs, probe_lr, device, weight_decay=probe_weight_decay,
         )
         cell_probe = (

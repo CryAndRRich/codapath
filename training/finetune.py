@@ -1,11 +1,19 @@
 """Final-training pass: LoRA + auxiliary loss + augmentation on raw pixels.
 
-**This runs AFTER a budget's points are already selected -- never inside the
-active-learning loop.** Selection always uses the frozen embedding cache
-(fast, and the whole point of comparing samplers under one frozen protocol);
-this module is what `run_al_main.ipynb` calls once per budget, after
-`main.run`'s sweep has produced `selected_indices`, to optionally fine-tune
-the backbone on just those points and re-evaluate.
+**`finetune_and_evaluate` runs AFTER a budget's points are already selected**,
+once per budget, on `main.run`'s `selected_indices` -- it is what optionally
+fine-tunes the backbone on just those points and re-evaluates.
+
+**`AUGMENT` is the one axis that also reaches INTO the AL loop.** When
+`augment != "none"`, `make_augmented_feature_provider` (below) is handed to
+`sampling/scalpel` so the per-round uncertainty probe trains on freshly
+augmented pixels of the labeled set, instead of on frozen cache rows -- so
+"augmented" means the same thing in both halves of a run rather than
+applying only after selection finished. Point SELECTION itself is untouched:
+the coverage kernel, sigma adaptation and the pool-wide uncertainty scoring
+all still read the frozen cache, so what changes is only what the probe
+learned from. `USE_LORA` stays a final-training-only axis; a LoRA-adapted
+encoder is never used to select.
 
 **Every budget gets its own full-curve point**, not just the largest one --
 the confirmed choice for `TRAIN_MODE` axes at every budget in the sweep
@@ -38,9 +46,13 @@ from torch.utils.data import DataLoader, Dataset
 from data.augment import build_augment_transform
 from data.loaders import RawRGBDataset, default_transform
 from training.losses import center_loss, supcon_loss, triplet_loss
-from training.probe import LinearProbe, class_weights
+from training.probe import LinearProbe, _EarlyStopper, class_weights
 
-__all__ = ["needs_pixels", "finetune_and_evaluate"]
+__all__ = [
+    "needs_pixels",
+    "finetune_and_evaluate",
+    "make_augmented_feature_provider",
+]
 
 AUX_LOSS_FNS = {"center": center_loss, "supcon": supcon_loss, "triplet": triplet_loss}
 
@@ -208,7 +220,14 @@ def finetune_and_evaluate(
     optimizer = torch.optim.Adam(trainable, lr=probe_lr, weight_decay=weight_decay)
     aux_fn = AUX_LOSS_FNS.get(aux_loss)
 
-    for _ in range(probe_epochs):
+    # Same budget and same stopping rule as every other training loop in this
+    # project (training/probe.py::_EarlyStopper): up to `probe_epochs`, cut
+    # short once the epoch's mean training loss has plateaued for 20 epochs.
+    # It matters most here -- this is the only loop that pays a full encoder
+    # forward (and, under LoRA, a backward) per image per epoch.
+    stopper = _EarlyStopper()
+    for epoch in range(probe_epochs):
+        running, batches = 0.0, 0
         for images, batch_labels in loader:
             images = images.to(device, non_blocking=True)
             batch_labels = batch_labels.to(device, non_blocking=True).long()
@@ -227,6 +246,10 @@ def finetune_and_evaluate(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            running += float(loss.detach())
+            batches += 1
+        if batches and stopper.step(running / batches, epoch):
+            break
 
     probe.eval()
     predictions = np.argmax(probe.predict_proba(test_features, device), axis=1)
@@ -293,3 +316,73 @@ def _encode(encoder_model: nn.Module, images: torch.Tensor, image_encoder: str) 
     # CONCH: RAW_SPACE (proj_contrast=False, normalize=False) -- the probe
     # space, never PROJ_SPACE (features/vlm.py module docstring).
     return encoder_model.encode_image(images, normalize=False, proj_contrast=False)
+
+
+def make_augmented_feature_provider(
+    train_dataset,
+    encoder_model: nn.Module,
+    device: torch.device,
+    image_encoder: str = "dinov2",
+    augment: str = "flip_rotate",
+    conch_preprocess=None,
+    batch_size: int = 64,
+):
+    """Return `provider(indices) -> np.ndarray` of freshly-augmented features.
+
+    **This is the ONE place selection-time augmentation is produced**, and it
+    exists so `sampling/` never has to know what a pixel, a transform or an
+    encoder is: `sampling/scalpel/uncertainty.py` receives an opaque callable
+    and uses it only to build the visual probe's TRAINING matrix.
+
+    Why this is cheap enough to run inside the AL loop: the probe trains on
+    the LABELED set only (<= the largest budget, 200 here), never on the
+    ~90k-row pool. A whole 8-budget x 5-round sweep is ~2.7k image forwards
+    per epoch, against 3.6M for re-extracting the pool every round -- ~27x
+    cheaper, which is what makes "augment during selection" viable at all.
+
+    **Known, deliberate asymmetry.** The probe TRAINS on augmented pixels but
+    is then used to score the whole pool from the FROZEN cache, because
+    augmenting 90k rows per round is exactly the 27x cost this avoids. That
+    is the ordinary train-with-augmentation/infer-without arrangement, with
+    the pool playing the part of the test set. Two consequences worth naming
+    rather than discovering later:
+
+    * `sampling/scalpel`'s CELL probe cannot be augmented at all -- CellViT
+      embeddings come from a cache with no pixels behind them, so in
+      `uncertainty_mode="disagreement"` an augmented visual probe is compared
+      against an un-augmented cell probe.
+    * The temperature calibration that precedes the comparison is fitted on
+      the same augmented features, so it calibrates the augmented probe, not
+      a frozen one.
+
+    Neither is a bug to fix here; both are properties of the configuration
+    `AUGMENT != "none"` selects, and they are why `AUGMENT="none"` (which
+    never builds a provider at all) remains the clean control arm.
+    """
+    if augment == "none":
+        raise ValueError(
+            "make_augmented_feature_provider is for augment != 'none'; the "
+            "un-augmented path must read the frozen cache directly instead of "
+            "re-encoding identical pixels every round"
+        )
+    transform = _resolve_transform(image_encoder, augment, conch_preprocess)
+    raw = RawRGBDataset(train_dataset)
+    encoder_model = encoder_model.to(device)
+    encoder_model.eval()
+
+    def provider(indices) -> np.ndarray:
+        indices = list(indices)
+        if not indices:
+            return np.empty((0, _encoder_output_dim(encoder_model, image_encoder)), dtype=np.float32)
+        dataset = _SelectedPixelDataset(raw, indices, transform)
+        loader = DataLoader(
+            dataset, batch_size=min(batch_size, len(dataset)), shuffle=False,
+        )
+        chunks = []
+        with torch.no_grad():
+            for images, _labels in loader:
+                images = images.to(device, non_blocking=True)
+                chunks.append(_encode(encoder_model, images, image_encoder).cpu().numpy())
+        return np.concatenate(chunks, axis=0).astype(np.float32)
+
+    return provider

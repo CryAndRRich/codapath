@@ -10,6 +10,7 @@ slug derived from it cannot collide even after truncation.
 from __future__ import annotations
 
 import hashlib
+from typing import Optional
 
 # Kaggle dataset slugs are limited; keep well inside it.
 SLUG_LIMIT = 50
@@ -64,7 +65,13 @@ def results_archive_stem(dataset: str, sampler: str, seed: int) -> str:
     return f"{dataset}_{sampler}_seed{seed}"
 
 
-def main_archive_stem(dataset: str, sampler: str, seed: int, encoder: str = "dinov2") -> str:
+def main_archive_stem(
+    dataset: str,
+    sampler: str,
+    seed: int,
+    encoder: str = "dinov2",
+    run_name: Optional[str] = None,
+) -> str:
     """Archive name for `run_al_main.ipynb`'s AL results.
 
     Same shape as `results_archive_stem`, plus `encoder` -- the axis
@@ -76,8 +83,17 @@ def main_archive_stem(dataset: str, sampler: str, seed: int, encoder: str = "din
     appended when non-default, so an unchanged DINOv2 run's archive name
     matches what `results_archive_stem` would have produced -- mirroring how
     `_default_run_name` only appends `encoder` when it is not `"dinov2"`.
+
+    `run_name`, when given, is `main._default_run_name`'s output and is used
+    INSTEAD of `sampler` -- because that is the string that already encodes
+    every variant axis of the run (cell_pooling, use_lora, aux_loss, augment,
+    ...). Without it a 48-combination sweep produces 48 zips all called
+    `pathmnist_scalpel_seed42.zip`: each download overwrites the last in the
+    browser, and each Kaggle Dataset publish versions over the previous one.
+    The `sampler` name is already a prefix of `run_name`, so passing it does
+    not lose information -- it adds the axes that distinguish the runs.
     """
-    stem = f"{dataset}_{sampler}_seed{seed}"
+    stem = f"{dataset}_{run_name or sampler}_seed{seed}"
     if encoder != "dinov2":
         stem = f"{stem}_{encoder.replace('/', '_')}"
     return stem

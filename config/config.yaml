@@ -112,7 +112,11 @@ samplers:
     chunk_size: 2000
     n_sigma: 2000                      # pool subsample for the round-1 bandwidth and the sigma floor
     sigma_floor_ratio: 0.25            # sigma >= this * bootstrap sigma; near-duplicate tiles drive min-pairwise to ~0
-    probe_epochs: 50
+    probe_epochs: 100                  # matches training.probe_epochs (the evaluation probe) so
+                                       # selection and final training share one budget. Every loop
+                                       # early-stops on training loss after 20 flat epochs
+                                       # (training/probe.py::_EarlyStopper), so a converged fit
+                                       # costs far fewer than 100 in practice.
     probe_lr: 0.001
     probe_weight_decay: 0.0001
     consistency_weight: 0.0            # >0 couples the two probes during training. Works AGAINST acquisition:
