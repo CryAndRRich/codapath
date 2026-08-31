@@ -15,6 +15,21 @@ all still read the frozen cache, so what changes is only what the probe
 learned from. `USE_LORA` stays a final-training-only axis; a LoRA-adapted
 encoder is never used to select.
 
+**Two invariants the LoRA path depends on, both of which were violated in
+the first version and produced near-chance accuracy on a real run:**
+
+- *Score the space you trained in.* A LoRA run's probe reads features from
+  the ADAPTED encoder, so it must be evaluated on test features from that
+  same encoder (`encode_dataset`, hence the required `test_dataset`). The
+  frozen embedding cache describes a different encoder; because both are
+  768-d, using it raises nothing and simply reports noise.
+- *Every budget starts from a clean adapter.* `main.run` loads this encoder
+  once and reuses it across the whole sweep, and the training loop below
+  mutates it in place, so `main.run` calls
+  `training.lora.reset_lora_parameters` before each budget. Without that,
+  budget k+1 inherits budget k's adapter, trained on a different labeled
+  set, and the sweep stops measuring "N labels -> this accuracy".
+
 **Every budget gets its own full-curve point**, not just the largest one --
 the confirmed choice for `TRAIN_MODE` axes at every budget in the sweep
 (`PLAN_IMPLEMENT.md` §6.4's open question, resolved: full curve, ~8x the cost
@@ -52,20 +67,53 @@ __all__ = [
     "needs_pixels",
     "finetune_and_evaluate",
     "make_augmented_feature_provider",
+    "encode_dataset",
 ]
 
 AUX_LOSS_FNS = {"center": center_loss, "supcon": supcon_loss, "triplet": triplet_loss}
 
+# Smallest trailing batch worth forming. The pairwise auxiliary losses need
+# one same-class pair, and the chance a batch has none grows sharply as the
+# batch shrinks relative to the class count: measured over 14 classes,
+# all-singleton batches occur 62.7% of the time at size 4, 8.6% at size 8,
+# and ~0% from size 12 up. Scaled by `num_classes` rather than fixed, because
+# the same absolute size is safe for 2 classes and unsafe for 14.
+def _min_tail_batch(num_classes: int) -> int:
+    return max(8, min(2 * num_classes, 32))
 
-def needs_pixels(use_lora: bool, augment: str) -> bool:
-    """True iff this configuration needs raw pixels at all.
+
+def needs_pixels(use_lora: bool, augment: str, aux_loss: str = "none") -> bool:
+    """True iff this configuration needs the pixel-reading final-training pass.
 
     The one predicate `run_al_main.ipynb` and this module both call, so
     "when do we load images" is decided in exactly one place -- duplicating
     this condition inline at two call sites is exactly the kind of drift
     that produces a config where one site thinks pixels are needed and the
     other does not.
+
+    **`aux_loss` alone does NOT make this true, and that is deliberate.**
+    An auxiliary loss acts on the encoder's features; with `use_lora=False`
+    the encoder is frozen and those features carry no gradient, so the term
+    is a constant that changes nothing (see `finetune_and_evaluate`'s guard,
+    which refuses that combination outright rather than running a no-op).
+    `aux_loss` is therefore only meaningful together with `use_lora`, which
+    already makes this predicate true on its own.
+
+    `aux_loss` is still in the signature so callers pass the whole config and
+    this function -- not each call site -- decides. An earlier version
+    omitted the parameter entirely, which meant `run_al_main.ipynb` and
+    `main.py` could not even express the question.
     """
+    if aux_loss != "none" and not use_lora:
+        # Not silently False: this configuration is refused downstream, and
+        # returning False here would route it to the frozen probe path where
+        # it would run to completion as a mislabeled baseline.
+        raise ValueError(
+            f"aux_loss={aux_loss!r} with use_lora=False is not a valid "
+            "configuration: the auxiliary losses act on encoder features, "
+            "which carry no gradient when the encoder is frozen. Enable "
+            "LoRA, or set aux_loss='none'."
+        )
     return bool(use_lora) or augment != "none"
 
 
@@ -107,6 +155,67 @@ class _SelectedPixelDataset(Dataset):
     def __getitem__(self, i: int):
         image, label, _sample_id = self.raw[self.indices[i]]
         return self.transform(image), label
+
+
+class _AllPixelDataset(Dataset):
+    """Every row of `raw`, under a fixed (never augmented) transform.
+
+    The test-set counterpart of `_SelectedPixelDataset`. Evaluation must see
+    the encoder's plain preprocessing -- augmentation is a TRAINING-time
+    perturbation, and applying it at test time would measure the encoder on
+    inputs no protocol in this project scores on.
+    """
+
+    def __init__(self, raw: RawRGBDataset, transform) -> None:
+        self.raw = raw
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.raw)
+
+    def __getitem__(self, i: int):
+        image, label, _sample_id = self.raw[i]
+        return self.transform(image), label
+
+
+@torch.no_grad()
+def encode_dataset(
+    dataset,
+    encoder_model: nn.Module,
+    device: torch.device,
+    image_encoder: str = "dinov2",
+    conch_preprocess=None,
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Encode EVERY row of `dataset` with `encoder_model`, in dataset order.
+
+    Used to re-derive test features through a LoRA-adapted encoder. The
+    transform is the encoder's plain preprocessing -- `augment="none"` is
+    passed explicitly rather than defaulted, because augmenting a test set is
+    never correct here.
+
+    Returns `(len(dataset), feat_dim)` float32, aligned row-for-row with the
+    dataset's own order, which is the order `test_labels` is in.
+    """
+    transform = _resolve_transform(image_encoder, "none", conch_preprocess)
+    pixels = _AllPixelDataset(RawRGBDataset(dataset), transform)
+    workers = _loader_workers(dataset)
+    loader = DataLoader(
+        pixels, batch_size=batch_size, shuffle=False,
+        num_workers=workers, pin_memory=workers > 0,
+    )
+    was_training = encoder_model.training
+    encoder_model.eval()
+    encoder_model = encoder_model.to(device)
+    outputs = []
+    for images, _labels in loader:
+        images = images.to(device, non_blocking=True)
+        outputs.append(_encode(encoder_model, images, image_encoder).float().cpu().numpy())
+    if was_training:
+        encoder_model.train()
+    if not outputs:
+        raise ValueError("encode_dataset got an empty dataset")
+    return np.concatenate(outputs, axis=0).astype(np.float32)
 
 
 def _resolve_transform(image_encoder: str, augment: str, conch_preprocess=None):
@@ -158,6 +267,7 @@ def finetune_and_evaluate(
     conch_preprocess=None,
     batch_size: int = 32,
     weight_decay: float = 0.0,
+    test_dataset=None,
 ) -> Tuple[LinearProbe, Dict[str, float]]:
     """Run the final-training pass for one budget and evaluate it.
 
@@ -166,27 +276,71 @@ def finetune_and_evaluate(
     so the caller can drop it straight into that dict without renaming
     anything.
 
-    `test_features` stays the FROZEN embedding-cache features, never
-    re-extracted through a fine-tuned encoder: this pass adapts the encoder
-    only on the training pixels, and the whole point of a shared test set is
-    that scoring against it means the same thing across every run. A LoRA
-    run's test-time features would need the ADAPTED encoder to be
-    meaningful, which is a larger change (a per-run test cache) explicitly
-    out of scope here -- `evaluate_al_sampler.ipynb`'s existing encoder-aware
-    scoring does not (yet) know how to load an adapted-encoder cache, and
-    building that is future work, not silently approximated by scoring a
-    fine-tuned model against frozen features.
+    **Which test features get scored depends on whether the encoder moved.**
+
+    `use_lora=True` adapts the encoder, so the probe is trained on features
+    from the ADAPTED encoder. Scoring that probe against the frozen
+    embedding cache would compare two different feature spaces -- the probe
+    would be reading coordinates that no longer mean what it learned. So
+    when `use_lora=True`, `test_dataset` is REQUIRED and the test features
+    are re-encoded through the adapted encoder here.
+
+    Measured cost of getting this wrong (histoset, 14 balanced classes,
+    r=8): accuracy fell to 0.10-0.21 against a 0.071 random floor, with
+    predictions collapsing onto a few classes (3885 of 5600 test rows into
+    one class at budget 200) -- while a LoRA perturbation far milder than
+    real training already moves DINOv2 CLS features 27% in L2 (cosine 0.96).
+    Nothing about the shapes disagrees, which is why this survived: both
+    spaces are 768-d.
+
+    `use_lora=False` (the augment-only path) leaves the encoder frozen, so
+    its features ARE the cache's features and `test_features` is used
+    directly -- `test_dataset` is not needed and re-encoding would only
+    spend a forward pass to reproduce the cache.
     """
-    if not needs_pixels(use_lora, augment):
+    if not needs_pixels(use_lora, augment, aux_loss):
         raise ValueError(
-            "finetune_and_evaluate is for the pixel-reading path only "
-            "(use_lora=True or augment != 'none'); the frozen-embedding "
-            "path should call training.probe.train_probe directly instead"
+            "finetune_and_evaluate is for the final-training path only "
+            "(use_lora=True, augment != 'none', or aux_loss != 'none'); the "
+            "plain frozen-embedding path should call "
+            "training.probe.train_probe directly instead"
         )
     if aux_loss not in ("none", *AUX_LOSS_FNS):
         raise ValueError(f"aux_loss must be one of {('none', *AUX_LOSS_FNS)}, got {aux_loss!r}")
+    if aux_loss != "none" and not use_lora:
+        # Every loss in training/losses.py reads only `features`, and on the
+        # frozen path those are produced under torch.no_grad() -- so the aux
+        # term has no grad_fn and adds a CONSTANT to the loss. It cannot move
+        # the probe (the probe's own gradient comes from cross-entropy alone)
+        # and it cannot move the encoder (frozen). Verified directly: calling
+        # .backward() on center_loss over no_grad features raises "does not
+        # require grad".
+        #
+        # Running it anyway would produce a result file stamped `auxcenter`
+        # that is numerically identical to the no-aux baseline -- the same
+        # class of silent no-op as the minmax-on-a-constant-vector lesson in
+        # CLAUDE.md. Refuse instead.
+        raise ValueError(
+            f"aux_loss={aux_loss!r} requires use_lora=True. The auxiliary "
+            "losses act on the ENCODER's features, but with use_lora=False "
+            "the encoder is frozen and its features are computed under "
+            "no_grad, so the term is a constant that changes nothing -- the "
+            "run would be identical to aux_loss='none' while being labeled "
+            "otherwise. Enable LoRA, or set aux_loss='none'."
+        )
     if use_lora and encoder_model is None:
         raise ValueError("use_lora=True needs encoder_model (a LoRA-wrapped encoder)")
+    if use_lora and test_dataset is None:
+        # Hard error, never a silent fall back to `test_features`: that fall
+        # back is exactly the bug this parameter exists to make impossible,
+        # and it is invisible downstream because both spaces share a width.
+        raise ValueError(
+            "use_lora=True needs test_dataset: the probe is trained on "
+            "features from the LoRA-ADAPTED encoder, so it must be scored on "
+            "test features from that same encoder. Scoring it against the "
+            "frozen embedding cache compares two different feature spaces "
+            "and silently produces near-chance accuracy."
+        )
     if encoder_model is None:
         # The augment-only path still has to turn augmented PIXELS into
         # features, which needs an encoder. An earlier version fell through to
@@ -212,8 +366,29 @@ def finetune_and_evaluate(
     # project's policy -- 2 for a per-file dataset, 0 for an already-decoded
     # (and usually mapped) .npz, where a worker would only add pickling.
     loader_workers = _loader_workers(train_dataset)
+    # A tiny TRAILING batch is the problem here, not the batch size itself.
+    # `supcon`/`triplet` need at least one same-class pair somewhere in the
+    # batch, and a 4-sample remainder over 14 classes is all-singletons ~61%
+    # of the time (measured) -- which at 100 epochs is a near-certain crash
+    # partway through a budget. `drop_last` is not the fix: at budget 25 it
+    # would throw away labeled points this project spent its entire budget
+    # acquiring. Instead, when the remainder would be too small to contain a
+    # pair, widen the batch so the samples are redistributed and every batch
+    # stays viable. `len(dataset)` is at most the largest budget (200), so a
+    # widened batch is still small.
+    batch_size = min(batch_size, len(dataset))
+    min_tail = _min_tail_batch(num_classes)
+    remainder = len(dataset) % batch_size
+    if 0 < remainder < min_tail and len(dataset) > batch_size:
+        # Grow the batch until the split is even, or until one batch holds
+        # everything (the full-batch case, which has no remainder at all).
+        while batch_size < len(dataset):
+            batch_size += 1
+            remainder = len(dataset) % batch_size
+            if remainder == 0 or remainder >= min_tail:
+                break
     loader = DataLoader(
-        dataset, batch_size=min(batch_size, len(dataset)), shuffle=True,
+        dataset, batch_size=batch_size, shuffle=True,
         num_workers=loader_workers, pin_memory=loader_workers > 0,
     )
 
@@ -248,6 +423,8 @@ def finetune_and_evaluate(
     # It matters most here -- this is the only loop that pays a full encoder
     # forward (and, under LoRA, a backward) per image per epoch.
     stopper = _EarlyStopper()
+    aux_skipped = 0
+    aux_batches = 0
     for epoch in range(probe_epochs):
         running, batches = 0.0, 0
         for images, batch_labels in loader:
@@ -263,18 +440,63 @@ def finetune_and_evaluate(
             logits = probe(features)
             loss = criterion(logits, batch_labels)
             if aux_fn is not None:
-                loss = loss + aux_weight * aux_fn(features, logits, batch_labels)
+                try:
+                    loss = loss + aux_weight * aux_fn(features, logits, batch_labels)
+                except ValueError:
+                    # The pairwise losses raise when NO anchor in the batch has
+                    # a same-class positive. Batch widening above makes that
+                    # rare, but it cannot be ruled out (a labeled set can be
+                    # spread across more classes than any batch can pair up),
+                    # and aborting a budget hours into a sweep over one
+                    # unlucky shuffle is the wrong trade. Skip the aux term
+                    # for THIS batch only; cross-entropy still trains on it.
+                    #
+                    # Counted, not swallowed: a run where this fires on most
+                    # batches is not really an auxiliary-loss run, and the
+                    # printed summary below is what says so.
+                    aux_skipped += 1
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             running += float(loss.detach())
             batches += 1
+            if aux_fn is not None:
+                aux_batches += 1
         if batches and stopper.step(running / batches, epoch):
             break
 
+    if aux_skipped:
+        # Loud, because a high ratio means the run is closer to aux_loss
+        # "none" than to what its filename claims.
+        share = aux_skipped / max(aux_batches, 1)
+        print(
+            f"[final-train] aux_loss={aux_loss!r} skipped on {aux_skipped}/"
+            f"{aux_batches} batches ({share:.1%}) -- no same-class pair in "
+            "those batches"
+            + ("  *** the auxiliary loss barely acted on this run ***"
+               if share > 0.5 else "")
+        )
+
     probe.eval()
-    predictions = np.argmax(probe.predict_proba(test_features, device), axis=1)
+    if use_lora:
+        # The encoder moved during training, so the cache no longer describes
+        # it. Re-encode the test set through the adapted encoder: this is the
+        # only feature space the probe above was ever trained to read.
+        eval_features = encode_dataset(
+            test_dataset, encoder_model, device,
+            image_encoder=image_encoder, conch_preprocess=conch_preprocess,
+            batch_size=max(batch_size, 32),
+        )
+        if eval_features.shape[0] != len(test_labels):
+            raise ValueError(
+                f"re-encoded test features have {eval_features.shape[0]} rows "
+                f"but test_labels has {len(test_labels)} -- test_dataset is "
+                "not the dataset test_labels came from"
+            )
+    else:
+        eval_features = test_features
+    predictions = np.argmax(probe.predict_proba(eval_features, device), axis=1)
     from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
     metrics = {

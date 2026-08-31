@@ -369,7 +369,7 @@ def run(
     ft_aux_loss = final_train_cfg.get("aux_loss", "none")
     ft_aux_weight = float(final_train_cfg.get("aux_weight", 0.5))
     ft_augment = final_train_cfg.get("augment", "none")
-    run_final_training = needs_pixels(ft_use_lora, ft_augment)
+    run_final_training = needs_pixels(ft_use_lora, ft_augment, ft_aux_loss)
 
     spec = spec_for(sampler_name)
     output_name = _safe_run_name(
@@ -683,6 +683,35 @@ def run(
                 # §6.4: every budget gets its own final-training pass (the
                 # confirmed full-curve choice), reusing the ONE encoder
                 # loaded above rather than reloading it per budget.
+                #
+                # Reusing the encoder object means reusing its ADAPTER STATE
+                # too, so reset it first: `finetune_and_evaluate` trains it in
+                # place, and without this budget 75 would start from the
+                # adapter budget 25 trained on a different labeled set. Each
+                # budget must independently answer "given N labels, how well
+                # does this do". The reset restores the freshly-wrapped
+                # initialization exactly (zero delta), so this is equivalent
+                # to re-wrapping a clean checkpoint without re-downloading it.
+                if ft_use_lora and ft_encoder_model is not None:
+                    from training.lora import reset_lora_parameters
+
+                    # Seeded, so every budget starts from the IDENTICAL
+                    # adapter. Without a seed the Kaiming draw comes from the
+                    # global RNG, which selection has already advanced by a
+                    # budget-dependent amount -- so a budget's LoRA init (and
+                    # therefore its result) would depend on its position in
+                    # the sweep. The zero-delta invariant holds either way,
+                    # which is why this is invisible to a "did it start
+                    # clean?" check and only shows up when the budget order
+                    # is reversed.
+                    n_reset = reset_lora_parameters(ft_encoder_model, seed=random_seed)
+                    if n_reset == 0:
+                        raise RuntimeError(
+                            "use_lora=True but no LoRA adapters were found to "
+                            f"reset on the {image_encoder} encoder -- the wrap "
+                            "did not take effect, so this run would have "
+                            "trained nothing but the probe."
+                        )
                 probe, ft_metrics = finetune_and_evaluate(
                     train_dataset=train_dataset,
                     selected_indices=selected_indices,
@@ -702,6 +731,11 @@ def run(
                     augment=ft_augment,
                     encoder_model=ft_encoder_model,
                     conch_preprocess=ft_conch_preprocess,
+                    # LoRA adapts the encoder, so this budget's probe must be
+                    # scored on test features from THAT encoder, not on the
+                    # frozen cache. finetune_and_evaluate re-encodes from
+                    # these pixels; it raises rather than falling back.
+                    test_dataset=test_dataset,
                 )
                 accuracy, precision, recall, f1 = (
                     ft_metrics["acc"], ft_metrics["precision"],

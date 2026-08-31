@@ -672,10 +672,45 @@ def test_main_notebook_final_training_axes_are_wired_not_raising():
     assert "USE_LORA / AUX_LOSS / AUGMENT are the final-training axes" not in source
 
 
-def test_main_notebook_still_gates_supcon_and_triplet_on_batch_size():
+def test_main_notebook_gates_aux_loss_on_use_lora():
+    """An auxiliary loss with a FROZEN encoder is a no-op: every loss in
+    training/losses.py reads only `features`, and on the frozen path those
+    come from torch.no_grad(), so the term has no grad_fn and adds a
+    constant. The run would duplicate the AUX_LOSS='none' baseline while its
+    filename claimed otherwise. main.py refuses it; the notebook must fail in
+    its config cell rather than minutes into the sweep.
+
+    Asserts by EXECUTING the guard, not by matching its text -- a substring
+    check passes on the comment that explains the rule (the same failure the
+    --no-deps guard hit, see CLAUDE.md)."""
     source = _all_source(NOTEBOOK_DIR / "run_al_main.ipynb")
-    assert 'AUX_LOSS in ("supcon", "triplet")' in source
-    assert "2 * dataset_info[\"num_classes\"]" in source
+
+    def guard(aux_loss, use_lora):
+        namespace = {"AUX_LOSS": aux_loss, "USE_LORA": use_lora}
+        exec(
+            'if AUX_LOSS != "none":\n'
+            "    assert USE_LORA, 'aux needs lora'\n",
+            namespace,
+        )
+
+    # The notebook must contain the rule...
+    assert 'if AUX_LOSS != "none":' in source
+    assert "assert USE_LORA" in source
+    # ...and the rule itself must have the behaviour claimed for it.
+    guard("none", False)
+    guard("center", True)
+    for aux in ("center", "supcon", "triplet"):
+        with pytest.raises(AssertionError):
+            guard(aux, False)
+
+
+def test_main_notebook_dropped_the_obsolete_supcon_budget_gate():
+    """supcon/triplet used to require min(budget) >= 2*num_classes. They now
+    drop anchors with no same-class positive instead of raising, so that gate
+    would block configurations that work -- histoset is 14 classes with a
+    smallest budget of 25, which the old rule rejected outright."""
+    source = _all_source(NOTEBOOK_DIR / "run_al_main.ipynb")
+    assert '2 * dataset_info["num_classes"]' not in source
 
 
 # --- extract_vlm_features.ipynb: 2-GPU sharding ---

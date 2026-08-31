@@ -2,22 +2,31 @@
 
 Every loss shares one signature -- `(features, logits, labels) -> scalar` --
 so `training/finetune.py` can dispatch on `AUX_LOSS` without a special case
-per loss. `logits` is accepted even though only `center_loss` ignores it,
-because a caller building this call site once (not once per loss kind)
-should not have to know which losses use which arguments.
+per loss. **All three currently ignore `logits`**; it is in the signature so
+that a loss which does need it can be added without changing the one call
+site, and so a caller building that site does not have to know which losses
+read which arguments.
 
-**`supcon_loss` and `triplet_loss` RAISE on a batch with fewer than 2
-samples of some present class**, rather than returning ~0. A silent 0 is the
-failure this project has hit before with a different mechanism (see
-CLAUDE.md's minmax-on-a-constant-vector lesson): the training loop would run
-to completion, print a normal-looking loss curve, and the auxiliary loss
-would have contributed nothing the whole time, with nothing to say so. This
-project's budgets (25-200 labeled points) make a thin batch a realistic risk,
-not a hypothetical one, which is exactly why `run_al_main.ipynb`'s assert
-cell also checks `min(budget) >= 2 * num_classes` before a supcon/triplet run
-is allowed to start (PLAN_IMPLEMENT.md §6.1) -- this raise is the second,
-mechanism-level line of defense for the same problem, active on every batch,
-not just the smallest configured budget.
+That every loss reads ONLY `features` has a consequence worth stating
+plainly: an auxiliary loss can only do something if `features` carries a
+gradient. On `finetune_and_evaluate`'s frozen-encoder path the features are
+produced under `torch.no_grad()`, so an aux term there has no `grad_fn` at
+all -- it is a constant added to the loss, contributing exactly nothing.
+`finetune_and_evaluate` therefore refuses that combination rather than
+running it; see its `aux_loss`/`use_lora` guard.
+
+**Thin batches are normal here, and are handled by DROPPING the anchors that
+have no positive -- not by raising.** `supcon_loss` and `triplet_loss` need a
+same-class partner per anchor. An earlier version raised whenever any present
+class had fewer than 2 members in the batch, which made both losses
+unrunnable at this project's budgets: histoset has 14 classes, budget 25
+selects only ~10 of them, and a random batch of 32 tripped the raise in 99%
+of draws (measured). No batching strategy fixes that -- a class with one
+sample in the whole labeled set has no positive in ANY batch. So those
+anchors are excluded from the mean (the standard Khosla et al. formulation,
+which sums over a positive set `P(i)` that is empty for them) while still
+serving as negatives for other anchors. The losses raise only when NO anchor
+has a positive, where the value is genuinely undefined.
 """
 
 from __future__ import annotations
@@ -62,24 +71,27 @@ def supcon_loss(
     and pushes it away from every sample of a different class, in the
     (L2-normalized) feature space.
 
-    Raises `ValueError` if any class present in `labels` has fewer than 2
-    members: an anchor with no positive (no other same-class sample in the
-    batch) has an undefined "pull toward" term. The failure is silent
-    without this check -- the pairwise-similarity sum over an empty positive
-    set is exactly 0, so the training loop keeps running and reports a
-    non-`nan` loss that quietly ignores that anchor's class the whole time.
+    **Anchors with no positive are DROPPED from the mean, not silently
+    counted as zero.** An anchor whose class has exactly one member in the
+    batch has no "pull toward" term at all; including it would add a hard 0
+    to the mean and quietly bias the loss downward in proportion to how many
+    such anchors there are. Averaging only over anchors that HAVE a positive
+    is the standard formulation (Khosla et al. 2020 Eq. 2 sums over
+    `P(i)`, which is empty for those anchors).
+
+    An earlier version raised `ValueError` instead. That was wrong for this
+    project: at these budgets a singleton class is the NORM, not an error.
+    histoset has 14 classes and budget 25 selects only ~10 of them, so with
+    `batch_size=32` a randomly-drawn batch hit the raise in 99% of cases --
+    making `supcon` and `triplet` unrunnable on the very sweep they were
+    added for. And no batching strategy can fix it: a class with exactly one
+    sample in the whole labeled set has no positive in ANY batch.
+
+    Raises only when NO anchor in the batch has a positive (every class is a
+    singleton), where the loss is genuinely undefined rather than merely
+    thin.
     """
     labels = labels.long()
-    counts = torch.bincount(labels)
-    present = counts[counts > 0]
-    if (present < 2).any():
-        thin = [int(c) for c in torch.unique(labels) if counts[c] < 2]
-        raise ValueError(
-            f"supcon_loss: class(es) {thin} have fewer than 2 samples in this "
-            f"batch (batch size {len(labels)}) -- an anchor with no same-class "
-            "positive has no defined pull term. Use AUX_LOSS='center' if the "
-            "budget cannot guarantee 2+ samples/class."
-        )
 
     normalized = F.normalize(features, dim=1)
     similarity = torch.matmul(normalized, normalized.T) / temperature
@@ -92,8 +104,19 @@ def supcon_loss(
     exp_sim = torch.exp(similarity) * (~self_mask)
     log_prob = similarity - torch.log(exp_sim.sum(dim=1, keepdim=True).clamp_min(1e-12))
 
-    positive_counts = positive_mask.sum(dim=1).clamp_min(1)
-    mean_log_prob_pos = (positive_mask * log_prob).sum(dim=1) / positive_counts
+    positive_counts = positive_mask.sum(dim=1)
+    has_positive = positive_counts > 0
+    if not bool(has_positive.any()):
+        raise ValueError(
+            f"supcon_loss: no anchor in this batch (size {len(labels)}) has a "
+            "same-class positive -- every present class is a singleton, so the "
+            "loss is undefined. Use AUX_LOSS='center', which needs no pair."
+        )
+
+    mean_log_prob_pos = (
+        (positive_mask * log_prob).sum(dim=1)[has_positive]
+        / positive_counts[has_positive]
+    )
     return -mean_log_prob_pos.mean()
 
 
@@ -107,29 +130,34 @@ def triplet_loss(
     HARDEST positive (farthest same-class sample) and the HARDEST negative
     (closest different-class sample), in Euclidean feature space.
 
-    Raises `ValueError` under the same condition as `supcon_loss` (some
-    present class has fewer than 2 members) -- an anchor with no positive
-    cannot select a hardest positive, and the same silent-zero failure mode
-    applies: a masked-out max over an empty set is `-inf` unless guarded, and
-    a naive guard that clamps it to 0 would silently drop that anchor from
-    the loss rather than raising.
+    **Anchors with no positive are DROPPED from the mean**, for the same
+    reason and by the same rule as `supcon_loss` -- see its docstring for why
+    raising here was wrong at this project's budgets (a singleton class is
+    normal, not an error, and no batching strategy can manufacture a positive
+    for a class with one sample in the whole labeled set).
+
+    The drop is explicit, not the accidental `max`-over-empty-set value: a
+    masked max would return 0 (the diagonal's value), which reads as "the
+    hardest positive is at distance 0" and silently makes that anchor's
+    triplet trivially satisfied.
+
+    Raises only when NO anchor has a positive.
     """
     labels = labels.long()
-    counts = torch.bincount(labels)
-    if (counts[counts > 0] < 2).any():
-        thin = [int(c) for c in torch.unique(labels) if counts[c] < 2]
-        raise ValueError(
-            f"triplet_loss: class(es) {thin} have fewer than 2 samples in this "
-            f"batch (batch size {len(labels)}) -- an anchor with no same-class "
-            "positive has no hardest-positive to select. Use AUX_LOSS='center' "
-            "if the budget cannot guarantee 2+ samples/class."
-        )
 
     pairwise = torch.cdist(features, features, p=2)
     same_class = labels.unsqueeze(0) == labels.unsqueeze(1)
     self_mask = torch.eye(len(labels), dtype=torch.bool, device=labels.device)
     positive_mask = same_class & ~self_mask
     negative_mask = ~same_class
+
+    has_positive = positive_mask.any(dim=1)
+    if not bool(has_positive.any()):
+        raise ValueError(
+            f"triplet_loss: no anchor in this batch (size {len(labels)}) has a "
+            "same-class positive -- every present class is a singleton, so the "
+            "loss is undefined. Use AUX_LOSS='center', which needs no pair."
+        )
 
     hardest_positive = (pairwise * positive_mask).max(dim=1).values
     # Negatives use +inf where masked out so `.min` never picks a same-class
@@ -138,4 +166,5 @@ def triplet_loss(
     masked_negative = pairwise.masked_fill(~negative_mask, float("inf"))
     hardest_negative = masked_negative.min(dim=1).values
 
-    return F.relu(hardest_positive - hardest_negative + margin).mean()
+    triplets = F.relu(hardest_positive - hardest_negative + margin)
+    return triplets[has_positive].mean()

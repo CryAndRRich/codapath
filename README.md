@@ -368,19 +368,35 @@ it True raises `NotImplementedError` naming exactly what is missing
 `CLAUDE.md`'s contribution #1) rather than silently running without it.
 
 **`USE_LORA`/`AUX_LOSS`/`AUGMENT` are the final-training pass** (§6.4/§6.5),
-run AFTER a budget's points are already selected — never inside selection
-itself, which still always trains on the frozen embedding cache. **Every
-budget in the sweep gets its own final-training pass**, not just the largest
-(the confirmed full-curve choice: the research question is whether LoRA
-helps more at low or high budgets). The encoder is loaded exactly ONCE per
-run, reused across every budget's pass.
+run AFTER a budget's points are already selected. **Every budget in the sweep
+gets its own final-training pass**, not just the largest (the confirmed
+full-curve choice: the research question is whether LoRA helps more at low or
+high budgets). The encoder is loaded exactly ONCE per run and reused across
+every budget's pass — so `reset_lora_parameters` restores a clean adapter
+before each one, or budget k+1 would inherit budget k's fine-tuned weights.
+
+Three rules govern how these axes combine:
+
+- **`AUX_LOSS` requires `USE_LORA`.** Every loss in `training/losses.py`
+  reads only `features`; with the encoder frozen those come from `no_grad`,
+  so the term has no `grad_fn` and adds a constant that changes nothing. The
+  combination is refused rather than run as a mislabeled baseline.
+- **`AUGMENT` also reaches INTO selection**, unlike the other two: the
+  per-round uncertainty probe trains on freshly augmented pixels of the
+  labeled set (`make_augmented_feature_provider`), so "augmented" means the
+  same thing in both halves of a run. Point selection itself is untouched —
+  the coverage kernel, sigma adaptation and pool-wide scoring all still read
+  the frozen cache. `USE_LORA` never reaches selection.
+- **Test scoring follows the encoder.** A LoRA run re-encodes the test set
+  through the adapted encoder; the frozen-encoder paths keep using the
+  embedding cache, which describes exactly that encoder.
 
 | Piece | What it does |
 |---|---|
-| `training/lora.py` | Hand-rolled LoRA (no `peft` locally). `LinearLoRA` wraps DINOv2's separate `query`/`value` `nn.Linear` layers; `MultiheadAttentionLoRA` replaces CONCH's fused `nn.MultiheadAttention` with a hand-written forward that re-derives Q/K/V from the same `in_proj_weight` plus a low-rank delta on Q and V (K is never adapted). Both verified against the real modules they wrap: `r=0` is bit-for-bit identical to the frozen original. |
+| `training/lora.py` | Hand-rolled LoRA (no `peft` locally). `LinearLoRA` wraps DINOv2's separate `query`/`value` `nn.Linear` layers; `FusedQKVLoRA` wraps the fused `qkv` `nn.Linear` in CONCH's **timm** vision trunk (`model.visual.trunk.blocks[i].attn.qkv`), adding a delta to the Q and V row-blocks only. Verified against the real modules they wrap: `r=0` is bit-for-bit identical to the frozen original. `reset_lora_parameters` restores the freshly-wrapped state (zero delta) so each budget in a sweep starts from a clean adapter — `main.run` reuses one encoder object across all budgets and trains it in place. |
 | `training/losses.py` | `center_loss`, `supcon_loss`, `triplet_loss`, one shared `(features, logits, labels) -> scalar` signature. `supcon`/`triplet` **raise** on any batch with fewer than 2 samples of a present class — a silent near-zero loss on a thin batch is exactly the failure mode this project has already lost debugging time to once (see the minmax-on-a-constant-vector lesson). |
 | `data/augment.py` | `flip_rotate` only — deliberately no color jitter, since this project already lost a method to a stain-shortcut failure from color augmentation on H&E tiles. |
-| `training/finetune.py` | `finetune_and_evaluate` — reads raw pixels for just the selected indices (`RawRGBDataset`, no dataset-wide decode), trains encoder + probe end-to-end when `use_lora=True`, or just the probe (encoder frozen under `inference_mode`) when only `augment` is active. Test-set scoring always uses the frozen embedding cache, never a re-extracted adapted-encoder cache. |
+| `training/finetune.py` | `finetune_and_evaluate` — reads raw pixels for just the selected indices (`RawRGBDataset`, no dataset-wide decode), trains encoder + probe end-to-end when `use_lora=True`, or just the probe (encoder frozen under `inference_mode`) when only `augment` is active. **Test-set scoring follows the encoder**: `use_lora=True` re-encodes the test set through the adapted encoder (`encode_dataset`, requires `test_dataset`), because a probe trained on adapted features cannot be scored against the frozen cache; the augment-only path leaves the encoder frozen and so keeps using the cache directly. |
 
 A probe from this pass records `metadata["final_train_cfg"]` (and
 `results["final_train_cfg"]`) — present only when the pass actually ran, so a

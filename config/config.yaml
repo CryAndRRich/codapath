@@ -32,6 +32,10 @@ final_training:
   use_lora: false
   lora_r: 8
   lora_alpha: 16.0
+  # REQUIRES use_lora: true. The auxiliary losses act on the encoder's
+  # features; with the encoder frozen those carry no gradient, so the term is
+  # a constant that changes nothing and the run would duplicate aux_loss:
+  # "none" under a different filename. main.py refuses the combination.
   aux_loss: "none"        # none | center | supcon | triplet
   aux_weight: 0.5          # fixed at 0.5 for every aux_loss kind, once used
   augment: "none"          # none | flip_rotate

@@ -74,6 +74,7 @@ __all__ = [
     "apply_lora_to_dinov2",
     "apply_lora_to_conch",
     "lora_parameters",
+    "reset_lora_parameters",
 ]
 
 
@@ -441,3 +442,83 @@ def lora_parameters(model: nn.Module) -> List[nn.Parameter]:
         if any(name.endswith(f".{n}") or name == n for n in names) and param.requires_grad:
             params.append(param)
     return params
+
+
+def reset_lora_parameters(model: nn.Module, seed: Optional[int] = None) -> int:
+    """Re-initialize every LoRA adapter in `model` to its freshly-wrapped state.
+
+    Returns the number of wrapped modules reset.
+
+    **Why this has to exist.** `main.run` loads the final-training encoder
+    ONCE and reuses it for every budget in the sweep (reloading a checkpoint
+    eight times would cost more than the pass itself). But
+    `finetune_and_evaluate` trains that encoder IN PLACE, so without an
+    explicit reset budget 75 starts from the adapter budget 25 already
+    trained -- on a different labeled set. Each budget is supposed to answer
+    "given N labels, how well does this do", independently; carrying weights
+    forward silently turns the sweep into one continued training run whose
+    later points saw far more than N labels.
+
+    Measured symptom of the missing reset (histoset, LoRA r=8, 2 shards):
+    accuracy collapsed after the FIRST budget each shard processed -- 0.384
+    then 0.183/0.183/0.211 in one shard, 0.308 then 0.181/0.097/0.134 in the
+    other. The break tracked position-in-shard, not budget size, which is
+    what distinguishes this from "LoRA is simply bad at low budgets".
+
+    The reset restores the exact initialization `LinearLoRA.__init__` uses --
+    Kaiming-uniform `A`, ZERO `B` -- so a reset module reproduces its frozen
+    base output bit-for-bit until the first optimizer step, at any `r`. `r=0`
+    modules hold buffers rather than parameters and are skipped.
+
+    **`seed` makes the reset DETERMINISTIC, and that matters more than it
+    looks.** Kaiming-uniform draws from the global RNG, so without a seed
+    each budget in a sweep gets a *different* `A`. The adapter delta is still
+    exactly zero either way (`B` is zeroed), so "did this budget start
+    clean?" passes -- but the two budgets then train from different starting
+    points, and since selection consumes a budget-dependent amount of RNG
+    before this is called, the init a budget receives depends on its POSITION
+    in the sweep. Measured: reversing the budget order changed a budget's
+    accuracy (0.667 -> 0.500 on a 6-class fixture); seeding here made every
+    budget order-invariant. `main.run` passes its own `random_seed`, so every
+    budget starts from the identical adapter and a budget's result depends
+    only on its labeled set.
+    """
+    if seed is not None:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+    else:
+        generator = None
+    reset_count = 0
+    for module in model.modules():
+        if not isinstance(module, (LinearLoRA, FusedQKVLoRA, MultiheadAttentionLoRA)):
+            continue
+        if getattr(module, "r", 0) == 0:
+            # r=0 keeps empty BUFFERS, not parameters: there is no adapter
+            # state to reset, and re-initializing a buffer would be a no-op
+            # that only obscures the count.
+            continue
+        with torch.no_grad():
+            for a_name, b_name in (
+                ("lora_A", "lora_B"),
+                ("lora_A_q", "lora_B_q"),
+                ("lora_A_v", "lora_B_v"),
+            ):
+                a = getattr(module, a_name, None)
+                b = getattr(module, b_name, None)
+                if a is None or b is None:
+                    continue
+                if generator is None:
+                    nn.init.kaiming_uniform_(a, a=math.sqrt(5))
+                else:
+                    # kaiming_uniform_ takes no generator, so reproduce its
+                    # bound explicitly: U(-bound, bound) with
+                    # bound = sqrt(6 / ((1 + a^2) * fan_in)), a = sqrt(5),
+                    # which is what nn.init.kaiming_uniform_(a=sqrt(5))
+                    # computes for a 2-D weight (fan_in = size(1)).
+                    fan_in = a.size(1)
+                    bound = math.sqrt(6.0 / (6.0 * fan_in))
+                    with torch.no_grad():
+                        a.uniform_(-bound, bound, generator=generator)
+                b.zero_()
+        reset_count += 1
+    return reset_count
