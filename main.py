@@ -456,10 +456,33 @@ def run(
         ft_encoder_model = None
         ft_conch_preprocess = None
         if run_final_training:
+            # `transformers` prints a per-parameter "Loading weights" tqdm bar
+            # on every from_pretrained. Under `tee_stdout` those land in the
+            # run log: a measured 2442 of 2528 lines (97%, 337 KB) in one
+            # 2-shard run, which buried the 86 lines that actually said what
+            # the run was doing. Progress on a sub-second local checkpoint
+            # read is worth nothing; the log is worth a lot.
+            from transformers.utils import logging as _hf_logging
+
+            _hf_logging.disable_progress_bar()
+        # Snapshot of the UNWRAPPED, untrained encoder, taken before LoRA is
+        # applied and kept only when selection-time augmentation needs its own
+        # copy (see the `selection_augment_provider` block below). Copying from
+        # memory here is what avoids a second checkpoint download, which hung a
+        # 2-shard Kaggle run for hours against the HF Hub's unauthenticated
+        # rate limit.
+        selection_encoder_snapshot = None
+        if run_final_training:
+            needs_own_selection_encoder = ft_augment != "none" and ft_use_lora
             if image_encoder == "dinov2":
                 from transformers import Dinov2Model
 
                 ft_encoder_model = Dinov2Model.from_pretrained(visual_backbone)
+                if needs_own_selection_encoder:
+                    import copy
+
+                    selection_encoder_snapshot = copy.deepcopy(ft_encoder_model)
+                    selection_encoder_snapshot.requires_grad_(False)
                 if ft_use_lora:
                     from training.lora import apply_lora_to_dinov2
 
@@ -472,6 +495,11 @@ def run(
                 ft_encoder_model, ft_conch_preprocess = load_conch(
                     visual_backbone, device, hf_token=hf_token
                 )
+                if needs_own_selection_encoder:
+                    import copy
+
+                    selection_encoder_snapshot = copy.deepcopy(ft_encoder_model)
+                    selection_encoder_snapshot.requires_grad_(False)
                 if ft_use_lora:
                     from training.lora import apply_lora_to_conch
 
@@ -511,37 +539,38 @@ def run(
         # encoder must never select the points it is later trained on.
         selection_augment_provider = None
         selection_encoder_model = None
-        if ft_augment != "none":
+        if ft_augment != "none" and ft_encoder_model is not None:
             from training.finetune import make_augmented_feature_provider
 
-            # A SEPARATE, always-frozen encoder -- never `ft_encoder_model`.
-            # That one is LoRA-wrapped and `finetune_and_evaluate` trains it
-            # in place, once per budget, so reusing it here would let budget
-            # k's fine-tuned weights choose budget k+1's points: training
-            # leaking into selection, which no amount of frozen-cache
-            # coverage elsewhere would undo. Loading a second copy costs one
-            # checkpoint read per run and keeps the two roles honest.
-            if image_encoder == "dinov2":
-                from transformers import Dinov2Model
-
-                selection_encoder_model = Dinov2Model.from_pretrained(visual_backbone)
-                selection_encoder_model.requires_grad_(False)
-                selection_preprocess = None
+            # Selection must never see LoRA-adapted weights: `ft_encoder_model`
+            # is trained IN PLACE by `finetune_and_evaluate`, once per budget,
+            # so sharing it under `use_lora=True` would let budget k's
+            # fine-tuned weights choose budget k+1's points.
+            #
+            # That only applies when LoRA is on. With `use_lora=False` the
+            # encoder is frozen for the whole run and never mutated, so the
+            # same object is safe to share -- and sharing it matters: an
+            # earlier version ALWAYS re-loaded the checkpoint here, and on
+            # Kaggle two shard processes hitting the HF Hub unauthenticated at
+            # the same moment hung the run with no output past this point and
+            # no traceback. When LoRA IS on, the isolated copy is the
+            # `selection_encoder_snapshot` taken above -- deepcopied from
+            # memory BEFORE the LoRA wrap, so it is the plain pretrained
+            # encoder and needs no second download.
+            if ft_use_lora:
+                selection_encoder_model = selection_encoder_snapshot
+                source = "unwrapped snapshot taken before the LoRA wrap"
             else:
-                from features.vlm import load_conch
-
-                selection_encoder_model, selection_preprocess = load_conch(
-                    visual_backbone, device, hf_token=hf_token
-                )
-                selection_encoder_model.requires_grad_(False)
+                selection_encoder_model = ft_encoder_model
+                source = "shared with the final-training pass (frozen, never mutated)"
 
             selection_augment_provider = make_augmented_feature_provider(
                 train_dataset, selection_encoder_model, device,
                 image_encoder=image_encoder, augment=ft_augment,
-                conch_preprocess=selection_preprocess,
+                conch_preprocess=ft_conch_preprocess,
             )
-            print(f"[selection] uncertainty probe trains on augment={ft_augment!r} pixels "
-                  "(frozen encoder, separate from the final-training one)")
+            print(f"[selection] uncertainty probe trains on augment={ft_augment!r} "
+                  f"pixels -- encoder: {source}")
 
         common = dict(
             oracle_labels=train_labels,
@@ -742,6 +771,7 @@ def run(
 
         del ft_encoder_model
         del selection_encoder_model
+        del selection_encoder_snapshot
         clear_memory()
 
         _save(

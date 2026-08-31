@@ -44,7 +44,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from data.augment import build_augment_transform
-from data.loaders import RawRGBDataset, default_transform
+from data.loaders import RawRGBDataset, default_num_workers, default_transform
 from training.losses import center_loss, supcon_loss, triplet_loss
 from training.probe import LinearProbe, _EarlyStopper, class_weights
 
@@ -67,6 +67,21 @@ def needs_pixels(use_lora: bool, augment: str) -> bool:
     other does not.
     """
     return bool(use_lora) or augment != "none"
+
+
+def _loader_workers(train_dataset) -> int:
+    """DataLoader workers for a pixel-reading loop over `train_dataset`.
+
+    Defers to `data.loaders.default_num_workers`, which already encodes this
+    project's policy (2 for a per-file ImageFolder whose JPEG decode would
+    otherwise block the GPU on the main thread, 0 for an already-decoded and
+    usually memory-mapped .npz). The dataset object here does not carry its
+    own path, so the kind is inferred from the attribute an NPZDataset has
+    and an ImageFolder does not.
+    """
+    base = getattr(train_dataset, "dataset", train_dataset)
+    is_npz = hasattr(base, "npz_path") or hasattr(base, "mmap")
+    return default_num_workers("x.npz" if is_npz else "x/dir")
 
 
 class _SelectedPixelDataset(Dataset):
@@ -191,8 +206,15 @@ def finetune_and_evaluate(
 
     transform = _resolve_transform(image_encoder, augment, conch_preprocess)
     dataset = _SelectedPixelDataset(RawRGBDataset(train_dataset), selected_indices, transform)
+    # ImageFolder datasets (histoset, skintissue) decode a JPEG per sample; at
+    # num_workers=0 that happens on the main thread and the GPU waits on the
+    # CPU rather than the reverse. `default_num_workers` already encodes this
+    # project's policy -- 2 for a per-file dataset, 0 for an already-decoded
+    # (and usually mapped) .npz, where a worker would only add pickling.
+    loader_workers = _loader_workers(train_dataset)
     loader = DataLoader(
         dataset, batch_size=min(batch_size, len(dataset)), shuffle=True,
+        num_workers=loader_workers, pin_memory=loader_workers > 0,
     )
 
     if use_lora:
@@ -369,6 +391,9 @@ def make_augmented_feature_provider(
     raw = RawRGBDataset(train_dataset)
     encoder_model = encoder_model.to(device)
     encoder_model.eval()
+    # Resolved once, outside `provider`: the answer cannot change between
+    # rounds, and `default_num_workers` is a policy lookup, not a measurement.
+    loader_workers = _loader_workers(train_dataset)
 
     def provider(indices) -> np.ndarray:
         indices = list(indices)
@@ -377,6 +402,7 @@ def make_augmented_feature_provider(
         dataset = _SelectedPixelDataset(raw, indices, transform)
         loader = DataLoader(
             dataset, batch_size=min(batch_size, len(dataset)), shuffle=False,
+            num_workers=loader_workers, pin_memory=loader_workers > 0,
         )
         chunks = []
         with torch.no_grad():
