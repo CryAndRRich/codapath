@@ -517,8 +517,21 @@ def reset_lora_parameters(model: nn.Module, seed: Optional[int] = None) -> int:
                     # computes for a 2-D weight (fan_in = size(1)).
                     fan_in = a.size(1)
                     bound = math.sqrt(6.0 / (6.0 * fan_in))
-                    with torch.no_grad():
-                        a.uniform_(-bound, bound, generator=generator)
+                    # Drawn on CPU and copied, never with a device generator:
+                    # `Tensor.uniform_(generator=...)` requires the generator's
+                    # device to MATCH the tensor's, so a CPU generator against a
+                    # CUDA parameter raises "Expected a 'cuda' device type for
+                    # generator but found 'cpu'" -- which is invisible in a
+                    # CPU-only test suite and killed both GPU shards of a real
+                    # Kaggle run 40 minutes in. Drawing on CPU also makes the
+                    # init DEVICE-INDEPENDENT: the same seed gives the same
+                    # numbers whether the model sits on CPU or GPU, so a run is
+                    # reproducible across machines rather than only within one.
+                    a.copy_(
+                        torch.empty(a.shape, dtype=a.dtype, device="cpu").uniform_(
+                            -bound, bound, generator=generator
+                        )
+                    )
                 b.zero_()
         reset_count += 1
     return reset_count
