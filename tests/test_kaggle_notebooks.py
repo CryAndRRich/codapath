@@ -398,9 +398,68 @@ def test_vlm_notebook_keeps_dataset_seed_vlm_and_style_singular():
 
 def test_vlm_notebook_archive_stem_includes_the_description_style():
     """Two styles are two artifacts (different text prototype file), so the
-    archive name must distinguish them -- not just dataset/seed/VLM."""
+    archive name must distinguish them -- not just dataset/seed/VLM.
+
+    Asserts on DESCRIPTION_STYLE_EFFECTIVE, not DESCRIPTION_STYLE: when the
+    llm_* description file is missing the notebook falls back to bare class
+    names, and that run must not be able to claim the real style's filename.
+    """
     source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
-    assert "vlm_archive_stem(DATASET, SEED, VLM, DESCRIPTION_STYLE)" in source
+    assert "vlm_archive_stem(DATASET, SEED, VLM, DESCRIPTION_STYLE_EFFECTIVE)" in source
+
+
+def test_vlm_notebook_fallback_style_reaches_every_artifact_name():
+    """The class-name fallback must rename the zip, the text-prototype cache
+    AND the manifest, or a fallback run silently overwrites a real llm_* one.
+
+    Parses the notebook rather than grepping prose: an earlier test in this
+    file passed on a comment that merely mentioned the flag it was checking.
+    """
+    import ast
+
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    assert "DESCRIPTION_STYLE_EFFECTIVE = DESCRIPTION_STYLE" in source, (
+        "the effective style must default to the requested one"
+    )
+    assert 'f"{DESCRIPTION_STYLE}_fallback_classname"' in source, (
+        "the fallback must tag itself distinctly"
+    )
+    # All three artifact names must be keyed on the EFFECTIVE style.
+    for call in (
+        "text_prototype_cache_paths(FEATURE_DIR, DATASET, DESCRIPTION_STYLE_EFFECTIVE)",
+        "vlm_archive_stem(DATASET, SEED, VLM, DESCRIPTION_STYLE_EFFECTIVE)",
+        '"style": DESCRIPTION_STYLE_EFFECTIVE,',
+    ):
+        assert call in source, f"missing: {call}"
+    # And none of them may still use the raw style.
+    for stale in (
+        "text_prototype_cache_paths(FEATURE_DIR, DATASET, DESCRIPTION_STYLE)",
+        "vlm_archive_stem(DATASET, SEED, VLM, DESCRIPTION_STYLE)",
+        '"style": DESCRIPTION_STYLE,',
+    ):
+        assert stale not in source, f"still keyed on the requested style: {stale}"
+
+
+def test_vlm_notebook_preflight_runs_before_extraction():
+    """The timing estimate is worthless if it prints after the multi-hour run.
+
+    Asserts on ORDER (the same way the mmap-cleanup test does), not merely on
+    the preflight's presence.
+    """
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    preflight = source.index("---- PREFLIGHT")
+    estimate = source.index("[preflight] ESTIMATE:")
+    # The three mutually exclusive extraction branches all follow the preflight.
+    extraction = source.index("if SHARDS == 1:")
+    assert preflight < estimate < extraction, (
+        "preflight must print its estimate before extraction starts"
+    )
+    # It must discard a warm-up batch: a cold first CUDA forward is several
+    # times slower and would inflate the estimate.
+    assert "warm-up, discarded" in source
+    # And it must report GPU-hours vs wall clock separately -- conflating them
+    # is what once rejected a run at 14.5 h that was 7.2 h across two GPUs.
+    assert "GPU-hours" in source and "_pf_gpu_hours / SHARDS" in source
 
 
 def test_cellvit_wheel_is_installed_with_no_deps():
