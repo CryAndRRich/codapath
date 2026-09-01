@@ -4,16 +4,19 @@
 once per budget, on `main.run`'s `selected_indices` -- it is what optionally
 fine-tunes the backbone on just those points and re-evaluates.
 
-**`AUGMENT` is the one axis that also reaches INTO the AL loop.** When
-`augment != "none"`, `make_augmented_feature_provider` (below) is handed to
-`sampling/scalpel` so the per-round uncertainty probe trains on freshly
-augmented pixels of the labeled set, instead of on frozen cache rows -- so
-"augmented" means the same thing in both halves of a run rather than
-applying only after selection finished. Point SELECTION itself is untouched:
-the coverage kernel, sigma adaptation and the pool-wide uncertainty scoring
-all still read the frozen cache, so what changes is only what the probe
-learned from. `USE_LORA` stays a final-training-only axis; a LoRA-adapted
-encoder is never used to select.
+**Every axis here is final-training only -- none of them changes what gets
+selected.** `AUGMENT` used to be the exception: `make_augmented_feature_provider`
+(below) was handed to `sampling/scalpel` so the per-round uncertainty probe
+trained on augmented pixels. That was removed after measuring it on histoset
+seed 42: it changed the SELECTED SET, with only ~55% of points overlapping
+the un-augmented run at every budget. The cause is structural, not a bug --
+the provider can only augment the probe's TRAINING rows (augmenting ~90k pool
+rows per round costs ~27x), and the CellViT cell probe cannot be augmented at
+all because its embeddings come from a cache with no pixels behind them, so
+`disagreement = JS(visual, cell)` compared a noised probe against a clean one
+and read the noise as disagreement (JS 1.65x the frozen run's on average, max
+3.28x). `make_augmented_feature_provider` is still used, but only by the
+final-training pass below.
 
 **Two invariants the LoRA path depends on, both of which were violated in
 the first version and produced near-chance accuracy on a real run:**
@@ -260,6 +263,7 @@ def finetune_and_evaluate(
     use_lora: bool = False,
     lora_r: int = 8,
     lora_alpha: float = 16.0,
+    lora_lr: Optional[float] = None,
     aux_loss: str = "none",
     aux_weight: float = 0.5,
     augment: str = "none",
@@ -414,7 +418,37 @@ def finetune_and_evaluate(
     criterion = nn.CrossEntropyLoss(
         weight=torch.as_tensor(class_weights(labeled_labels, num_classes), device=device)
     )
-    optimizer = torch.optim.Adam(trainable, lr=probe_lr, weight_decay=weight_decay)
+    # The probe and the adapter get SEPARATE learning rates.
+    #
+    # They were on one `lr=probe_lr` (1e-3), which is right for a linear probe
+    # on frozen features and far too large for a rank-8 adapter inside a
+    # 12-layer ViT: measured on real DINOv2, lr=1e-3 moves the CLS feature
+    # 116.9% in L2 (cosine 0.318 with the frozen output) against 82.9%
+    # (cosine 0.652) at 1e-4. On a real histoset run that showed up as the
+    # encoder's features losing class separation entirely -- 2849 of 5600
+    # test rows predicted as one class at budget 200, with the probe's own
+    # weight norm SMALLER than the frozen baseline's (2.44 vs 3.93) and its
+    # per-class rows more uniform (max/min 1.13 vs 1.29). That is a collapsed
+    # feature space, not an over-fit probe, and it cost the most at low
+    # budgets (-2.8 sigma at 50, -3.8 sigma at 75).
+    #
+    # `lora_lr=None` means "same as probe_lr", which reproduces the old
+    # single-rate behaviour exactly for anyone comparing against it.
+    if use_lora and lora_lr is not None and lora_lr != probe_lr:
+        from training.lora import lora_parameters as _lora_parameters
+
+        adapter_params = _lora_parameters(encoder_model)
+        adapter_ids = {id(p) for p in adapter_params}
+        probe_params = [p for p in trainable if id(p) not in adapter_ids]
+        optimizer = torch.optim.Adam(
+            [
+                {"params": probe_params, "lr": probe_lr},
+                {"params": adapter_params, "lr": lora_lr},
+            ],
+            weight_decay=weight_decay,
+        )
+    else:
+        optimizer = torch.optim.Adam(trainable, lr=probe_lr, weight_decay=weight_decay)
     aux_fn = AUX_LOSS_FNS.get(aux_loss)
 
     # Same budget and same stopping rule as every other training loop in this
@@ -573,10 +607,12 @@ def make_augmented_feature_provider(
 ):
     """Return `provider(indices) -> np.ndarray` of freshly-augmented features.
 
-    **This is the ONE place selection-time augmentation is produced**, and it
-    exists so `sampling/` never has to know what a pixel, a transform or an
-    encoder is: `sampling/scalpel/uncertainty.py` receives an opaque callable
-    and uses it only to build the visual probe's TRAINING matrix.
+    **No longer used for SELECTION.** It once fed `sampling/scalpel` an opaque
+    callable so the per-round uncertainty probe trained on augmented pixels;
+    that path is gone (see the module docstring for the measurement that
+    removed it). `sampling/scalpel/uncertainty.py` still accepts an
+    `augmented_feature_provider` and its tests still cover that branch, but
+    `main.run` never passes one -- augmentation is a final-training axis.
 
     Why this is cheap enough to run inside the AL loop: the probe trains on
     the LABELED set only (<= the largest budget, 200 here), never on the
@@ -584,24 +620,26 @@ def make_augmented_feature_provider(
     per epoch, against 3.6M for re-extracting the pool every round -- ~27x
     cheaper, which is what makes "augment during selection" viable at all.
 
-    **Known, deliberate asymmetry.** The probe TRAINS on augmented pixels but
-    is then used to score the whole pool from the FROZEN cache, because
-    augmenting 90k rows per round is exactly the 27x cost this avoids. That
-    is the ordinary train-with-augmentation/infer-without arrangement, with
-    the pool playing the part of the test set. Two consequences worth naming
-    rather than discovering later:
+    **The asymmetry that made this unusable for selection**, kept here because
+    it explains why the selection path was removed rather than repaired. The
+    probe TRAINS on augmented pixels but scores the pool from the FROZEN
+    cache, since augmenting 90k rows per round is the 27x cost this avoids.
+    For a final probe that is just the ordinary
+    train-with-augmentation/infer-without arrangement. Inside the AL loop it
+    was not, because two things could not follow:
 
     * `sampling/scalpel`'s CELL probe cannot be augmented at all -- CellViT
-      embeddings come from a cache with no pixels behind them, so in
-      `uncertainty_mode="disagreement"` an augmented visual probe is compared
-      against an un-augmented cell probe.
-    * The temperature calibration that precedes the comparison is fitted on
-      the same augmented features, so it calibrates the augmented probe, not
-      a frozen one.
+      embeddings come from a cache with no pixels behind them, so
+      `uncertainty_mode="disagreement"` compared an augmented visual probe
+      against an un-augmented cell probe and read the difference as
+      disagreement.
+    * The temperature calibration preceding that comparison was fitted on the
+      augmented features, so it calibrated the augmented probe, not a frozen
+      one.
 
-    Neither is a bug to fix here; both are properties of the configuration
-    `AUGMENT != "none"` selects, and they are why `AUGMENT="none"` (which
-    never builds a provider at all) remains the clean control arm.
+    Measured consequence on histoset seed 42: JS 1.65x the frozen run's on
+    average (max 3.28x), ~55% selection overlap, and worse class balance at
+    the high budgets.
     """
     if augment == "none":
         raise ValueError(

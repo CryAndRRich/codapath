@@ -20,7 +20,12 @@
 #   tqdm          -> features/visual.py progress reporting
 #   einops        -> imported by cellvit's own model code, and --no-deps means
 #                    the wheel did not bring it
-transformers>=4.27.0
+# <5 to match requirements.txt. This path only needs Dinov2Model, which 5.x
+# still has, but pinning both files the same way keeps every Kaggle session on
+# one transformers major -- and CONCH (extract_vlm_features.ipynb) genuinely
+# breaks on 5.x, so a split pin would make "which notebook ran" decide whether
+# the image has a working tokenizer.
+transformers>=4.27.0,<5
 PyYAML>=6.0
 Pillow>=9.0.0
 tqdm>=4.60.0

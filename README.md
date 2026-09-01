@@ -389,12 +389,20 @@ Three rules govern how these axes combine:
   reads only `features`; with the encoder frozen those come from `no_grad`,
   so the term has no `grad_fn` and adds a constant that changes nothing. The
   combination is refused rather than run as a mislabeled baseline.
-- **`AUGMENT` also reaches INTO selection**, unlike the other two: the
-  per-round uncertainty probe trains on freshly augmented pixels of the
-  labeled set (`make_augmented_feature_provider`), so "augmented" means the
-  same thing in both halves of a run. Point selection itself is untouched —
-  the coverage kernel, sigma adaptation and pool-wide scoring all still read
-  the frozen cache. `USE_LORA` never reaches selection.
+- **No axis reaches into selection.** `AUGMENT` used to: the per-round
+  uncertainty probe trained on freshly augmented pixels
+  (`make_augmented_feature_provider`). Measured on histoset seed 42 that
+  changed the *selected set* — only ~55% overlap with the un-augmented run at
+  every budget — because the provider can only augment the probe's training
+  rows and the CellViT cell probe cannot be augmented at all (its embeddings
+  come from a pixel-less cache), so `JS(visual, cell)` read the injected noise
+  as disagreement (1.65x the frozen run's on average). `AUGMENT` now applies
+  only to the final probe, like `USE_LORA` and `AUX_LOSS`.
+- **The adapter has its own learning rate.** `LORA_LR` defaults to `1e-4`,
+  separate from `PROBE_LR` (`1e-3`). One shared rate collapsed a real run —
+  2849 of 5600 test rows predicted as one class at budget 200 — because a rate
+  sized for a linear probe moves a rank-8 adapter's features 116.9% in L2
+  (cosine 0.318 with the frozen output) against 82.9% / 0.652 at `1e-4`.
 - **Test scoring follows the encoder.** A LoRA run re-encodes the test set
   through the adapted encoder; the frozen-encoder paths keep using the
   embedding cache, which describes exactly that encoder.

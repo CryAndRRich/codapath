@@ -628,6 +628,22 @@ def encode_text_prototypes(
             f"{len(class_names)} class names but {len(class_prompts)} prompt lists"
         )
     tokenizer = get_tokenizer()
+    # CONCH's own `tokenize` calls `tokenizer.batch_encode_plus`, which
+    # transformers 5 removed along with `PreTrainedTokenizerFast` (replaced by
+    # `TokenizersBackend`). CONCH has not followed, so on 5.x this raises
+    # `AttributeError: TokenizersBackend has no attribute batch_encode_plus`
+    # from inside the conch package -- after the 802 MB checkpoint has already
+    # downloaded, and pointing at a file this project does not own. Say what is
+    # actually wrong instead.
+    if not hasattr(tokenizer, "batch_encode_plus"):
+        import transformers
+
+        raise RuntimeError(
+            f"CONCH's tokenizer needs `batch_encode_plus`, which transformers "
+            f"{transformers.__version__} does not provide (it was removed in "
+            "transformers 5). Install transformers<5 -- requirements.txt pins "
+            "this, so a 5.x here means the environment was built without it."
+        )
     prototypes = []
     for prompts in class_prompts:
         if not prompts:

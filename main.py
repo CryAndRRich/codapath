@@ -160,6 +160,14 @@ def _default_run_name(
         part = f"lora{rank}"
         if alpha != 16.0:
             part = f"{part}a{alpha}".replace(".", "p")
+        # The adapter learning rate is its own axis: two runs differing only
+        # in `lora_lr` are two different experiments, and without this they
+        # would write to the same filenames and silently overwrite each
+        # other. Appended only when it differs from the 1e-4 default, so
+        # every name produced before this axis existed is unchanged.
+        lora_lr = final_train_cfg.get("lora_lr")
+        if lora_lr is not None and float(lora_lr) != 1e-4:
+            part = f"{part}lr{float(lora_lr):g}".replace(".", "p").replace("-", "m")
         parts.append(part)
     aux_loss = final_train_cfg.get("aux_loss", "none")
     if aux_loss != "none":
@@ -366,6 +374,15 @@ def run(
     ft_use_lora = bool(final_train_cfg.get("use_lora", False))
     ft_lora_r = int(final_train_cfg.get("lora_r", 8))
     ft_lora_alpha = float(final_train_cfg.get("lora_alpha", 16.0))
+    # The adapter's own learning rate, DEFAULTED SEPARATELY from the probe's.
+    # `probe_lr` (1e-3) is sized for a linear probe on frozen features; the
+    # same rate on a rank-8 adapter inside a 12-layer ViT moved DINOv2's CLS
+    # feature 116.9% in L2 (cosine 0.318 with the frozen output) against
+    # 82.9% / 0.652 at 1e-4, and on a real histoset run collapsed the encoder
+    # to one class for 2849 of 5600 test rows. 1e-4 is the conservative
+    # default; pass `lora_lr` in `final_train_cfg` to A/B it (setting it equal
+    # to `probe_lr` reproduces the old single-rate behaviour exactly).
+    ft_lora_lr = float(final_train_cfg.get("lora_lr", 1e-4))
     ft_aux_loss = final_train_cfg.get("aux_loss", "none")
     ft_aux_weight = float(final_train_cfg.get("aux_weight", 0.5))
     ft_augment = final_train_cfg.get("augment", "none")
@@ -465,24 +482,16 @@ def run(
             from transformers.utils import logging as _hf_logging
 
             _hf_logging.disable_progress_bar()
-        # Snapshot of the UNWRAPPED, untrained encoder, taken before LoRA is
-        # applied and kept only when selection-time augmentation needs its own
-        # copy (see the `selection_augment_provider` block below). Copying from
-        # memory here is what avoids a second checkpoint download, which hung a
-        # 2-shard Kaggle run for hours against the HF Hub's unauthenticated
-        # rate limit.
-        selection_encoder_snapshot = None
+        # No unwrapped snapshot is kept any more: it existed only so that
+        # selection-time augmentation could run on a non-LoRA copy of the
+        # encoder, and selection no longer augments anything (see the note
+        # further down). Nothing outside the final-training pass touches this
+        # encoder now.
         if run_final_training:
-            needs_own_selection_encoder = ft_augment != "none" and ft_use_lora
             if image_encoder == "dinov2":
                 from transformers import Dinov2Model
 
                 ft_encoder_model = Dinov2Model.from_pretrained(visual_backbone)
-                if needs_own_selection_encoder:
-                    import copy
-
-                    selection_encoder_snapshot = copy.deepcopy(ft_encoder_model)
-                    selection_encoder_snapshot.requires_grad_(False)
                 if ft_use_lora:
                     from training.lora import apply_lora_to_dinov2
 
@@ -495,11 +504,6 @@ def run(
                 ft_encoder_model, ft_conch_preprocess = load_conch(
                     visual_backbone, device, hf_token=hf_token
                 )
-                if needs_own_selection_encoder:
-                    import copy
-
-                    selection_encoder_snapshot = copy.deepcopy(ft_encoder_model)
-                    selection_encoder_snapshot.requires_grad_(False)
                 if ft_use_lora:
                     from training.lora import apply_lora_to_conch
 
@@ -527,50 +531,29 @@ def run(
             sampler_inputs["cell_embeddings"] = view.patch_features
             sampler_inputs["cell_reliability"] = view.reliability
 
-        # AUGMENT reaches into the AL loop too, not just the final-training
-        # pass: with `augment != "none"` the per-round uncertainty probe
-        # trains on freshly augmented pixels of the LABELED set instead of
-        # frozen cache rows, so "augmented" means the same thing in both
-        # halves of a run. Only the probe's training rows change -- the
-        # coverage kernel, sigma adaptation and the pool-wide uncertainty
-        # scoring all still read the frozen cache, because augmenting ~90k
-        # pool rows every round costs ~27x what augmenting <=200 labeled rows
-        # does. `USE_LORA` deliberately does NOT reach in here: a LoRA-adapted
-        # encoder must never select the points it is later trained on.
-        selection_augment_provider = None
-        selection_encoder_model = None
-        if ft_augment != "none" and ft_encoder_model is not None:
-            from training.finetune import make_augmented_feature_provider
-
-            # Selection must never see LoRA-adapted weights: `ft_encoder_model`
-            # is trained IN PLACE by `finetune_and_evaluate`, once per budget,
-            # so sharing it under `use_lora=True` would let budget k's
-            # fine-tuned weights choose budget k+1's points.
-            #
-            # That only applies when LoRA is on. With `use_lora=False` the
-            # encoder is frozen for the whole run and never mutated, so the
-            # same object is safe to share -- and sharing it matters: an
-            # earlier version ALWAYS re-loaded the checkpoint here, and on
-            # Kaggle two shard processes hitting the HF Hub unauthenticated at
-            # the same moment hung the run with no output past this point and
-            # no traceback. When LoRA IS on, the isolated copy is the
-            # `selection_encoder_snapshot` taken above -- deepcopied from
-            # memory BEFORE the LoRA wrap, so it is the plain pretrained
-            # encoder and needs no second download.
-            if ft_use_lora:
-                selection_encoder_model = selection_encoder_snapshot
-                source = "unwrapped snapshot taken before the LoRA wrap"
-            else:
-                selection_encoder_model = ft_encoder_model
-                source = "shared with the final-training pass (frozen, never mutated)"
-
-            selection_augment_provider = make_augmented_feature_provider(
-                train_dataset, selection_encoder_model, device,
-                image_encoder=image_encoder, augment=ft_augment,
-                conch_preprocess=ft_conch_preprocess,
-            )
-            print(f"[selection] uncertainty probe trains on augment={ft_augment!r} "
-                  f"pixels -- encoder: {source}")
+        # AUGMENT is a FINAL-TRAINING axis only -- selection always reads the
+        # frozen cache.
+        #
+        # It used to also feed the per-round uncertainty probe augmented
+        # pixels, which made it the one axis that changed what got SELECTED.
+        # That was measured on histoset seed 42 and it is why the block is
+        # gone: only ~55% of the selected set overlapped the un-augmented run
+        # at every budget. The mechanism was an unavoidable asymmetry -- the
+        # provider augments only the probe's TRAINING rows (augmenting ~90k
+        # pool rows per round costs ~27x), and the CELL probe cannot be
+        # augmented at all, because CellViT embeddings come from a cache with
+        # no pixels behind them. So `disagreement = JS(visual, cell)` compared
+        # a noised probe against a clean one and read the noise as
+        # disagreement: JS came out 1.65x the frozen run's on average (max
+        # 3.28x) in nearly every round, which pushed sigma down faster and
+        # left the high budgets WORSE balanced (label entropy 2.4530 vs
+        # 2.4735, classes with <5 samples 3 vs 1).
+        #
+        # Keeping augmentation out of selection makes AUGMENT answer the
+        # question it is meant to answer -- does augmenting the final probe
+        # help -- instead of mixing that with a change in acquisition.
+        # `USE_LORA` was already final-training-only for the same reason: an
+        # adapted encoder must never select the points it is later trained on.
 
         common = dict(
             oracle_labels=train_labels,
@@ -579,9 +562,6 @@ def run(
             **sampler_inputs,
             **sampler_cfg,
         )
-        if selection_augment_provider is not None:
-            common["augmented_feature_provider"] = selection_augment_provider
-
         # One shared run only when the spec says a prefix is faithful. Every
         # budget below `prefix_exact_min_class_multiple * num_classes` still
         # gets its own run, so a clamped threshold can never be reported as if
@@ -725,6 +705,7 @@ def run(
                     image_encoder=image_encoder,
                     use_lora=ft_use_lora,
                     lora_r=ft_lora_r,
+                    lora_lr=ft_lora_lr,
                     lora_alpha=ft_lora_alpha,
                     aux_loss=ft_aux_loss,
                     aux_weight=ft_aux_weight,
@@ -804,8 +785,6 @@ def run(
             print(f"[sweep] {sweep_watch.line()}")
 
         del ft_encoder_model
-        del selection_encoder_model
-        del selection_encoder_snapshot
         clear_memory()
 
         _save(
