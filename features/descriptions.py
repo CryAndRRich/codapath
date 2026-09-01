@@ -49,8 +49,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
+import time
 from datetime import date
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import yaml
 
@@ -155,6 +157,79 @@ def load_descriptions(dataset: str, style: str, config: Optional[dict] = None) -
     return descriptions
 
 
+# A hosted model is shared infrastructure, so a single call can fail for
+# reasons that have nothing to do with this caller. Retried here rather than
+# left to the notebook, because the sweep is 78 sequential calls (9+14+16
+# classes x 2 styles) and ONE transient failure anywhere in it used to abort
+# the whole run, discarding every description already generated.
+#
+# Which statuses are worth retrying:
+#   503 UNAVAILABLE       - "model is currently experiencing high demand",
+#                           explicitly described by Google as temporary.
+#   429 RESOURCE_EXHAUSTED - free-tier rate limit; a per-minute quota clears
+#                           on its own, so waiting is the correct response.
+#   500 / 504             - server-side error and gateway timeout.
+# Everything else (401 bad key, 404 retired model name, 400 malformed
+# prompt) is a deterministic error that would fail identically on a retry, so
+# it is raised immediately instead of burning six delays first.
+_RETRYABLE_STATUS = (429, 500, 503, 504)
+
+# Exponential backoff with full jitter. Jitter matters even for a single
+# sequential client: without it, a run that hits a busy model retries on a
+# fixed schedule, and every client doing the same converges on the same
+# retry instants -- the thundering-herd pattern that keeps an overloaded
+# service overloaded. Delays are 2, 4, 8, 16, 32, 64s (jittered), so six
+# attempts span up to ~2 minutes per class before giving up.
+_MAX_ATTEMPTS = 6
+_BASE_DELAY_SECONDS = 2.0
+_MAX_DELAY_SECONDS = 64.0
+
+
+def _status_code(error: BaseException) -> Optional[int]:
+    """HTTP status of a google-genai error, or None if it is not one.
+
+    Read defensively: `google.genai` raises `APIError` subclasses carrying
+    `.code`, but the attribute name has moved between releases and Kaggle
+    installs whatever is current. Falling back to scanning the message keeps
+    a version bump from silently turning "retry the 503" into "never retry
+    anything" -- which would look exactly like the bug this code fixes.
+    """
+    for attribute in ("code", "status_code"):
+        value = getattr(error, attribute, None)
+        if isinstance(value, int):
+            return value
+    text = str(error)
+    for status in _RETRYABLE_STATUS:
+        if text.startswith(f"{status} ") or f" {status} " in text:
+            return status
+    return None
+
+
+def _call_with_retry(call: Callable[[], object], label: str, verbose: bool = True):
+    """Run `call`, retrying transient server-side failures with backoff.
+
+    `call` is a zero-argument closure rather than the client plus arguments,
+    so this function needs to know nothing about the genai API surface and
+    can be unit-tested without it.
+    """
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            return call()
+        except Exception as error:  # noqa: BLE001 - re-raised below unless retryable
+            status = _status_code(error)
+            if status not in _RETRYABLE_STATUS or attempt == _MAX_ATTEMPTS:
+                raise
+            delay = min(_BASE_DELAY_SECONDS * 2 ** (attempt - 1), _MAX_DELAY_SECONDS)
+            delay = random.uniform(0.0, delay)  # full jitter
+            if verbose:
+                print(
+                    f"    [retry] {label}: {status} on attempt {attempt}/"
+                    f"{_MAX_ATTEMPTS}, waiting {delay:.1f}s"
+                )
+            time.sleep(delay)
+    raise AssertionError("unreachable: the loop either returns or raises")
+
+
 def generate_descriptions(
     dataset: str,
     style: str,
@@ -163,6 +238,8 @@ def generate_descriptions(
     temperature: float = 0.0,
     seed: int = 42,
     api_key: Optional[str] = None,
+    request_interval: float = 1.0,
+    verbose: bool = True,
 ) -> dict:
     """Call the Gemini API once per class and return the full payload
     `generate_class_description.ipynb` writes to disk.
@@ -175,6 +252,20 @@ def generate_descriptions(
     Raises `ValueError` for `style not in VALID_STYLES` (this function never
     handles `"manual"` -- that style has no API call, see `load_descriptions`).
     No model family is rejected -- see module docstring.
+
+    **Transient server errors are retried, not fatal.** The calls here are
+    strictly sequential -- one blocking request at a time, never concurrent --
+    so a `503 UNAVAILABLE` ("this model is currently experiencing high
+    demand") reflects load from every OTHER caller of a shared hosted model,
+    not anything this sweep is doing. Retried with exponential backoff and
+    full jitter; `request_interval` additionally spaces successive classes so
+    a 16-class sweep does not fire 16 back-to-back requests at a model that
+    just said it was busy. Set `request_interval=0.0` to disable the spacing
+    (retries still apply).
+
+    Without this, one transient failure anywhere in a 78-call sweep aborted
+    the run and discarded every description already generated -- the whole
+    sweep had to start over, into the same busy model.
     """
     if style not in VALID_STYLES:
         raise ValueError(f"style must be one of {sorted(VALID_STYLES)}, got {style!r}")
@@ -186,12 +277,39 @@ def generate_descriptions(
     generation_config = types.GenerateContentConfig(temperature=temperature)
 
     descriptions: Dict[str, str] = {}
-    for class_name in class_names:
+    for index, class_name in enumerate(class_names):
         prompt = _PROMPT_TEMPLATES[style].format(class_name=class_name, dataset=dataset)
-        response = client.models.generate_content(
-            model=model, contents=prompt, config=generation_config,
+        # A small fixed gap between classes. The calls were already strictly
+        # sequential (one blocking request at a time, never concurrent), so
+        # this does not fix a self-inflicted burst -- it just stops a 16-class
+        # sweep from issuing 16 back-to-back requests into a model that is
+        # already reporting high demand, which is what turns one 503 into a
+        # run of them. Skipped before the first call, where there is nothing
+        # to space out.
+        if index > 0 and request_interval > 0.0:
+            time.sleep(request_interval)
+        response = _call_with_retry(
+            lambda: client.models.generate_content(
+                model=model, contents=prompt, config=generation_config,
+            ),
+            label=f"{dataset}/{style}/{class_name}",
+            verbose=verbose,
         )
-        descriptions[class_name] = response.text.strip()
+        text = (response.text or "").strip()
+        if not text:
+            # An empty completion is not a transport failure, so the retry
+            # above never sees it -- but writing it would produce a frozen
+            # artifact with a blank description that the notebook's own
+            # assert would only catch after every remaining class was
+            # generated. Fail on the class that actually failed.
+            raise RuntimeError(
+                f"{dataset}/{style}/{class_name}: the model returned an empty "
+                "description (no text in the response). Re-run this pair; if it "
+                "persists, the prompt may be tripping a safety filter."
+            )
+        descriptions[class_name] = text
+        if verbose:
+            print(f"    [{index + 1}/{len(class_names)}] {class_name}")
 
     return {
         "dataset": dataset,
