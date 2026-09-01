@@ -245,17 +245,19 @@ in results and manifests.
 
 `generate_class_description.ipynb` writes `config/descriptions/{dataset}_{style}.json`
 **once**, committed to the repo — the text prior `extract_vlm_features.ipynb`'s
-`DESCRIPTION_STYLE="llm_*"` reads. `MODEL` in the EDIT cell picks whichever
-Gemini model is currently available to your API key — needs no GPU and no
-dataset image, only a Gemini API key (Kaggle Secret `GEMINI_API_KEY`, same
-pattern as `extract_vlm_features.ipynb`'s `HF_TOKEN`).
+`DESCRIPTION_STYLE="llm_*"` reads. Calls go through
+[OpenRouter](https://openrouter.ai), a single OpenAI-compatible endpoint that
+proxies many providers, so `MODEL` in the EDIT cell is an OpenRouter-format id
+(`"<provider>/<model>"`, e.g. `"google/gemini-2.5-flash"`) — needs no GPU and
+no dataset image, only an OpenRouter API key (Kaggle Secret
+`OPENROUTER_API_KEY`, same pattern as `extract_vlm_features.ipynb`'s
+`HF_TOKEN`).
 
 **A hosted model call is not bit-for-bit reproducible**, even at
-`temperature=0.0` — Google does not guarantee determinism across requests, let
+`temperature=0.0` — no provider guarantees determinism across requests, let
 alone across months as the weights served behind a fixed model name change,
-and a pinned model name can itself be retired (`gemini-2.5-flash`, this
-notebook's original default, returned `404 NOT_FOUND` for new callers as of
-2026-08). The reproducible unit is the **committed JSON file**, not "re-run
+and a pinned model id can itself stop resolving without notice. The
+reproducible unit is the **committed JSON file**, not "re-run
 the notebook and expect the same text": the notebook refuses to overwrite an
 existing file unless `OVERWRITE=True`, and the payload records `model`,
 `temperature`, `seed`, `generated_at` and a `sha256` of the generated text —

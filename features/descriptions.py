@@ -21,17 +21,14 @@ the API. `generate_descriptions`'s returned payload records `model`,
 `sha256` -- proof that the named model produced exactly this text on this
 date, not a promise it will again.
 
-**No model family is blocked.** An earlier version of this function rejected
-every `gemini-3.x` model, because Google's docs at the time said
-`temperature`/`topK`/`topP` were deprecated and silently ignored on that
-family. That restriction is gone: `gemini-2.5-flash` no longer exists for new
-callers at all, `gemini-3.x` is what Google now points callers to, and this
-module's whole point is a frozen, inspectable-after-the-fact artifact -- if
-`temperature` genuinely has no effect on some future model, the written
-`descriptions` are still exactly what that model actually returned, just
-possibly less reproducible on a re-run, which is the same tradeoff already
-made by not requiring bit-exact reproducibility above. Pick whatever `MODEL`
-is current and available; nothing here needs to be kept in sync with it.
+**No model family is blocked.** This module calls the model through
+**OpenRouter** (`https://openrouter.ai/api/v1/chat/completions`, an
+OpenAI-compatible REST endpoint that proxies many providers under one API
+key) rather than a provider-specific SDK, so `MODEL` is whatever
+OpenRouter-format id the caller picks (e.g. `"google/gemini-2.5-flash"`,
+`"anthropic/claude-3.5-haiku"`, `"openai/gpt-4o-mini"`) -- nothing here needs
+to be kept in sync with it, and nothing here is tied to one vendor's model
+family.
 
 **`load_descriptions(dataset, "manual")` is the control arm** and needs no
 file at all: it reads `datasets.<dataset>.descriptions` straight out of
@@ -39,9 +36,9 @@ file at all: it reads `datasets.<dataset>.descriptions` straight out of
 therefore behaves like every other style from a caller's point of view
 (same return shape) without this module ever writing a `manual` file.
 
-The `google-genai` package is not installed in this environment, so
-`generate_descriptions` imports it lazily, inside the function body --
-the same pattern `features/vlm.py` uses for `conch`.
+`generate_descriptions` talks to OpenRouter with the stdlib-adjacent
+`requests` package (already a transitive dependency of `transformers`) --
+no provider SDK needed, since OpenRouter's endpoint is plain REST.
 """
 
 from __future__ import annotations
@@ -186,14 +183,19 @@ _MAX_DELAY_SECONDS = 64.0
 
 
 def _status_code(error: BaseException) -> Optional[int]:
-    """HTTP status of a google-genai error, or None if it is not one.
+    """HTTP status of an OpenRouter request error, or None if it is not one.
 
-    Read defensively: `google.genai` raises `APIError` subclasses carrying
-    `.code`, but the attribute name has moved between releases and Kaggle
-    installs whatever is current. Falling back to scanning the message keeps
-    a version bump from silently turning "retry the 503" into "never retry
-    anything" -- which would look exactly like the bug this code fixes.
+    `requests.HTTPError` carries the status on `error.response.status_code`;
+    read defensively (also checking bare `.code`/`.status_code` attributes)
+    so a `requests` version bump can't silently turn "retry the 503" into
+    "never retry anything" -- which would look exactly like the bug this
+    code fixes.
     """
+    response = getattr(error, "response", None)
+    if response is not None:
+        value = getattr(response, "status_code", None)
+        if isinstance(value, int):
+            return value
     for attribute in ("code", "status_code"):
         value = getattr(error, attribute, None)
         if isinstance(value, int):
@@ -241,7 +243,7 @@ def generate_descriptions(
     request_interval: float = 1.0,
     verbose: bool = True,
 ) -> dict:
-    """Call the Gemini API once per class and return the full payload
+    """Call the OpenRouter API once per class and return the full payload
     `generate_class_description.ipynb` writes to disk.
 
     Does NOT write the file itself -- the notebook owns the "refuse to
@@ -270,11 +272,20 @@ def generate_descriptions(
     if style not in VALID_STYLES:
         raise ValueError(f"style must be one of {sorted(VALID_STYLES)}, got {style!r}")
 
-    from google import genai
-    from google.genai import types
+    import requests
 
-    client = genai.Client(api_key=api_key or None)
-    generation_config = types.GenerateContentConfig(temperature=temperature)
+    key = api_key or os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        raise ValueError(
+            "No OpenRouter API key -- pass api_key= or set the OPENROUTER_API_KEY "
+            "environment variable."
+        )
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    })
+    endpoint = "https://openrouter.ai/api/v1/chat/completions"
 
     descriptions: Dict[str, str] = {}
     for index, class_name in enumerate(class_names):
@@ -288,14 +299,29 @@ def generate_descriptions(
         # to space out.
         if index > 0 and request_interval > 0.0:
             time.sleep(request_interval)
-        response = _call_with_retry(
-            lambda: client.models.generate_content(
-                model=model, contents=prompt, config=generation_config,
-            ),
+
+        def _call(prompt=prompt, class_name=class_name):
+            resp = session.post(
+                endpoint,
+                json={
+                    "model": model,
+                    "temperature": temperature,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+        payload_json = _call_with_retry(
+            _call,
             label=f"{dataset}/{style}/{class_name}",
             verbose=verbose,
         )
-        text = (response.text or "").strip()
+        choices = payload_json.get("choices") or []
+        text = ""
+        if choices:
+            text = (choices[0].get("message", {}).get("content") or "").strip()
         if not text:
             # An empty completion is not a transport failure, so the retry
             # above never sees it -- but writing it would produce a frozen
