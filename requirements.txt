@@ -16,6 +16,17 @@ tqdm>=4.60.0
 # after the 802 MB checkpoint download, and in code this project does not own.
 # Nothing here needs 5.x: the only other use is Dinov2Model.
 transformers>=4.27.0,<5
+# The SAME wall, one layer down. transformers 4.x declares
+# `huggingface-hub>=0.23.2,<1.0` and CHECKS it at import time, so a hub 1.x
+# makes `import transformers` itself raise:
+#   ImportError: huggingface-hub>=0.34.0,<1.0 is required ... found 1.29.0
+# That is not hypothetical -- every notebook here installs this file and THEN
+# runs `pip install -U huggingface_hub hf-transfer`, and an unbounded `-U`
+# resolves to 1.x, undoing the pin that had just been applied one line
+# earlier. Pinning it here is what makes that upgrade a no-op instead of a
+# broken environment; the notebooks additionally carry the bound on their own
+# `-U` line, because `-U` ignores what is already installed.
+huggingface_hub>=0.23.2,<1.0
 PyYAML>=6.0
 
 # Test suite (tests/ is untracked -- see .gitignore).
