@@ -11,6 +11,15 @@ where a label buys the most.
 Both probes are temperature-calibrated before comparison, otherwise the
 divergence mostly reflects the two heads' different over-confidence rather
 than genuine disagreement.
+
+**The weight is built from RANKS, not raw values.** It combines two
+quantities on very different scales -- Jensen-Shannon disagreement between
+the probes, and the visual margin used wherever no cell view exists -- and
+mixing them raw let the margin branch dominate completely. Each term is
+rank-normalized over the set of points it is defined for before they are
+combined; see the comment on the mixing line for what that cost when it was
+missing, and `sampling.uncertainty.rank_normalize` for why ranks rather than
+min-max.
 """
 
 from typing import Dict, Optional, Sequence, Tuple
@@ -20,7 +29,11 @@ import torch
 
 from utils.runtime import clear_memory
 from ..calibration import calibrate_temperature
-from ..uncertainty import js_disagreement_from_logits, margin_uncertainty_from_logits
+from ..uncertainty import (
+    js_disagreement_from_logits,
+    margin_uncertainty_from_logits,
+    rank_normalize,
+)
 
 UNCERTAINTY_MODES = ("disagreement", "visual_margin")
 
@@ -154,14 +167,66 @@ def round_weights(
     del visual_probe
 
     if cell_probe is None:
-        weights = visual_margin
+        # Rank-normalized for the same reason, and just as importantly for
+        # COMPARABILITY: `uncertainty_mode="visual_margin"` is the controlled
+        # ablation that isolates what the cell view contributes, so it has to
+        # differ from the disagreement mode in the weight's MEANING only, not
+        # in how that weight is scaled. A monotone transform of U does not
+        # preserve the greedy argmax -- U weights each pool ROW inside the
+        # sum, so rescaling one row relative to another changes which
+        # candidate wins (measured: 6 of 20 picks changed between raw and
+        # ranked margin on the same features). Leaving one branch raw would
+        # have made the ablation partly a test of normalization.
+        weights = rank_normalize(visual_margin)
     else:
         cell_logits = cell_probe.predict_logits(cell_features, device) / tau_cell
         disagreement = js_disagreement_from_logits(visual_logits, cell_logits)
-        # Patches with no nucleus have no cell opinion to disagree with, so they
-        # fall back to the visual margin in proportion to how unreliable their
-        # cell view is. rho=1 is pure disagreement, rho=0 is pure margin.
-        weights = reliability * disagreement + (1.0 - reliability) * visual_margin
+
+        # Patches with no nucleus have no cell opinion to disagree with, so
+        # they fall back to the visual margin in proportion to how unreliable
+        # their cell view is. rho=1 is pure disagreement, rho=0 is pure
+        # margin. That fallback is deliberate and stays: a patch the cell
+        # probe cannot speak for still needs SOME uncertainty signal, and the
+        # visual margin is the only one left. Giving it 0 instead would
+        # permanently exclude ~9% of the pool from every round after the
+        # first, however hard those patches actually are.
+        #
+        # **The two terms are rank-normalized WITHIN THEIR OWN GROUP before
+        # being combined**, because raw they are not on the same scale at all
+        # -- measured on a real 14-class histoset run, JS averaged 0.02 while
+        # the margin averaged ~0.7. Mixing them raw made every one of the
+        # top-200 weights a nucleus-free patch (a fair share is ~18 of 200),
+        # and since nucleus-free patches are not spread evenly over classes
+        # (ovarian tissue is sparser than lung or colon), rounds 1-4 of that
+        # run put 150 of 160 picks into 5 of the 14 classes and never sampled
+        # 4 classes at all. Round 0, which uses U=1 and no weight, covered
+        # all 14 -- so the collapse was the weight, not the coverage term.
+        #
+        # Each term is ranked over the set of points that term is DEFINED
+        # for, which is not the same set for both:
+        #
+        # * JS exists only where a cell probe had an opinion, so it is ranked
+        #   within `valid`. Ranking it against patches whose JS is discarded
+        #   would compare it to numbers that never enter the objective.
+        # * The margin exists EVERYWHERE, and with
+        #   `reliability_mode="mean_confidence"` reliability is continuous, so
+        #   a patch with rho=0.3 draws 70% of its weight from the margin while
+        #   still being `valid`. Ranking the margin only within the
+        #   nucleus-free group would hand every such patch a margin term of 0
+        #   -- silently zeroing most of the weight for every partially
+        #   reliable point. Ranked pool-wide, it is defined for all of them.
+        #   (Under the default `reliability_mode="valid"` rho is exactly 0 or
+        #   1, so this distinction changes nothing there; it only keeps the
+        #   continuous mode from breaking.)
+        #
+        # rank_normalize maps a constant input to a constant 0.5, not to
+        # zeros, so a degenerate round yields a neutral weight instead of an
+        # all-zero one that would collapse every marginal gain (CLAUDE.md's
+        # min-max-on-a-constant-vector lesson).
+        weights = (
+            reliability * rank_normalize(disagreement, valid)
+            + (1.0 - reliability) * rank_normalize(visual_margin)
+        )
         diagnostics["mean_disagreement"] = float(
             disagreement[valid].mean() if valid.any() else 0.0
         )

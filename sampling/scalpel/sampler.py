@@ -17,7 +17,11 @@ The single substitution is `U`:
   broad coverage, no cold-start guessing. This is the hook where a label-free
   semantic prior would go if one is added later.
 * later rounds set `U` from how much a DINOv2 probe and a CellViT cell probe
-  disagree on the same patch (see `.uncertainty`).
+  disagree on the same patch (see `.uncertainty`), falling back to the visual
+  margin wherever no nucleus was detected and the cell probe therefore has no
+  opinion. Both terms are RANK-normalized before being combined: raw, the
+  disagreement (~0.02) and the margin (~0.7) are two orders of magnitude
+  apart, and the fallback branch swamped the objective -- see `.uncertainty`.
 
 `uncertainty_mode="visual_margin"` runs the identical loop with Uncertainty
 Herding's own margin weight, which is the controlled ablation for measuring

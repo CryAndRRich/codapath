@@ -784,3 +784,81 @@ def test_vlm_notebook_shards_over_visible_gpus_and_assembles():
         "sharded output must be assembled into the single cache layout "
         "run_al_main.ipynb reads"
     )
+
+
+def test_vlm_extraction_notebook_actually_reads_the_kaggle_secret():
+    """CONCH is `gated: auto` on the Hub and extract_vlm_features.ipynb is the
+    only notebook that downloads the checkpoint, so it cannot run without a
+    token.
+
+    An earlier version of its auth cell PRINTED that it was "relying on a
+    Kaggle Secret" and never read one -- so a user who set the Secret up
+    exactly as the message described still failed at the download cell, with
+    the message itself as evidence that they had done it right. The other two
+    token-using notebooks both read it properly; this asserts the third does
+    too, by parsing for the actual call rather than for prose about it.
+    """
+    source = _all_source(NOTEBOOK_DIR / "extract_vlm_features.ipynb")
+    assert "UserSecretsClient" in source, (
+        "extract_vlm_features.ipynb never reads the Kaggle Secret, so an "
+        "HF_TOKEN set there is silently ignored"
+    )
+    assert "get_secret(\"HF_TOKEN\")" in source
+    # And it must refuse to continue without one, rather than reaching the
+    # download and failing there with an opaque 401/403.
+    assert "assert HF_TOKEN" in source
+
+
+def test_every_conch_notebook_installs_the_package_before_importing_it():
+    """`conch` is not in requirements.txt -- only the CONCH paths need it, and
+    it is a heavy install a frozen DINOv2 run should not pay. So each notebook
+    that uses it must pip-install it from the official repo first.
+
+    The package is INSTALLED, never vendored: nothing under features/ or
+    training/ contains a copy of CONCH's source, and both `from conch...`
+    imports in features/vlm.py are lazy (inside a function), so importing
+    this project with no conch present still works.
+    """
+    for name in ("extract_vlm_features.ipynb", "run_al_main.ipynb"):
+        source = _all_source(NOTEBOOK_DIR / name)
+        assert "github.com/mahmoodlab/CONCH.git" in source, (
+            f"{name} uses CONCH but never installs the package"
+        )
+
+
+@pytest.mark.parametrize("notebook", [
+    "extract_visual_features.ipynb",
+    "extract_vlm_features.ipynb",
+    "extract_nucleus_features.ipynb",
+    "run_al_main.ipynb",
+    "run_al_baseline.ipynb",
+])
+def test_every_mmap_notebook_deletes_its_export_before_archiving(notebook):
+    """The .npy mmap export is scratch, and it is the biggest thing on disk.
+
+    PathMNIST-224 exports ~15 GiB. A real run of run_al_main.ipynb finished
+    with 16.1 GB left in /kaggle/working, ~15.7 GB of it that directory --
+    80% of the ~20 GB Output quota spent on a file nothing reads again. A
+    session that exceeds the quota shows NOTHING in the Output tab, including
+    the zip that was fine, so this is not merely untidy: it is how a finished
+    multi-hour run produces no downloadable result. Same class of failure as
+    the nucleus run's `OSError: [Errno 28]`.
+
+    Order matters as much as presence -- freeing the space AFTER building the
+    archive is too late, since the archive is written while the export still
+    occupies the disk.
+    """
+    source = _all_source(NOTEBOOK_DIR / notebook)
+    if "MMAP_CACHE_DIR =" not in source:
+        pytest.skip(f"{notebook} does not use a mmap export")
+
+    assert "rmtree(MMAP_CACHE_DIR" in source, (
+        f"{notebook} exports a .npy mmap cache but never deletes it, leaving "
+        "~15 GiB of scratch in the Output quota"
+    )
+    cleanup_at = source.index("rmtree(MMAP_CACHE_DIR")
+    archive_at = source.index("shutil.make_archive")
+    assert cleanup_at < archive_at, (
+        f"{notebook} frees the mmap export only AFTER make_archive, so the "
+        "disk peak the quota sees is unchanged"
+    )
