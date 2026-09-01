@@ -43,7 +43,7 @@ from ..kernels import (
     running_max_coverage,
 )
 from ..registry import register_sampler
-from .uncertainty import UNCERTAINTY_MODES, round_weights
+from .uncertainty import MAX_TEMPERATURE, UNCERTAINTY_MODES, round_weights
 from .views import build_cell_view, normalize_rows
 
 
@@ -62,12 +62,22 @@ def scalpel_sampling(**kwargs) -> List[int]:
     num_rounds = int(kwargs.get("num_rounds", 5))
     chunk_size = int(kwargs.get("chunk_size", 2000))
     n_sigma = int(kwargs.get("n_sigma", 2000))
-    sigma_floor_ratio = float(kwargs.get("sigma_floor_ratio", 0.25))
-    probe_epochs = int(kwargs.get("probe_epochs", 50))
+    # Mirrors config/config.yaml. A stale default here is not a runtime bug
+    # (config.yaml always supplies the value via main.py) but it misleads
+    # anyone reading this file for what the method actually runs.
+    sigma_floor_ratio = float(kwargs.get("sigma_floor_ratio", 0.10))
+    # 100 in config/config.yaml, matching training.probe_epochs so selection
+    # and the evaluation probe share one budget. Kept in sync here for the
+    # same reason as sigma_floor_ratio above.
+    probe_epochs = int(kwargs.get("probe_epochs", 100))
     probe_lr = float(kwargs.get("probe_lr", 1e-3))
     probe_weight_decay = float(kwargs.get("probe_weight_decay", 1e-4))
     consistency_weight = float(kwargs.get("consistency_weight", 0.0))
     consistency_mode = kwargs.get("consistency_mode", "symmetric_js")
+    # Overridable so the cap can be A/B tested from the notebook without
+    # editing code (OVERRIDES={"max_temperature": 19.9} reproduces the
+    # uncapped behaviour). Mirrors config/config.yaml.
+    max_temperature = float(kwargs.get("max_temperature", MAX_TEMPERATURE))
     diag = bool(kwargs.get("diag", True))
     # Set by main.py only when AUGMENT != "none": a callable mapping pool
     # indices to freshly augmented features for the visual probe's TRAINING
@@ -117,7 +127,13 @@ def scalpel_sampling(**kwargs) -> List[int]:
 
         if round_index == 0:
             weights_np = None
-            diagnostics = {"tau_visual": 1.0, "tau_cell": 1.0, "mean_disagreement": float("nan")}
+            # Same keys round_weights returns, so the trace schema is
+            # identical for round 0 (which never calls it) and every later
+            # round.
+            diagnostics = {
+                "tau_visual": 1.0, "tau_cell": 1.0,
+                "mean_disagreement": float("nan"), "tau_at_cap": 0.0,
+            }
         else:
             sigma = max(labeled_min_sigma(coverage_features, selected, sigma), sigma_floor)
             weights_np, diagnostics = round_weights(
@@ -129,6 +145,7 @@ def scalpel_sampling(**kwargs) -> List[int]:
                 consistency_weight=consistency_weight,
                 consistency_mode=consistency_mode,
                 augmented_feature_provider=augmented_feature_provider,
+                max_temperature=max_temperature,
             )
 
         if weights_np is None:

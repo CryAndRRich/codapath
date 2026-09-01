@@ -54,6 +54,7 @@ def calibrate_temperature(
     probe_epochs: int,
     probe_lr: float,
     device: torch.device,
+    max_temperature: float = None,
 ) -> float:
     """Split the labeled set, fit a throwaway probe on the train part, and
     return the grid temperature minimising ECE on the held-out part.
@@ -65,6 +66,23 @@ def calibrate_temperature(
 
     Returns 1.0 (no scaling) whenever the split leaves too little to calibrate
     on, which is the normal case for the first one or two rounds.
+
+    `max_temperature` truncates the grid. The default is None -- the full
+    paper grid, which the Uncertainty Herding and REFINE baselines must keep
+    to stay faithful. `scalpel` passes a cap, because a temperature at the
+    grid's ceiling is destructive there in a way it is not for a single-probe
+    method: dividing BOTH probes' logits by ~20 flattens each softmax toward
+    uniform, and two near-uniform distributions cannot disagree. Measured on
+    14-class logits, mean Jensen-Shannon divergence between two genuinely
+    different probes falls 0.349 -> 0.0023 (150x) as T goes 1.0 -> 19.9,
+    which is exactly the `tau=19.9/19.9 js=0.0001` seen in a real histoset
+    run: the disagreement signal -- the whole of what SCALPEL adds over
+    Uncertainty Herding -- was annihilated by its own calibration step.
+
+    A ceiling temperature is also weak evidence to begin with at these
+    budgets: it is chosen by minimising ECE over a validation split that can
+    be ~7 points across 14 classes, where the binned estimate is mostly
+    noise.
     """
     from training.probe import train_probe
 
@@ -86,8 +104,14 @@ def calibrate_temperature(
     validation_logits = probe.predict_logits(features[validation_index], device)
     del probe
 
+    grid = TEMPERATURE_GRID
+    if max_temperature is not None:
+        grid = grid[grid <= float(max_temperature)]
+        if len(grid) == 0:
+            return 1.0
+
     best_temperature, best_error = 1.0, float("inf")
-    for temperature in TEMPERATURE_GRID:
+    for temperature in grid:
         error = expected_calibration_error(
             validation_logits / temperature, validation_labels, n_bins=num_classes
         )

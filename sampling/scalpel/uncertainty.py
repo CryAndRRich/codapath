@@ -37,6 +37,25 @@ from ..uncertainty import (
 
 UNCERTAINTY_MODES = ("disagreement", "visual_margin")
 
+# Ceiling for the temperature search, tighter than the paper grid's 19.9.
+#
+# Uncertainty Herding calibrates ONE probe, where a large temperature merely
+# flattens a single confidence. SCALPEL compares TWO, and dividing both by a
+# large T pushes each softmax toward uniform -- and two near-uniform
+# distributions cannot disagree. Measured on 14-class logits from two
+# genuinely different probes, the mean Jensen-Shannon divergence retained is:
+#
+#     T=1.0  100%      T=3.0  25.1%      T=7.0   5.2%
+#     T=2.0   47.6%    T=5.0   9.9%      T=19.9  0.7%
+#
+# A real histoset run logged `tau=19.9/19.9 js=0.0001`: the search hit the
+# grid ceiling and destroyed the disagreement signal, which is the entire
+# contribution this method makes over Uncertainty Herding. 5.0 keeps ~14x
+# more of that signal than 19.9 while still permitting genuine calibration
+# (the useful range at these budgets is small T; a ceiling value is anyway
+# fitted on a validation split that can be ~7 points across 14 classes).
+MAX_TEMPERATURE = 5.0
+
 
 def _has_two_classes(labels: np.ndarray) -> bool:
     return len(labels) >= 2 and len(np.unique(labels)) >= 2
@@ -57,6 +76,7 @@ def round_weights(
     consistency_weight: float = 0.0,
     consistency_mode: str = "symmetric_js",
     augmented_feature_provider=None,
+    max_temperature: float = MAX_TEMPERATURE,
 ) -> Tuple[Optional[np.ndarray], Dict[str, float]]:
     """Return `(per-pool weights in [0, 1], diagnostics)`.
 
@@ -88,10 +108,15 @@ def round_weights(
     selected_index = np.asarray(selected, dtype=np.int64)
     valid = reliability > 0.0
     cell_index = selected_index[valid[selected_index]]
+    # Every key present on every path: the sampler copies this dict straight
+    # into the per-round trace, so a key that appears only on some rounds
+    # gives the saved trace an inconsistent schema and any reader comparing
+    # rounds hits a KeyError.
     diagnostics: Dict[str, float] = {
         "tau_visual": 1.0,
         "tau_cell": 1.0,
         "mean_disagreement": float("nan"),
+        "tau_at_cap": 0.0,
     }
 
     if not _has_two_classes(labels[selected_index]):
@@ -120,18 +145,26 @@ def round_weights(
 
     tau_visual = calibrate_temperature(
         visual_train, labels[selected_index], list(range(len(selected_index))), num_classes,
-        probe_epochs, probe_lr, device,
+        probe_epochs, probe_lr, device, max_temperature=max_temperature,
     )
     cell_trainable = _has_two_classes(labels[cell_index])
     tau_cell = (
         calibrate_temperature(
             cell_features, labels, cell_index.tolist(), num_classes,
-            probe_epochs, probe_lr, device,
+            probe_epochs, probe_lr, device, max_temperature=max_temperature,
         )
         if cell_trainable else 1.0
     )
     diagnostics["tau_visual"] = float(tau_visual)
     diagnostics["tau_cell"] = float(tau_cell)
+    # A temperature sitting exactly on the cap means the ECE search wanted to
+    # go further and was stopped. That is worth seeing: it says the probes are
+    # so over-confident (or the validation split so small) that calibration
+    # is fighting the signal rather than sharpening it.
+    diagnostics["tau_at_cap"] = float(
+        max_temperature is not None
+        and (tau_visual >= max_temperature - 1e-9 or tau_cell >= max_temperature - 1e-9)
+    )
 
     want_cell = cell_trainable and uncertainty_mode == "disagreement"
     if want_cell and consistency_weight > 0.0:
