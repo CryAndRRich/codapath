@@ -1,0 +1,21 @@
+{
+  "dataset": "pathmnist",
+  "descriptions": {
+    "adipose": "Histopathology reveals a delicate honeycomb or chicken-wire network of large, polygonal adipocytes dominated by optically clear, unstained lipid vacuoles bounded by thin eosinophilic cell membranes with flattened, eccentric, hyperchromatic nuclei compressed against the periphery.",
+    "background": "An optically clear, white to pale off-white empty slide space devoid of intact cellular architecture, organized tissue, and nuclei, characterized by a uniform, non-staining or faintly textured field with only occasional isolated amorphous debris or slide artifacts.",
+    "debris": "Amorphous, heterogeneous aggregates of necrotic eosinophilic proteinaceous material mingled with basophilic karyorrhectic nuclear dust, fragmented cellular remnants, and lysed erythrocytes lacking intact cell borders or organized tissue architecture.",
+    "lymphocytes": "Dense clusters and sheets of small, round mononuclear cells characterized by intensely hyperchromatic, deeply basophilic spherical nuclei with coarse condensed chromatin and a barely perceptible, scant rim of pale cytoplasm yielding an extremely high nuclear-to-cytoplasmic ratio.",
+    "mucus": "Amorphous, pale basophilic to light lavender extracellular lakes exhibiting a translucent, wispy, and web-like fibrillary texture, forming paucicellular or acellular expansile pools that may contain sparsely suspended, detached degenerative epithelial fragments and isolated vacuolated cells.",
+    "smooth_muscle": "Histologically characterized by cohesive, parallel or intersecting fascicles of elongated, spindle-shaped myocytes displaying abundant, fibrillar eosinophilic cytoplasm and centrally positioned, blunt-ended cigar-shaped nuclei with evenly dispersed chromatin.",
+    "normal_colon_mucosa": "Regular, parallel tubular or round cross-sectional crypts lined by a monolayer of tall columnar epithelium rich in clear, pale apical goblet cell vacuoles, with uniform, basally located, non-overlapping oval nuclei surrounded by delicate fibrovascular lamina propria.",
+    "cancer_associated_stroma": "Desmoplastic and fibrous connective tissue exhibiting streaming, pale eosinophilic collagen bundles and a fibrillar to myxoid extracellular matrix interspersed with elongated, tapered spindle-shaped fibroblast and myofibroblast nuclei arranged in wavy, irregular fascicles.",
+    "colorectal_adenocarcinoma": "Irregularly shaped, crowded, and infiltrating glandular epithelial structures lined by pseudostratified, hyperchromatic, pleomorphic columnar cells displaying prominent nucleoli, loss of nuclear polarity, high nuclear-to-cytoplasmic ratios, and central luminal necrotic debris."
+  },
+  "generated_at": "2026-09-01",
+  "model": "google/gemini-3.7-flash",
+  "prompt_template": "You are a pathologist writing a single, dense sentence that a vision-language model's text encoder will compare against histopathology image patches. Describe the class {class_name!r} (dataset: {dataset}) in ONE sentence, focused on visually distinctive tissue morphology (cell shape, arrangement, texture) -- not clinical significance or diagnosis. Output only the sentence, no preamble, no quotes.",
+  "seed": 42,
+  "sha256": "54f0086f80e04306042028a665315118ac83e560cb886e59317be276eb1e8e75",
+  "style": "llm_short",
+  "temperature": 0.0
+}

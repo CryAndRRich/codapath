@@ -30,11 +30,13 @@ OpenRouter-format id the caller picks (e.g. `"google/gemini-2.5-flash"`,
 to be kept in sync with it, and nothing here is tied to one vendor's model
 family.
 
-**`load_descriptions(dataset, "manual")` is the control arm** and needs no
-file at all: it reads `datasets.<dataset>.descriptions` straight out of
-`config/config.yaml`, the same block `config.yaml` has always had. `"manual"`
-therefore behaves like every other style from a caller's point of view
-(same return shape) without this module ever writing a `manual` file.
+**There is no `"manual"` style any more.** `config.yaml` used to carry a
+hand-written `datasets.<dataset>.descriptions` map that doubled as a control
+arm; it now carries only `datasets.<dataset>.class_names`, the canonical
+class order, and every description is a frozen LLM artifact under
+`config/descriptions/`. The weakest-text-prior control is
+`extract_vlm_features.ipynb`'s class-name fallback, which needs no config
+block at all -- it derives the prompt from the class name itself.
 
 `generate_descriptions` talks to OpenRouter with the stdlib-adjacent
 `requests` package (already a transitive dependency of `transformers`) --
@@ -115,12 +117,11 @@ def _sha256_descriptions(descriptions: Dict[str, str]) -> str:
 def load_descriptions(dataset: str, style: str, config: Optional[dict] = None) -> Dict[str, str]:
     """Return `{class_name: description}` for one (dataset, style) pair.
 
-    `style="manual"` reads `config/config.yaml`'s `datasets.<dataset>.descriptions`
-    directly -- no file, always available, the control every LLM style must
-    beat to justify itself. Any other style reads the frozen JSON file
-    `generate_class_description.ipynb` wrote; raises `FileNotFoundError` with
-    an actionable message if that notebook has not been run yet for this
-    (dataset, style).
+    Reads the frozen JSON file `generate_class_description.ipynb` wrote;
+    raises `FileNotFoundError` with an actionable message if that notebook
+    has not been run yet for this (dataset, style). The class ORDER in that
+    file must match `config.yaml`'s `class_names`, since that order is what
+    the probe's label ids and the text prototypes are both built on.
 
     `config`, if given, is the already-parsed `config.yaml` dict (avoids a
     second parse when the caller has one already); otherwise this reads and
@@ -129,9 +130,6 @@ def load_descriptions(dataset: str, style: str, config: Optional[dict] = None) -
     if config is None:
         with open("config/config.yaml", "r", encoding="utf-8") as handle:
             config = yaml.safe_load(handle)
-
-    if style == "manual":
-        return dict(config["datasets"][dataset]["descriptions"])
 
     path = description_path(dataset, style)
     if not os.path.isfile(path):
@@ -144,7 +142,7 @@ def load_descriptions(dataset: str, style: str, config: Optional[dict] = None) -
         payload = json.load(handle)
     descriptions = dict(payload["descriptions"])
 
-    expected_class_names = list(config["datasets"][dataset]["descriptions"])
+    expected_class_names = list(config["datasets"][dataset]["class_names"])
     if list(descriptions) != expected_class_names:
         raise ValueError(
             f"{path} class order {list(descriptions)} does not match "
@@ -251,9 +249,8 @@ def generate_descriptions(
     not buried in a library function a future caller might invoke without
     meaning to overwrite a frozen artifact.
 
-    Raises `ValueError` for `style not in VALID_STYLES` (this function never
-    handles `"manual"` -- that style has no API call, see `load_descriptions`).
-    No model family is rejected -- see module docstring.
+    Raises `ValueError` for `style not in VALID_STYLES`. No model family is
+    rejected -- see module docstring.
 
     **Transient server errors are retried, not fatal.** The calls here are
     strictly sequential -- one blocking request at a time, never concurrent --

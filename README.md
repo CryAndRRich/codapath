@@ -274,10 +274,15 @@ Two styles (`STYLE` in the EDIT cell): `llm_short` (one dense sentence),
 `llm_morphology` (2–4 sentences on cell shape/arrangement/texture/staining).
 A third style, `llm_multi` (`NUM_PER_CLASS` differently-phrased variants per
 class), was removed entirely — recoverable from git history if a
-multi-variant ensemble is needed again. `"manual"` needs no file —
-`features/descriptions.py::load_descriptions` reads
-`datasets.<dataset>.descriptions` from `config.yaml` directly, and is the
-control every LLM style has to beat.
+multi-variant ensemble is needed again. There is no `"manual"` style any
+more: `config.yaml` used to carry a hand-written
+`datasets.<dataset>.descriptions` map that doubled as a control arm, and it
+now carries only `class_names` (the canonical class order). The
+weakest-text-prior control is `extract_vlm_features.ipynb`'s class-name
+fallback, which derives the prompt from the class name itself
+(`breast_malignant` → `"breast malignant"`) and needs no config block to
+maintain — it also lets that notebook run before any description file
+exists.
 
 ---
 
@@ -317,9 +322,10 @@ exactly this; not passing one still gives every other caller the original
 `DESCRIPTION_STYLE = "conch_official"` uses the paper authors' own 22-template
 × 4–5-classname CRC100K prompt ensemble (vendored, CC BY-NC-ND 4.0, in
 `config/prompts/`; PathMNIST only — its 9 classes match `config.yaml`'s
-`datasets.pathmnist.descriptions` order 1:1, checked in code via
-`assert_class_order_matches_prompts`). `"manual"` reads `config.yaml`
-directly; `"llm_*"` reads a file `generate_class_description.ipynb` wrote.
+`datasets.pathmnist.class_names` order 1:1, checked in code via
+`assert_class_order_matches_prompts`). `"llm_*"` reads the committed file
+`generate_class_description.ipynb` wrote, falling back to the bare class
+names when that file does not exist yet.
 
 **Zero-shot sanity check**, printed and asserted `> 0.70` at the end of the
 notebook — not a reproduction of the paper's 79.1% on CRC100K (PathMNIST is
