@@ -361,6 +361,13 @@ see "Class descriptions" above).
 | `run_al_main.ipynb` | `scalpel`, this project's own method — either image encoder |
 | `evaluate_al_sampler.ipynb` | reload saved probes and rebuild the comparison table |
 
+**The notebooks carry no prose.** No markdown cells, no explanatory comments —
+only code, plus a single `# a | b | c` comment on each editable variable naming
+the values it accepts. Anything that explains *why* lives in this README and in
+`CLAUDE.md`, in one place rather than duplicated across seven notebooks where
+it silently goes stale. Read the EDIT cell for what a run can be told to do;
+read here for what the choice means.
+
 `run_al_baseline.ipynb` and `run_al_main.ipynb` are deliberately separate
 notebooks rather than one with a bigger menu: a baseline run only needs the
 DINOv2 visual cache, and asserting that at the top of its own notebook
