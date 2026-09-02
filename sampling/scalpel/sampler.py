@@ -72,8 +72,12 @@ def scalpel_sampling(**kwargs) -> List[int]:
     probe_epochs = int(kwargs.get("probe_epochs", 100))
     probe_lr = float(kwargs.get("probe_lr", 1e-3))
     probe_weight_decay = float(kwargs.get("probe_weight_decay", 1e-4))
-    consistency_weight = float(kwargs.get("consistency_weight", 0.0))
-    consistency_mode = kwargs.get("consistency_mode", "symmetric_js")
+    # Semi-supervised coupling on the UNLABELED pool, masked to the region
+    # both probes already call confidently. See
+    # `training/probe.py::train_dual_probe` for why that mask is what keeps
+    # this from minimising the acquisition signal itself.
+    pool_consistency_weight = float(kwargs.get("pool_consistency_weight", 0.0))
+    pool_confidence_quantile = float(kwargs.get("pool_confidence_quantile", 0.5))
     # Overridable so the cap can be A/B tested from the notebook without
     # editing code (OVERRIDES={"max_temperature": 19.9} reproduces the
     # uncapped behaviour). Mirrors config/config.yaml.
@@ -83,6 +87,30 @@ def scalpel_sampling(**kwargs) -> List[int]:
     # indices to freshly augmented features for the visual probe's TRAINING
     # rows. None keeps the frozen-cache behaviour exactly.
     augmented_feature_provider = kwargs.get("augmented_feature_provider")
+
+    # Reject config keys this sampler does not read. `**kwargs` otherwise
+    # absorbs anything silently, so a stale `consistency_weight: 0.5` left in
+    # a config after that axis was deleted would run as a plain baseline while
+    # its name and saved config claimed a coupling term -- the mislabeled
+    # baseline `needs_pixels` already refuses for `aux_loss` without LoRA.
+    _KNOWN = {
+        "image_embeddings", "cell_embeddings", "cell_reliability", "oracle_labels",
+        "num_classes", "max_budget", "device", "trace", "uncertainty_mode",
+        "missing_impute", "num_rounds", "chunk_size", "n_sigma",
+        "sigma_floor_ratio", "probe_epochs", "probe_lr", "probe_weight_decay",
+        "pool_consistency_weight", "pool_confidence_quantile",
+        "max_temperature", "diag",
+        "augmented_feature_provider", "cell_source", "cell_pooling",
+        "reliability_mode", "rff_dim", "rff_bandwidth",
+        "rff_bandwidth_sample_size", "rff_transform_batch_size",
+    }
+    unknown = sorted(set(kwargs) - _KNOWN)
+    if unknown:
+        raise TypeError(
+            f"scalpel_sampling got unknown config key(s): {unknown}. "
+            "If one was removed from the code, delete it from config.yaml / "
+            "OVERRIDES too rather than leaving it to be ignored."
+        )
 
     if uncertainty_mode not in UNCERTAINTY_MODES:
         raise ValueError(f"uncertainty_mode must be one of {list(UNCERTAINTY_MODES)}")
@@ -133,6 +161,7 @@ def scalpel_sampling(**kwargs) -> List[int]:
             diagnostics = {
                 "tau_visual": 1.0, "tau_cell": 1.0,
                 "mean_disagreement": float("nan"), "tau_at_cap": 0.0,
+                "pool_mask_fraction": float("nan"),
             }
         else:
             sigma = max(labeled_min_sigma(coverage_features, selected, sigma), sigma_floor)
@@ -142,8 +171,8 @@ def scalpel_sampling(**kwargs) -> List[int]:
                 probe_epochs=probe_epochs,
                 probe_lr=probe_lr,
                 probe_weight_decay=probe_weight_decay,
-                consistency_weight=consistency_weight,
-                consistency_mode=consistency_mode,
+                pool_consistency_weight=pool_consistency_weight,
+                pool_confidence_quantile=pool_confidence_quantile,
                 augmented_feature_provider=augmented_feature_provider,
                 max_temperature=max_temperature,
             )

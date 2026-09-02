@@ -135,8 +135,16 @@ def _default_run_name(
             parts.append(pooling)
         if sampler_cfg.get("missing_impute", "mean") != "mean":
             parts.append(sampler_cfg["missing_impute"])
-        if float(sampler_cfg.get("consistency_weight", 0.0)) > 0.0:
-            parts.append(f"cons{sampler_cfg['consistency_weight']}".replace(".", "p"))
+        # Two runs differing only in this would otherwise share every
+        # filename. The threshold is part of the name too -- it decides how
+        # much of the pool the term ever sees, so it is not a cosmetic knob.
+        pool_weight = float(sampler_cfg.get("pool_consistency_weight", 0.0))
+        if pool_weight > 0.0:
+            part = f"poolcons{pool_weight:g}".replace(".", "p")
+            quantile = float(sampler_cfg.get("pool_confidence_quantile", 0.5))
+            if quantile != 0.5:
+                part = f"{part}q{quantile:g}".replace(".", "p")
+            parts.append(part)
     if encoder != "dinov2":
         parts.append(encoder)
     if use_text:

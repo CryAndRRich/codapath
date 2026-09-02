@@ -73,8 +73,8 @@ def round_weights(
     probe_epochs: int = 50,
     probe_lr: float = 1e-3,
     probe_weight_decay: float = 1e-4,
-    consistency_weight: float = 0.0,
-    consistency_mode: str = "symmetric_js",
+    pool_consistency_weight: float = 0.0,
+    pool_confidence_quantile: float = 0.5,
     augmented_feature_provider=None,
     max_temperature: float = MAX_TEMPERATURE,
 ) -> Tuple[Optional[np.ndarray], Dict[str, float]]:
@@ -117,6 +117,9 @@ def round_weights(
         "tau_cell": 1.0,
         "mean_disagreement": float("nan"),
         "tau_at_cap": 0.0,
+        # NaN, not 0.0: "the term did not run" and "it ran and masked nothing"
+        # are different facts, and 0.0 would conflate them.
+        "pool_mask_fraction": float("nan"),
     }
 
     if not _has_two_classes(labels[selected_index]):
@@ -167,8 +170,10 @@ def round_weights(
     )
 
     want_cell = cell_trainable and uncertainty_mode == "disagreement"
-    if want_cell and consistency_weight > 0.0:
-        visual_probe, cell_probe = train_dual_probe(
+    # The dual path is what trains both heads in ONE optimizer, which is the
+    # only place the coupling term can be computed at all.
+    if want_cell and pool_consistency_weight > 0.0:
+        visual_probe, cell_probe, dual_diag = train_dual_probe(
             visual_train,
             cell_features[selected_index],
             labels[selected_index],
@@ -177,11 +182,21 @@ def round_weights(
             probe_lr,
             device,
             cell_valid=valid[selected_index],
-            cell_reliability=reliability[selected_index],
-            consistency_weight=consistency_weight,
-            consistency_mode=consistency_mode,
             weight_decay=probe_weight_decay,
+            # The UNLABELED pool, in the same two views the probes read. Rows
+            # are passed whole; `train_dual_probe` does the subsampling, so
+            # the draw is deterministic per round rather than depending on
+            # whatever RNG state selection happened to leave behind.
+            pool_visual_features=visual_features if pool_consistency_weight > 0.0 else None,
+            pool_cell_features=cell_features if pool_consistency_weight > 0.0 else None,
+            pool_consistency_weight=pool_consistency_weight,
+            pool_confidence_quantile=pool_confidence_quantile,
         )
+        # How much of the pool actually cleared the confidence gate. A run
+        # where this stays 0 configured the term but never applied it -- an
+        # absolute threshold is dataset-dependent, so this must be visible in
+        # the trace rather than inferred from the score.
+        diagnostics["pool_mask_fraction"] = float(dual_diag["pool_mask_fraction"])
     else:
         visual_probe = train_probe(
             visual_train, labels[selected_index], num_classes,

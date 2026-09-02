@@ -32,12 +32,17 @@ even when neither is confident; a patch where tissue and cell evidence point at
 different classes is where a label buys the most. Pathology-specific: it needs a
 nucleus segmenter, and it does not transfer to natural images.
 
-**3. A training framework with an auxiliary loss.** Partly implemented. The
-probe-to-probe consistency term is in `training/probe.py::train_dual_probe`
-(`consistency_weight`, default 0 = off). LoRA on a pathology backbone plus a
-center/contrastive loss is not implemented. Note the tension: a consistency loss
-that makes the two probes agree shrinks exactly the divergence contribution 2
-selects on, so the two must not be the same quantity in the same place. Keep the
+**3. A training framework with an auxiliary loss.** Partly implemented. There
+are two independent auxiliary losses, at two different stages. During
+SELECTION, `training/probe.py::train_dual_probe` couples the two probes on the
+UNLABELED pool (`pool_consistency_weight`, default 0 = off), masked to the
+region both heads already call confidently. That mask is what resolves the
+tension with contribution 2: a coupling loss makes the two probes agree, which
+shrinks exactly the divergence 2 selects on, so it is kept off the contested
+region and applied only where they already agree. (A labeled-slice variant,
+`consistency_weight`, was removed — it coupled the heads on the rows they were
+already fitting and had no such mask.) After selection, the final-training pass
+adds a center/contrastive loss on the encoder's features; see below. Keep the
 frozen-DINOv2 protocol for comparing samplers and report the training framework
 as a separate claim, or the gain cannot be attributed.
 
@@ -194,7 +199,9 @@ Axes (all in `config/config.yaml` under `samplers.scalpel`):
 | `uncertainty_mode` | `disagreement` (the method) or `visual_margin` (ablation: plain Uncertainty Herding) |
 | `cell_pooling` | `mean`, `rff` (random-Fourier kernel mean embedding ≈ the patch's cell-distribution KDE) or `moments` |
 | `missing_impute` | `mean` or `zero` for patches with no detected nucleus |
-| `consistency_weight` | > 0 couples the two probes while training; works *against* acquisition |
+| `pool_consistency_weight` | > 0 adds a semi-supervised loss coupling the two probes on the UNLABELED pool, restricted to points both heads already call confidently. The mask keeps it off the contested region — pool-wide `JS(visual, cell)` *is* the acquisition weight, so an unmasked term would minimise the signal the sampler ranks on. Watch `pool_mask_fraction` in the trace for how much of the pool the term actually saw. |
+| `pool_confidence_quantile` | share of each head's own confidence tail admitted (default 0.5). A quantile, not an absolute cut: an absolute 0.9 admitted 67% / 49% / 42% of pathmnist / histoset / skintissue (9 / 14 / 16 classes), so one number meant three different experiments. |
+| — | How many pool rows the term uses is derived, not configured: half the pool capped at 20k. The pools differ 4.6x (22,400 vs 100,000 and 103,495), so a fixed row count and a fixed fraction each break on one end of that spread. |
 
 ---
 
@@ -374,6 +381,29 @@ text prior) is present in the EDIT cell but **not yet implemented** — setting
 it True raises `NotImplementedError` naming exactly what is missing
 (`sampling/scalpel/sampler.py` round 1 is still plain MaxHerding, `U=1`; see
 `CLAUDE.md`'s contribution #1) rather than silently running without it.
+
+**There are TWO auxiliary losses, at two stages, and they are independent.**
+`SEL_AUX_WEIGHT` acts on the two probes DURING selection (every round);
+`AUX_LOSS` acts on the encoder's features AFTER selection. Confusing them is
+easy and consequential, so the notebook names them apart.
+
+**`SEL_AUX_WEIGHT` is the selection-stage term** — semi-supervised, computed
+on the UNLABELED pool the probes never otherwise see (~22k–103k rows against
+≤200 labeled ones), added to their cross-entropy in one backward pass:
+
+```
+loss = CE(visual) + CE(cell) + SEL_AUX_WEIGHT * JS(visual, cell | confident)
+```
+
+The confidence mask is load-bearing, not a knob: pool-wide `JS(visual, cell)`
+*is* the acquisition weight, so an unmasked term would minimise the very
+signal the sampler ranks on. Masking to the region both heads already call
+confidently leaves the contested region — what the sampler wants to sample —
+out of the loss. Watch `pool_mask_fraction` in the trace for how much of the
+pool the term actually saw. Everything else about it adapts to the dataset on
+its own (a confidence QUANTILE rather than an absolute cut; half the pool
+capped at 20k rather than a fixed count), because the three datasets differ
+by 9/14/16 classes and 4.6x in pool size.
 
 **`USE_LORA`/`AUX_LOSS`/`AUGMENT` are the final-training pass** (§6.4/§6.5),
 run AFTER a budget's points are already selected. **Every budget in the sweep

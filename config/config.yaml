@@ -142,9 +142,24 @@ samplers:
                                        # costs far fewer than 100 in practice.
     probe_lr: 0.001
     probe_weight_decay: 0.0001
-    consistency_weight: 0.0            # >0 couples the two probes during training. Works AGAINST acquisition:
-                                       # forcing agreement shrinks the divergence this sampler selects on.
-    consistency_mode: "symmetric_js"   # symmetric_js | visual_teacher | cell_teacher
+    # Semi-supervised coupling on the UNLABELED pool, masked to the region
+    # both probes already call confidently (top pool_confidence_quantile of
+    # each head's own confidence). The mask is what keeps it from fighting
+    # acquisition: the contested region -- exactly what scalpel ranks on --
+    # is excluded from the loss. 0 disables the term entirely.
+    # Watch `pool_mask_fraction` in the trace: 0 means the gate never opened
+    # and the run is the baseline under another filename.
+    pool_consistency_weight: 0.0
+    # RELATIVE, not absolute -- this project runs 3 datasets and the scales
+    # differ. Quantile: the share of each head's own confidence tail that may
+    # enter the loss. An absolute 0.9 admitted 67% / 49% / 42% of pathmnist /
+    # histoset / skintissue at budget 200 (9 / 14 / 16 classes), i.e. three
+    # different experiments under one number.
+    pool_confidence_quantile: 0.5
+    # How many pool rows the term uses per epoch is derived from the pool
+    # size (half, capped at POOL_SUBSAMPLE_CAP in training/probe.py) rather
+    # than configured: a fixed row count and a fixed fraction each break on
+    # one end of this project's 4.6x pool-size spread.
     rff_dim: 64                        # cell_pooling=rff only
     rff_bandwidth: null                # null = deterministic median heuristic
     rff_bandwidth_sample_size: 2048
