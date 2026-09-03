@@ -47,7 +47,11 @@ from evaluation.sanity import (
     check_selection,
     format_report as format_sanity_report,
 )
-from features.vlm import RAW_SPACE, vlm_feature_cache_paths
+from features.vlm import (
+    RAW_SPACE,
+    text_prototype_cache_paths,
+    vlm_feature_cache_paths,
+)
 from features.visual import get_or_extract_features
 from sampling import get_sampler
 from sampling.specs import spec_for
@@ -121,11 +125,12 @@ def _default_run_name(
     protocol's run entirely, mistaking the first protocol's leftover file
     for a finished run of the second (PLAN_IMPLEMENT.md §6.2).
 
-    `use_text` is included even though no sampler reads a text prior yet
-    (that is `run_al_main.ipynb`'s job, step 10): the round-1 cold-start
-    text prior is a config-driven axis of a run, not of the sampler
-    function's own kwargs, so it has to be nameable the same way `encoder`
-    is, from the same call site, before that call site exists.
+    `use_text` names the round-1 cold start (contribution #1). It is an axis
+    of the RUN rather than of the sampler function's own kwargs -- `run` reads
+    the text prototypes from the VLM cache and passes them in -- so it has to
+    be nameable here the same way `encoder` is. Without it a text run and a
+    no-text run of the same config share a filename, and the notebook's resume
+    check ("does `<name>_results.pt` exist") would skip the second entirely.
     """
     parts = [sampler_name]
     if sampler_name == "scalpel":
@@ -338,6 +343,8 @@ def run(
     feature_cache_dir: str = "features",
     cellvit_cache_dir: str = "cellvit_features",
     mmap_cache_dir: Optional[str] = None,
+    use_text: bool = False,
+    description_style: str = "llm_short",
     run_name: Optional[str] = None,
     shard_tag: Optional[str] = None,
     image_encoder: str = "dinov2",
@@ -398,7 +405,9 @@ def run(
 
     spec = spec_for(sampler_name)
     output_name = _safe_run_name(
-        run_name or _default_run_name(sampler_name, sampler_cfg, encoder=image_encoder)
+        run_name or _default_run_name(
+            sampler_name, sampler_cfg, encoder=image_encoder, use_text=use_text,
+        )
     )
 
     # A budget-sharded run splits `cumulative_budget` across processes. The
@@ -524,13 +533,85 @@ def run(
             )
 
         # The probe always trains on visual_backbone features, and every
-        # sampler currently selects in that same space -- no sampler declares
-        # `text_embeddings` in `spec.needs` at the moment. A future cold-start
-        # text prior is a config-driven axis of `scalpel` itself, not a static
-        # per-sampler requirement, and will be wired in separately.
+        # sampler selects in that same space.
+        #
+        # The text prior below is deliberately NOT in `spec.needs`: that field
+        # lists arrays a sampler ALWAYS requires, and drives whether a cache is
+        # loaded at all. `use_text` is optional per run -- the same `scalpel`
+        # runs with or without it -- so declaring it there would make every
+        # scalpel run demand a VLM cache, including the DINOv2 ones that have
+        # no text tower to read.
         selection_features = train_features
         sampler_inputs: Dict[str, object] = {}
         cellvit_manifest = None
+
+        # Contribution #1: the round-1 cold start.
+        #
+        # Round 1 has no labels, so `scalpel`'s two probes cannot exist and the
+        # round falls back to pure coverage. A VLM's text tower scores every
+        # patch against one prototype per class WITHOUT a label, and the margin
+        # of that zero-shot distribution is the same "near a decision boundary"
+        # quantity rounds 2+ weight by -- so round 1 stops being uniform.
+        #
+        # Requires the CONCH image space: the prototypes are compared to
+        # `selection_features` by a dot product, and DINOv2 features live in a
+        # different space with no text tower pointing into it. `run` raises
+        # rather than silently comparing two unrelated encoders.
+        if use_text:
+            if image_encoder != "conch":
+                raise ValueError(
+                    f"use_text=True needs a text tower in the same space as the "
+                    f"image features, and image_encoder={image_encoder!r} has "
+                    "none. Use image_encoder='conch'."
+                )
+            text_paths = text_prototype_cache_paths(
+                vlm_cache_dir, dataset_key, description_style
+            )
+            if not os.path.exists(text_paths["prototypes"]):
+                raise FileNotFoundError(
+                    f"No text prototypes for {dataset_key}/{description_style} at "
+                    f"{text_paths['prototypes']}. Run extract_vlm_features.ipynb "
+                    f"with DESCRIPTION_STYLES including {description_style!r} and "
+                    "attach its published cache."
+                )
+            text_prototypes = np.load(text_paths["prototypes"])
+            if len(text_prototypes) != num_classes:
+                raise ValueError(
+                    f"{text_paths['prototypes']} holds {len(text_prototypes)} "
+                    f"prototypes but this run has {num_classes} classes"
+                )
+            sampler_inputs["text_prototypes"] = text_prototypes
+
+            # The model's learned temperature, read from the cache because an
+            # AL run never loads CONCH. It is not cosmetic: a positive scale
+            # cannot change an argmax, but it DOES change the top-2 gap the
+            # margin reads, and so the ORDER of the weights (measured Kendall
+            # tau 0.92-0.97 between scales on real histoset features).
+            #
+            # A cache written before this was saved has no `logit_scale`.
+            # Raising is better than defaulting to 1.0: that would silently
+            # select a different set than a re-extracted cache would, and the
+            # fix (re-run the text half of extract_vlm_features.ipynb, seconds
+            # of work) is cheap.
+            if os.path.exists(text_paths["manifest"]):
+                with open(text_paths["manifest"], "r", encoding="utf-8") as handle:
+                    text_manifest = json.load(handle)
+            else:
+                text_manifest = {}
+            if "logit_scale" not in text_manifest:
+                raise ValueError(
+                    f"{text_paths['manifest']} has no `logit_scale`. It was "
+                    "written before the round-1 text prior needed it, and "
+                    "guessing one would silently change which points are "
+                    "selected. Re-run extract_vlm_features.ipynb (the image "
+                    "features are reused, so only the text is recomputed)."
+                )
+            sampler_inputs["text_logit_scale"] = float(text_manifest["logit_scale"])
+            print(
+                f"[text] {description_style}: {text_prototypes.shape} prototypes "
+                f"(logit_scale={sampler_inputs['text_logit_scale']:.2f}) "
+                "-> round-1 acquisition weight"
+            )
         if "cell_embeddings" in spec.needs:
             view, cellvit_manifest = _load_cell_view(
                 cellvit_cache_dir, dataset_key, random_seed, train_sample_ids,

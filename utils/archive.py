@@ -94,22 +94,42 @@ def main_archive_stem(
     not lose information -- it adds the axes that distinguish the runs.
     """
     stem = f"{dataset}_{run_name or sampler}_seed{seed}"
-    if encoder != "dinov2":
-        stem = f"{stem}_{encoder.replace('/', '_')}"
+    # `run_name` comes from `main._default_run_name`, which ALREADY appends the
+    # encoder when it is not the default -- so appending it again here produced
+    # `..._scalpel_disagreement_conch_seed42_conch`. The suffix is only needed
+    # when the caller passed a bare sampler name instead.
+    suffix = encoder.replace("/", "_")
+    if encoder != "dinov2" and not stem.endswith(f"_{suffix}_seed{seed}"):
+        stem = f"{stem}_{suffix}"
     return stem
 
 
-def vlm_archive_stem(dataset: str, seed: int, vlm_name: str, style: str) -> str:
+def vlm_archive_stem(dataset: str, seed: int, vlm_name: str, styles) -> str:
     """Archive name for a VLM (e.g. CONCH) feature + text-prototype cache.
 
-    `style` is in the name because it is NOT a tuning knob on top of a fixed
-    cache -- it names a different text prototype, computed from a different
-    description file, living in a different `{dataset}_{style}_text.npy`. Two
-    styles are two artifacts, not two configurations of one artifact, so
-    archiving one under a name that could mean either would make the wrong
-    one indistinguishable from the right one.
+    Unlike every other stem here, `styles` is a LIST -- and unlike every other
+    axis in this module, that is not a sweep. CONCH's vision tower never sees a
+    prompt, so the image features are identical for every style and one
+    extraction serves all of them; encoding a style's text afterwards is a
+    handful of short strings. One run therefore produces one archive holding
+    every style, each in its own `{dataset}_{style}_text.npy`, and the name has
+    to say which ones are inside.
+
+    The styles are sorted so that the same set always produces the same name
+    regardless of the order they were listed in -- otherwise re-running with the
+    list reordered would publish a second archive holding identical data.
+
+    A single style still reads as plain `..._llm_short`, so an archive built
+    before this took a list keeps its name.
     """
-    return f"vlm_{dataset}_seed{seed}_{vlm_name.replace('/', '_')}_{style}"
+    if isinstance(styles, str):
+        styles = [styles]
+    if not styles:
+        raise ValueError("at least one description style is required")
+    return (
+        f"vlm_{dataset}_seed{seed}_{vlm_name.replace('/', '_')}"
+        f"_{'-'.join(sorted(styles))}"
+    )
 
 
 def nucleus_archive_stem(

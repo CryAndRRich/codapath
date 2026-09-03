@@ -43,7 +43,12 @@ from ..kernels import (
     running_max_coverage,
 )
 from ..registry import register_sampler
-from .uncertainty import MAX_TEMPERATURE, UNCERTAINTY_MODES, round_weights
+from .uncertainty import (
+    MAX_TEMPERATURE,
+    UNCERTAINTY_MODES,
+    round_weights,
+    text_prior_weights,
+)
 from .views import build_cell_view, normalize_rows
 
 
@@ -87,6 +92,14 @@ def scalpel_sampling(**kwargs) -> List[int]:
     # indices to freshly augmented features for the visual probe's TRAINING
     # rows. None keeps the frozen-cache behaviour exactly.
     augmented_feature_provider = kwargs.get("augmented_feature_provider")
+    # Contribution #1: one L2-normalized prototype per class, in the SAME space
+    # as `image_embeddings`. Supplied by main.py only when the run asked for the
+    # text prior and the encoder has a text tower; None keeps round 1 as plain
+    # MaxHerding, which is what every result measured before this existed used.
+    text_prototypes = kwargs.get("text_prototypes")
+    # The model's own learned temperature. It does not change an argmax, but it
+    # DOES change the top-2 gap the margin reads, so it is not cosmetic here.
+    text_logit_scale = float(kwargs.get("text_logit_scale", 1.0))
 
     # Reject config keys this sampler does not read. `**kwargs` otherwise
     # absorbs anything silently, so a stale `consistency_weight: 0.5` left in
@@ -100,6 +113,7 @@ def scalpel_sampling(**kwargs) -> List[int]:
         "sigma_floor_ratio", "probe_epochs", "probe_lr", "probe_weight_decay",
         "pool_consistency_weight", "pool_confidence_quantile",
         "max_temperature", "diag",
+        "text_prototypes", "text_logit_scale",
         "augmented_feature_provider", "cell_source", "cell_pooling",
         "reliability_mode", "rff_dim", "rff_bandwidth",
         "rff_bandwidth_sample_size", "rff_transform_batch_size",
@@ -154,7 +168,6 @@ def scalpel_sampling(**kwargs) -> List[int]:
             trace.start_round(round_index)
 
         if round_index == 0:
-            weights_np = None
             # Same keys round_weights returns, so the trace schema is
             # identical for round 0 (which never calls it) and every later
             # round.
@@ -163,6 +176,23 @@ def scalpel_sampling(**kwargs) -> List[int]:
                 "mean_disagreement": float("nan"), "tau_at_cap": 0.0,
                 "pool_mask_fraction": float("nan"),
             }
+            if text_prototypes is None:
+                # No text tower: round 1 stays pure MaxHerding, which is what
+                # every measured result in the README was produced with.
+                weights_np = None
+            else:
+                # Contribution #1, the cold start. Round 1 has no labels, so
+                # the two probes cannot exist -- but a VLM's text tower places
+                # each patch against one prototype per class with no label at
+                # all, and the margin of THAT is the same "close to a boundary"
+                # quantity rounds 2+ use. `visual_np` is the image side of the
+                # VLM's own space here (main.py passes the CONCH cache), so the
+                # dot product is the zero-shot comparison the model was
+                # trained for, not two unrelated encoders being compared.
+                weights_np, text_diagnostics = text_prior_weights(
+                    visual_np, text_prototypes, logit_scale=text_logit_scale,
+                )
+                diagnostics.update(text_diagnostics)
         else:
             sigma = max(labeled_min_sigma(coverage_features, selected, sigma), sigma_floor)
             weights_np, diagnostics = round_weights(

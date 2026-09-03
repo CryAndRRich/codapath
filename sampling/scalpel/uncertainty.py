@@ -283,3 +283,91 @@ def round_weights(
     del visual_logits
     clear_memory()
     return np.clip(weights, 0.0, 1.0).astype(np.float32), diagnostics
+
+
+def text_prior_weights(
+    image_embeddings: np.ndarray,
+    text_prototypes: np.ndarray,
+    logit_scale: float = 1.0,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """Round-1 acquisition weight from image-text similarity alone.
+
+    This is contribution #1: the cold start. Round 1 has no labels, so the
+    probes that produce every later round's weight cannot exist, and the method
+    falls back to pure MaxHerding (`U = 1`) -- coverage with no notion of which
+    regions are hard. A VLM's text tower supplies exactly the missing piece
+    without a single label: encode one prototype per class, and a patch whose
+    top two classes are nearly tied is one the model cannot place.
+
+    The weight is Uncertainty Herding's own margin, computed on zero-shot
+    logits instead of a trained probe's:
+
+        logits  = (image @ text.T) * logit_scale
+        weight  = 1 - (p_top1 - p_top2)   after softmax
+
+    so it is the SAME quantity every later round uses, only sourced
+    differently. That is deliberate: round 1 then differs from rounds 2+ in
+    where the uncertainty comes from, not in what "uncertain" means, and the
+    greedy coverage objective underneath is untouched.
+
+    Returned ranked, like every other term in this module. `rank_normalize`
+    maps a constant input to 0.5 rather than to zeros, so degenerate
+    prototypes yield uniform weights -- i.e. exactly the MaxHerding this
+    replaces -- instead of an all-zero vector that would collapse every
+    marginal gain and make `argmax` return index order.
+
+    `logit_scale` does NOT change the ranking. `argmax`, and the ORDER of
+    `1 - margin`, are invariant to a positive scale on the logits... but the
+    margin's VALUE is not, and neither is its rank ordering across points,
+    because softmax is not order-preserving in the gap between top-2
+    probabilities under different temperatures. Pass the model's own learned
+    `logit_scale.exp()` when it is known; the default 1.0 is the raw cosine.
+
+    Both arrays must be L2-normalized per row -- `image @ text.T` is read AS a
+    cosine, the same contract `sampling/kernels.py` documents. Raising here is
+    cheaper than a silently wrong weight.
+    """
+    image_embeddings = np.asarray(image_embeddings, dtype=np.float32)
+    text_prototypes = np.asarray(text_prototypes, dtype=np.float32)
+    if image_embeddings.ndim != 2 or text_prototypes.ndim != 2:
+        raise ValueError("image_embeddings and text_prototypes must be 2-D")
+    if image_embeddings.shape[1] != text_prototypes.shape[1]:
+        raise ValueError(
+            f"image features are {image_embeddings.shape[1]}-d but text "
+            f"prototypes are {text_prototypes.shape[1]}-d; these are compared "
+            "by a dot product and must share a space"
+        )
+    if len(text_prototypes) < 2:
+        raise ValueError(
+            "a margin needs at least two classes to take a top-2 difference"
+        )
+    if float(logit_scale) <= 0.0:
+        raise ValueError("logit_scale must be positive")
+
+    text_norms = np.linalg.norm(text_prototypes, axis=1)
+    if not np.all(np.abs(text_norms - 1.0) < 1e-3):
+        raise ValueError(
+            "text prototypes must be L2-normalized per row; "
+            f"norms range [{text_norms.min():.4f}, {text_norms.max():.4f}]"
+        )
+    image_norms = np.linalg.norm(image_embeddings, axis=1, keepdims=True)
+    unit_images = image_embeddings / np.maximum(image_norms, 1e-12)
+
+    logits = (unit_images @ text_prototypes.T) * float(logit_scale)
+    margin = margin_uncertainty_from_logits(logits)
+
+    probabilities = np.exp(logits - logits.max(axis=1, keepdims=True))
+    probabilities /= probabilities.sum(axis=1, keepdims=True)
+    predictions = probabilities.argmax(axis=1)
+
+    diagnostics = {
+        "text_mean_margin": float(margin.mean()),
+        "text_mean_top1": float(probabilities.max(axis=1).mean()),
+        # How many classes the zero-shot head actually uses. A prior that puts
+        # every patch in one class carries no information about WHICH regions
+        # are hard, even though its margins may vary -- worth seeing in the
+        # trace rather than inferring from accuracy nobody computed here.
+        "text_classes_predicted": float(len(np.unique(predictions))),
+        "text_num_classes": float(len(text_prototypes)),
+    }
+    return rank_normalize(margin), diagnostics
