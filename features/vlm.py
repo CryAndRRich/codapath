@@ -67,8 +67,6 @@ __all__ = [
     "get_or_extract_vlm_features",
     "extract_vlm_features_shard",
     "assemble_vlm_feature_shards",
-    "load_official_conch_prompts",
-    "assert_class_order_matches_prompts",
     "encode_text_prototypes",
     "zero_shot_logits",
 ]
@@ -144,8 +142,7 @@ def load_conch(vlm_name: str, device: torch.device, hf_token: Optional[str] = No
     Returns `(model, preprocess)`. `preprocess` MUST be used as-is for every
     image this model ever sees -- it carries the 448x448 resize/crop and the
     OpenAI CLIP normalization the factory computed from the checkpoint, and
-    hand-rolling an equivalent transform is the exact mistake §10.3 of
-    PLAN_IMPLEMENT.md documents: it does not crash, it just silently shifts
+    hand-rolling an equivalent transform does not crash -- it silently shifts
     every embedding.
     """
     from conch.open_clip_custom import create_model_from_pretrained
@@ -534,48 +531,6 @@ def assemble_vlm_feature_shards(
         for split in ("train", "test"):
             shutil.rmtree(_vlm_shard_dir(cache_dir, base, split, shard_count), ignore_errors=True)
     return assembled
-
-
-# --------------------------------------------------------------------------
-# Official CONCH prompts -- pure data, no model needed to load or validate.
-# --------------------------------------------------------------------------
-
-def load_official_conch_prompts(path: str) -> Dict[str, object]:
-    """Read `crc100k_prompts_all_per_class.json`.
-
-    The content is nested one level deeper than it looks: everything is under
-    a `"0"` key, i.e. `data["0"]["classnames"]` and `data["0"]["templates"]`,
-    not `data["classnames"]`. Reading it at the top level raises `KeyError`
-    immediately -- documented here once so nobody re-derives this by trial and
-    error.
-    """
-    with open(path, "r", encoding="utf-8") as handle:
-        raw = json.load(handle)
-    inner = raw["0"]
-    return {"classnames": inner["classnames"], "templates": inner["templates"]}
-
-
-def assert_class_order_matches_prompts(class_names: Sequence[str], prompt_classnames: Dict[str, List[str]]) -> None:
-    """The order of `class_names` (from `config.yaml`) must match the order of
-    `prompt_classnames.keys()` (from the official CONCH prompt file) one-to-one.
-
-    Verified once by hand for PathMNIST (`adipose->ADI, background->BACK, ...,
-    colorectal_adenocarcinoma->TUM`), but this must be checked in code, not
-    assumed: a silent mismatch does not crash, it just permutes the confusion
-    matrix and reports a wrong number that looks plausible.
-
-    This checks COUNT and POSITION only -- it does not (and cannot) check that
-    `adipose` at position 0 semantically means the same thing as `ADI` at
-    position 0. That correspondence has to be verified once, by a human reading
-    both label sets, which is what the docstring above records.
-    """
-    prompt_keys = list(prompt_classnames.keys())
-    if len(class_names) != len(prompt_keys):
-        raise ValueError(
-            f"{len(class_names)} dataset classes vs {len(prompt_keys)} prompt "
-            f"classes -- this dataset does not have an official CONCH prompt "
-            f"file for it (only PathMNIST/CRC100K does)."
-        )
 
 
 # --------------------------------------------------------------------------

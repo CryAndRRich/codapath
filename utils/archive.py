@@ -79,7 +79,7 @@ def main_archive_stem(
     DINOv2 only. A DINOv2 `scalpel` run and a CONCH `scalpel` run of the same
     config are two different protocols (different feature space at every
     stage: coverage kernel, disagreement probes, evaluation probe --
-    PLAN_IMPLEMENT.md §6.2), so they must not share an archive name. Only
+    so they must not share an archive name. Only
     appended when non-default, so an unchanged DINOv2 run's archive name
     matches what `results_archive_stem` would have produced -- mirroring how
     `_default_run_name` only appends `encoder` when it is not `"dinov2"`.

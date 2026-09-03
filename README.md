@@ -19,7 +19,9 @@ Three contributions, at three different points in the pipeline:
 (margin, entropy, BADGE) or on pure coverage (Uncertainty Herding, TypiClust).
 Both are label-blind. Instead: have an LLM write a rich description per class,
 encode those with a pathology VLM's text tower, and score the pool against them
-zero-shot — so round 1 already carries semantic signal. *Not implemented yet.*
+zero-shot — so round 1 already carries semantic signal. Implemented as
+`sampling/scalpel/uncertainty.py::text_prior_weights`, reached through
+`USE_TEXT=True`; not yet run at full scale.
 
 **2. Cell-vs-visual disagreement as the acquisition signal.** Implemented, and
 the current SCALPEL. Keep Uncertainty Herding's objective exactly as published
@@ -252,7 +254,7 @@ in results and manifests.
 
 `generate_class_description.ipynb` writes `config/descriptions/{dataset}_{style}.json`
 **once**, committed to the repo — the text prior `extract_vlm_features.ipynb`'s
-`DESCRIPTION_STYLE="llm_*"` reads. Calls go through
+`DESCRIPTION_STYLES` reads. Calls go through
 [OpenRouter](https://openrouter.ai), a single OpenAI-compatible endpoint that
 proxies many providers, so `MODEL` in the EDIT cell is an OpenRouter-format id
 (`"<provider>/<model>"`, e.g. `"google/gemini-2.5-flash"`) — needs no GPU and
@@ -277,7 +279,8 @@ model is current, and if temperature genuinely has no effect on it, the
 written file is still exactly what that model returned — just potentially
 harder to reproduce on a later call, the same tradeoff already accepted above.
 
-Two styles (`STYLE` in the EDIT cell): `llm_short` (one dense sentence),
+Two styles (`STYLE` in the EDIT cell, `DESCRIPTION_STYLES` downstream):
+`llm_short` (one dense sentence),
 `llm_morphology` (2–4 sentences on cell shape/arrangement/texture/staining).
 A third style, `llm_multi` (`NUM_PER_CLASS` differently-phrased variants per
 class), was removed entirely — recoverable from git history if a
@@ -322,24 +325,30 @@ exactly this; not passing one still gives every other caller the original
 224+ImageNet behavior, byte for byte.
 
 **`logit_scale` is learned**, read off the loaded checkpoint
-(`model.logit_scale.exp()`), never a hard-coded temperature.
+(`model.logit_scale.exp()`), never a hard-coded temperature — and saved into
+the text manifest, because the AL round-1 text prior reads it and an AL run
+never loads CONCH. It cannot change a zero-shot argmax (a positive scale on
+the logits leaves the ordering intact), but it does change the top-2 gap the
+acquisition margin reads, so a run that guessed it would select a different
+set. `main.run` raises on a manifest that predates the field rather than
+defaulting.
 
 **Text prototypes** — one 512-d vector per class, cached separately by
 `(dataset, description style)` since they don't depend on the seed or split.
-`DESCRIPTION_STYLE = "conch_official"` uses the paper authors' own 22-template
-× 4–5-classname CRC100K prompt ensemble (vendored, CC BY-NC-ND 4.0, in
-`config/prompts/`; PathMNIST only — its 9 classes match `config.yaml`'s
-`datasets.pathmnist.class_names` order 1:1, checked in code via
-`assert_class_order_matches_prompts`). `"llm_*"` reads the committed file
-`generate_class_description.ipynb` wrote, falling back to the bare class
-names when that file does not exist yet.
+Two styles, `llm_short` and `llm_morphology`, each reading the committed file
+`generate_class_description.ipynb` wrote and falling back to the bare class
+names when that file does not exist yet. `DESCRIPTION_STYLES` is a LIST: the
+image features never see a prompt, so one extraction serves every style and
+adding one costs 14 strings through the text tower rather than another 448x448
+pass. The archive name lists the styles inside it.
 
-**Zero-shot sanity check**, printed and asserted `> 0.70` at the end of the
-notebook — not a reproduction of the paper's 79.1% on CRC100K (PathMNIST is
-224-native, resized up to 448 here), but a check that transform,
-normalization, tokenizer and projection are all correct. A wrong one of those
-does not crash — it silently produces near-random accuracy with no other
-symptom.
+**Zero-shot sanity check**, printed per style and never asserted. It exercises
+transform, tokenizer, projection, `logit_scale` and the class ORDER end to end,
+and a fault in any of them produces near-random accuracy with no other symptom
+— but the extraction is already paid for by the time it runs, so a bad number
+prints a warning naming the likely causes rather than throwing the cache away.
+No accuracy threshold is applied: the paper's 79.1% is CRC100K-specific, and
+histoset (14 classes) and skintissue (16) legitimately score far lower.
 
 ---
 
@@ -383,11 +392,12 @@ features: `main.py` only READS an already-published cache from
 `extract_vlm_features.ipynb` (`_load_vlm_features`), and raises with an
 actionable message if it is missing — loading the `conch` package, an HF
 token and a slow 448×448 forward pass inside a 2-GPU AL sweep would duplicate
-what the extraction notebook already does. `USE_TEXT` (the round-1 cold-start
-text prior) is present in the EDIT cell but **not yet implemented** — setting
-it True raises `NotImplementedError` naming exactly what is missing
-(`sampling/scalpel/sampler.py` round 1 is still plain MaxHerding, `U=1`; see
-`CLAUDE.md`'s contribution #1) rather than silently running without it.
+what the extraction notebook already does. `USE_TEXT=True` turns on the round-1 cold-start
+text prior: `main.run` reads the prototypes from the same VLM cache and passes
+them to `scalpel`, whose round 1 then weights by the margin of the zero-shot
+distribution instead of running plain MaxHerding. It needs
+`IMAGE_ENCODER="conch"` — the prototypes are compared to the image features by
+a dot product, and DINOv2 has no text tower pointing into its space.
 
 **There are TWO auxiliary losses, at two stages, and they are independent.**
 `SEL_AUX_WEIGHT` acts on the two probes DURING selection (every round);
@@ -581,15 +591,15 @@ axes that would otherwise overwrite each other
 (`scalpel_disagreement`, `scalpel_visual_margin`, …), and suffixed `_s<seed>`
 for any seed other than the config default. `_default_run_name` also accepts
 `encoder` (default `"dinov2"`, a non-default value appends e.g. `_conch`) and
-`use_text` (appends `_text` when true) so a future CONCH run of the same
-sampler+config gets a name distinct from its DINOv2 counterpart — without
-this, the two protocols would silently overwrite every file the first one
-wrote, and the notebook's resume check would skip the second protocol's run
-entirely, mistaking the first protocol's leftover results file for a
-finished run of the second. Neither parameter is wired into `run()` yet
-(that is `run_al_main.ipynb`'s job); calling `_default_run_name` with no
-encoder/use_text — as every current notebook does — produces exactly the
-same name it always has.
+`use_text` with `description_style` (appends e.g. `_text-llm_short`), so a
+CONCH run of the same sampler+config gets a name distinct from its DINOv2
+counterpart, and two description styles get names distinct from each other.
+Without this the runs would silently overwrite every file the first one wrote,
+and the notebook's resume check would skip the later ones entirely, mistaking
+a leftover results file for a finished run. The style is only appended when
+`use_text` is on, so a run that read no text does not claim an axis it never
+exercised, and calling `_default_run_name` with neither — as `run_al_baseline`
+does — produces exactly the name it always has.
 
 **A probe checkpoint states which feature space it was trained on.**
 `metadata["encoder"]` (the backbone name) and `metadata["encoder_kind"]`

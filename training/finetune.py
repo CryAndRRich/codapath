@@ -33,11 +33,10 @@ the first version and produced near-chance accuracy on a real run:**
   budget k+1 inherits budget k's adapter, trained on a different labeled
   set, and the sweep stops measuring "N labels -> this accuracy".
 
-**Every budget gets its own full-curve point**, not just the largest one --
-the confirmed choice for `TRAIN_MODE` axes at every budget in the sweep
-(`PLAN_IMPLEMENT.md` §6.4's open question, resolved: full curve, ~8x the cost
-of frozen-only, because the research question is whether LoRA helps more at
-low or high budgets, which a single max-budget point cannot answer).
+**Every budget gets its own full-curve point**, not just the largest one.
+That costs ~8x the frozen-only path, and is deliberate: the research question
+is whether LoRA helps more at low or high budgets, which a single max-budget
+point cannot answer.
 
 **The fast path is unchanged.** `use_lora=False` and `augment="none"` train a
 plain linear probe on the embedding cache -- `training/probe.py::train_probe`,

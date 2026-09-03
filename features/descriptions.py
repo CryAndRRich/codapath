@@ -1,7 +1,7 @@
 """LLM-written class descriptions -- the round-1 cold-start text prior.
 
 This module writes and reads `config/descriptions/{dataset}_{style}.json`
-(PLAN_IMPLEMENT.md §3). The file is generated **once**, committed to the
+The file is generated **once**, committed to the
 repo, and every later run just reads it -- `generate_descriptions` is not
 meant to be called from `main.py` or any run notebook, only from
 `generate_class_description.ipynb`.

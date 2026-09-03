@@ -124,7 +124,7 @@ def _default_run_name(
     `_predictions_budget_*.pt`, its log -- and the notebook's resume check
     (`<name>_results.pt exists`) would then silently SKIP the second
     protocol's run entirely, mistaking the first protocol's leftover file
-    for a finished run of the second (PLAN_IMPLEMENT.md §6.2).
+    for a finished run of the second.
 
     `use_text` names the round-1 cold start (contribution #1). It is an axis
     of the RUN rather than of the sampler function's own kwargs -- `run` reads
@@ -229,7 +229,7 @@ def _load_cell_view(
         # is not that same checkpoint -- including every CONCH run, whose
         # `visual_backbone` is a CONCH model id -- would be mixing a CONCH
         # image space with a DINOv2 cell space, which `sampling/scalpel`
-        # assumes are the same space (PLAN_IMPLEMENT.md §6.3).
+        # assumes are the same space.
         raise ValueError(
             f"cell_source='crop_dino' was extracted with DINOv2 backbone "
             f"{cache.manifest.get('dino_backbone')!r}, but this run's "
@@ -364,7 +364,7 @@ def run(
     stage of this run uses -- the coverage kernel, the disagreement probes
     inside `scalpel`, and the final evaluation probe -- because a run mixing
     encoders across stages is not a comparable protocol
-    (PLAN_IMPLEMENT.md §6.2). `"conch"` reads `RAW_SPACE` (proj_contrast=False,
+    `"conch"` reads `RAW_SPACE` (proj_contrast=False,
     normalize=False) from `features/vlm.py::get_or_extract_vlm_features`, never
     `PROJ_SPACE` -- that space is only for comparing an image against text, and
     using it here would not crash (both are 512-d) but would silently train
@@ -373,12 +373,12 @@ def run(
     `final_train_cfg`, if given, is a dict with any of `use_lora` (bool),
     `lora_r` (int), `lora_alpha` (float), `aux_loss`
     ("none"|"center"|"supcon"|"triplet"), `aux_weight` (float), `augment`
-    ("none"|"flip_rotate") -- the PLAN_IMPLEMENT.md §6.4 final-training pass,
+    ("none"|"flip_rotate") -- the final-training pass,
     run AFTER each budget's points are selected, never during selection
     itself. `None` (the default) and a dict where `training.finetune.needs_pixels`
     is False are identical: both keep the exact fast path this project has
     always run -- `training.probe.train_probe` on the frozen embedding
-    cache, no pixel loaded. Confirmed choice (PLAN_IMPLEMENT.md §6.4): the
+    cache, no pixel loaded. Confirmed choice: the
     final-training pass runs at EVERY budget in the sweep, not only the
     largest -- a full learning curve, not a single point, because the
     research question is whether LoRA helps more at low or high budgets.
@@ -847,7 +847,7 @@ def run(
                     # DINOv2 run (768-d) from a CONCH run (512-d, RAW_SPACE)
                     # apart — a dimension mismatch crashes, but if two spaces
                     # ever coincide in width it would silently score a probe
-                    # against the wrong test features (PLAN_IMPLEMENT.md §2.1).
+                    # against the wrong test features.
                     # `encoder_kind` is explicit rather than inferred from the
                     # `encoder` string (e.g. guessing "dinov2" is in the name)
                     # so a reader never has to pattern-match a HF repo id to
