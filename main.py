@@ -105,6 +105,7 @@ def _default_run_name(
     encoder: str = "dinov2",
     use_text: bool = False,
     final_train_cfg: Optional[Dict] = None,
+    description_style: str = "llm_short",
 ) -> str:
     """Encode the config axes that would otherwise overwrite each other.
 
@@ -153,7 +154,13 @@ def _default_run_name(
     if encoder != "dinov2":
         parts.append(encoder)
     if use_text:
-        parts.append("text")
+        # The STYLE is part of the name, not just the fact that text was used.
+        # Two styles are two different priors -- measured Kendall tau 0.025
+        # between llm_short and llm_morphology weights on real histoset
+        # features -- so without it they share a filename, the second run
+        # overwrites the first, and the notebook's resume check
+        # ("does `<name>_results.pt` exist") then SKIPS it entirely.
+        parts.append(f"text-{description_style}" if description_style else "text")
 
     # The §6.4 final-training axes. Without these in the name, a 48-combination
     # sweep over (cell_pooling x use_lora x aux_loss x augment) collapses onto
@@ -407,6 +414,7 @@ def run(
     output_name = _safe_run_name(
         run_name or _default_run_name(
             sampler_name, sampler_cfg, encoder=image_encoder, use_text=use_text,
+            description_style=description_style,
         )
     )
 
