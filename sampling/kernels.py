@@ -2,7 +2,7 @@
 
 Every sampler in this project that mixes coverage with a per-point weight
 shares this module: the baseline `uncertainty_herding` and the main method
-`scalpel`. Keeping one implementation avoids the class of bug this codebase
+`pact`. Keeping one implementation avoids the class of bug this codebase
 already hit twice — a kernel fed rows that were not L2-normalized, and a
 bandwidth passed as a squared distance.
 
@@ -15,6 +15,18 @@ Two invariants every caller must respect:
    Euclidean `||u - v|| = sqrt(2 - 2cos)`. Note `1 - cos == ||u - v||^2 / 2`,
    so passing `1 - cos` as a bandwidth over-sharpens the exponent and zeroes
    out every marginal gain.
+
+Normalization helpers deliberately do NOT live here. This module used to also
+export `minmax` and a `rank_normalize`, both unused, and the second was
+actively dangerous: it broke ties by INDEX, so a constant input came back as
+0, 1/n, 2/n, ... 1 -- an ascending ramp in index order, which is precisely the
+"argmax over a constant score returns index order" signature `evaluation/
+sanity.py` exists to detect. The live one is
+`sampling/uncertainty.py::rank_normalize`, which gives ties their average rank
+so a constant input maps to a neutral 0.5. Two functions with one name and
+opposite behaviour on the degenerate case is the kind of trap this file's own
+header warns about, so the dead pair was removed rather than left to be
+imported by mistake.
 """
 
 from typing import List, Optional, Sequence
@@ -24,26 +36,6 @@ import torch
 
 from utils.progress import progress
 from utils.runtime import clear_memory
-
-
-def minmax(values: np.ndarray) -> np.ndarray:
-    """Scale to [0, 1]. A constant input maps to all-zeros, which makes any
-    downstream product degenerate — callers that multiply must check for it."""
-    low, high = float(values.min()), float(values.max())
-    if high - low < 1e-12:
-        return np.zeros_like(values)
-    return (values - low) / (high - low)
-
-
-def rank_normalize(values: np.ndarray) -> np.ndarray:
-    """Rank-normalize to [0, 1], ties broken by index order.
-
-    Preferred over `minmax` for probe-derived uncertainty: those distributions
-    saturate near their maximum, where minmax amplifies noise in the tiny
-    remaining spread instead of preserving the real ordering.
-    """
-    order = np.argsort(np.argsort(values))
-    return (order / max(1, len(values) - 1)).astype(np.float32)
 
 
 def bootstrap_sigma(features: torch.Tensor, n_ref: int = 2000) -> float:

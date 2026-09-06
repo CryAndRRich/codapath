@@ -43,7 +43,7 @@ def rank_normalize(values: np.ndarray, mask: np.ndarray = None) -> np.ndarray:
     Returns an array the same length as `values`; entries outside `mask` are
     left at 0.0 and take no part in the ranking.
 
-    **Why rank and not min-max.** SCALPEL's acquisition weight mixes two
+    **Why rank and not min-max.** PACT's acquisition weight mixes two
     quantities that live on wildly different scales: Jensen-Shannon
     disagreement between two probes (measured at 0.012-0.025 on a real
     14-class histoset run) and the visual margin (~0.7 for the same probe).

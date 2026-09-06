@@ -20,11 +20,11 @@ Three contributions, at three different points in the pipeline:
 Both are label-blind. Instead: have an LLM write a rich description per class,
 encode those with a pathology VLM's text tower, and score the pool against them
 zero-shot — so round 1 already carries semantic signal. Implemented as
-`sampling/scalpel/uncertainty.py::text_prior_weights`, reached through
+`sampling/pact/uncertainty.py::text_prior_weights`, reached through
 `USE_TEXT=True`; not yet run at full scale.
 
 **2. Cell-vs-visual disagreement as the acquisition signal.** Implemented, and
-the current SCALPEL. Keep Uncertainty Herding's objective exactly as published
+the current PACT. Keep Uncertainty Herding's objective exactly as published
 and swap only its per-point weight: instead of "how close is the classifier to a
 boundary here", use "how much do a tissue-level view and a cell-level view
 disagree here". Two probes per round — one on DINOv2 patch features, one on
@@ -37,7 +37,8 @@ nucleus segmenter, and it does not transfer to natural images.
 **3. A training framework with an auxiliary loss.** Partly implemented. There
 are two independent auxiliary losses, at two different stages. During
 SELECTION, `training/probe.py::train_dual_probe` couples the two probes on the
-UNLABELED pool (`pool_consistency_weight`, default 0 = off), masked to the
+UNLABELED pool (`pool_consistency_weight`, **code default 0 = off, but the
+method as published uses 5** — see the note below), masked to the
 region both heads already call confidently. That mask is what resolves the
 tension with contribution 2: a coupling loss makes the two probes agree, which
 shrinks exactly the divergence 2 selects on, so it is kept off the contested
@@ -56,10 +57,10 @@ as a separate claim, or the gain cannot be attributed.
 pip install -r requirements.txt
 
 # One sampler, full budget sweep, one dataset.
-python main.py --dataset pathmnist --sampler scalpel
+python main.py --dataset pathmnist --sampler pact
 
 # The controlled ablation: same machinery, Uncertainty Herding's own weight.
-python main.py --dataset pathmnist --sampler scalpel --set uncertainty_mode=visual_margin
+python main.py --dataset pathmnist --sampler pact --set uncertainty_mode=visual_margin
 
 # A baseline.
 python main.py --dataset pathmnist --sampler uncertainty_herding
@@ -68,7 +69,7 @@ python main.py --dataset pathmnist --sampler uncertainty_herding
 `--set KEY=VALUE` overrides any sampler field from `config/config.yaml`; values
 are parsed as YAML, so `true`, `0.5`, `null` and `[1,2]` arrive typed.
 
-`scalpel` needs the CellViT cache — see [CellViT extraction](#cellvit-extraction).
+`pact` needs the CellViT cache — see [CellViT extraction](#cellvit-extraction).
 
 On Kaggle, use the notebooks instead (below).
 
@@ -91,9 +92,13 @@ sampling/
   calibration.py         ECE-minimising temperature scaling
   uncertainty.py         margin, Jensen-Shannon divergence
   baselines/             published methods, one file each
-  scalpel/               this project's method
+  pact/               this project's method
 training/                linear probe, dual probe, checkpoint IO
-evaluation/              test metrics, PALM curve fitting, plots
+evaluation/
+  metrics.py             test metrics, computed once during a run
+  results_io.py          read finished runs' metrics back out of their zips
+  palm.py                PALM learning-curve fit
+  alda.py                ALDA risk-aware deployment advice (B_abs, W, C_eta)
 scripts/                 CellViT extraction and its preflight
 notebooks/               four Kaggle notebooks, one per pipeline stage
 ```
@@ -123,13 +128,15 @@ The axes are orthogonal, and every combination is populated:
 |                | prefix-exact | not prefix-exact |
 |---|---|---|
 | **single pass** | `random`, `coreset` | `typiclust`, `activeft` |
-| **multi round** | `tcm` (once B ≥ 3·C) | `margin`, `entropy`, `badge`, `dropquery`, `uncertainty_herding`, `refine`, `scalpel` |
+| **multi round** | *(none currently)* | `margin`, `entropy`, `badge`, `uncertainty_herding`, `refine`, `pact` |
 
 `typiclust` and `activeft` make exactly one pass yet are *not* prefix-exact,
 because that pass reads B directly (`typiclust` derives `num_clusters` from it,
-`activeft` parameterises its optimisation by it). Conversely `tcm` runs several
-rounds yet *is* prefix-exact, because its phase boundary is a multiple of the
-class count rather than of B.
+`activeft` parameterises its optimisation by it) — so a large-B run is not a
+superset of a small-B run. The multi-round *and* prefix-exact cell is currently
+empty: `tcm` was its only member and has been removed. The two fields stay
+separate anyway, because inferring one from the other is the mistake this table
+exists to prevent.
 
 **The rule that catches most cases:** anything that scales an internal threshold
 by B is not prefix-exact, however one-shot it looks. That is why
@@ -137,7 +144,7 @@ by B is not prefix-exact, however one-shot it looks. That is why
 `refine` is False too — its stage-2 head *is* Uncertainty Herding.
 
 A third field, `needs`, lists the extra pool arrays a sampler wants (the cell
-view, for `scalpel`). It is **not** a classification axis. An earlier version
+view, for `pact`). It is **not** a classification axis. An earlier version
 of this file split samplers into three sets where two differed only by this
 field, which read as a third category that does not exist — and led to real
 bugs.
@@ -156,11 +163,15 @@ implementation it was verified against, and every deliberate deviation.
 | `badge` | Ash et al., ICLR 2020 | `repos/badge/.../badge_sampling.py` |
 | `typiclust` | Hacohen et al., ICML 2022 | `repos/typiclust/.../typiclust.py` |
 | `activeft` | Xie et al., CVPR 2023 | `repos/activeft/.../ActiveFT_CIFAR.py` |
-| `tcm` | ICLR 2024 Workshop | paper text (no public code) |
-| `dropquery` | TMLR 2024 | `repos/dropquery/ALFM/.../dropout.py` |
 | `uncertainty_herding` | Bae et al., ICLR 2025 | `repos/uherding/.../uherding.py` + paper |
 | `refine` | CVPR 2026 | `repos/refine/.../strategies.py` + official run config |
-| `scalpel` | this project | — |
+| `pact` | this project | — |
+
+`dropquery` (TMLR 2024, verified against `repos/dropquery/ALFM/.../dropout.py`)
+is no longer a runnable baseline and has no entry in `sampling/specs.py`, but
+its module stays: `refine`'s candidate-generation ensemble calls it by name
+through the registry, and dropping it would silently change `refine` away from
+its published five-strategy configuration.
 
 Baselines are the foundation of every claim, so fidelity beats convenience:
 where the reference does something expensive, this code does the expensive
@@ -171,7 +182,7 @@ reported.
 
 ---
 
-## SCALPEL
+## PACT
 
 One objective, evaluated identically in every round — Uncertainty Herding's
 weighted facility location on the DINOv2 space the probe also lives in:
@@ -194,14 +205,14 @@ The one substitution is `U`:
   CellViT found no nucleus has `rho = 0` and falls back entirely to the visual
   margin.
 
-Axes (all in `config/config.yaml` under `samplers.scalpel`):
+Axes (all in `config/config.yaml` under `samplers.pact`):
 
 | Field | Meaning |
 |---|---|
 | `uncertainty_mode` | `disagreement` (the method) or `visual_margin` (ablation: plain Uncertainty Herding) |
 | `cell_pooling` | `mean`, `rff` (random-Fourier kernel mean embedding ≈ the patch's cell-distribution KDE) or `moments` |
 | `missing_impute` | `mean` or `zero` for patches with no detected nucleus |
-| `pool_consistency_weight` | > 0 adds a semi-supervised loss coupling the two probes on the UNLABELED pool, restricted to points both heads already call confidently. The mask keeps it off the contested region — pool-wide `JS(visual, cell)` *is* the acquisition weight, so an unmasked term would minimise the signal the sampler ranks on. Watch `pool_mask_fraction` in the trace for how much of the pool the term actually saw. |
+| `pool_consistency_weight` | **PACT as published sets this to 5** (`SEL_AUX_WEIGHT=5` in `run_al_main.ipynb`, whose own default is 0.0 — so a default run reproduces the ABLATION, not the method, and nothing warns you). Positive on all three datasets at seed 42 (+0.011 histoset, +0.011 pathmnist, +0.003 skintissue mean accuracy). > 0 adds a semi-supervised loss coupling the two probes on the UNLABELED pool, restricted to points both heads already call confidently. The mask keeps it off the contested region — pool-wide `JS(visual, cell)` *is* the acquisition weight, so an unmasked term would minimise the signal the sampler ranks on. Watch `pool_mask_fraction` in the trace for how much of the pool the term actually saw. |
 | `pool_confidence_quantile` | share of each head's own confidence tail admitted (default 0.5). A quantile, not an absolute cut: an absolute 0.9 admitted 67% / 49% / 42% of pathmnist / histoset / skintissue (9 / 14 / 16 classes), so one number meant three different experiments. |
 | — | How many pool rows the term uses is derived, not configured: half the pool capped at 20k. The pools differ 4.6x (22,400 vs 100,000 and 103,495), so a fixed row count and a fixed fraction each break on one end of that spread. |
 
@@ -301,7 +312,7 @@ exists.
 `extract_vlm_features.ipynb` produces the second encoder Protocol B needs.
 CONCH is CoCa-based (image + text tower; the public checkpoint has its
 captioning decoder stripped), gated on Hugging Face, verified against
-`repos/CONCH` and the paper directly (`PLAN_IMPLEMENT.md` §10).
+`repos/CONCH` and the paper directly.
 
 **Two image embedding spaces, not interchangeable**
 (`features/vlm.py::extract_vlm_image_features`):
@@ -367,8 +378,8 @@ see "Class descriptions" above).
 | `extract_nucleus_features.ipynb` | CellViT cache; runs preflight first |
 | `extract_vlm_features.ipynb` | CONCH image features (both embedding spaces) + text prototypes |
 | `run_al_baseline.ipynb` | one of the 11 published baselines; no CellViT, no VLM |
-| `run_al_main.ipynb` | `scalpel`, this project's own method — either image encoder |
-| `evaluate_al_sampler.ipynb` | reload saved probes and rebuild the comparison table |
+| `run_al_main.ipynb` | `pact`, this project's own method — either image encoder |
+| `evaluate_al_sampler.ipynb` | read the finished runs' saved metrics; PALM + ALDA |
 
 **The notebooks carry no prose.** No markdown cells, no explanatory comments —
 only code, plus a single `# a | b | c` comment on each editable variable naming
@@ -380,21 +391,21 @@ read here for what the choice means.
 `run_al_baseline.ipynb` and `run_al_main.ipynb` are deliberately separate
 notebooks rather than one with a bigger menu: a baseline run only needs the
 DINOv2 visual cache, and asserting that at the top of its own notebook
-(`sampling.specs.BASELINE_SAMPLERS`) catches picking `scalpel` there before any
+(`sampling.specs.BASELINE_SAMPLERS`) catches picking `pact` there before any
 GPU time is spent, instead of failing deep inside `main.py` on the first
 budget.
 
 **`run_al_main.ipynb`'s `IMAGE_ENCODER` (`"dinov2"` | `"conch"`) decides the
 ONE feature space the whole run uses** — the coverage kernel, the disagreement
-probes inside `scalpel`, and the final evaluation probe
-(`PLAN_IMPLEMENT.md` §6.2). Unlike DINOv2, a CONCH run never extracts its own
+probes inside `pact`, and the final evaluation probe.
+Unlike DINOv2, a CONCH run never extracts its own
 features: `main.py` only READS an already-published cache from
 `extract_vlm_features.ipynb` (`_load_vlm_features`), and raises with an
 actionable message if it is missing — loading the `conch` package, an HF
 token and a slow 448×448 forward pass inside a 2-GPU AL sweep would duplicate
 what the extraction notebook already does. `USE_TEXT=True` turns on the round-1 cold-start
 text prior: `main.run` reads the prototypes from the same VLM cache and passes
-them to `scalpel`, whose round 1 then weights by the margin of the zero-shot
+them to `pact`, whose round 1 then weights by the margin of the zero-shot
 distribution instead of running plain MaxHerding. It needs
 `IMAGE_ENCODER="conch"` — the prototypes are compared to the image features by
 a dot product, and DINOv2 has no text tower pointing into its space.
@@ -519,7 +530,7 @@ serial.
 Budget splitting is sound precisely for the samplers where every budget is
 already an independent run: `spec.prefix_exact == False`. The flag itself
 decides, so a new sampler cannot drift out of sync with a hand-kept list. A
-prefix-exact sampler (`random`, `coreset`, `tcm`) derives its whole sweep from
+prefix-exact sampler (`random`, `coreset`) derives its whole sweep from
 one selection pass, so sharding it would repeat that pass per shard; `main.run`
 refuses a `shard_tag` for those rather than silently doing more work.
 
@@ -569,7 +580,7 @@ Per budget, under `checkpoints/<dataset>/`:
 |---|---|
 | `<run>_selected_budget_<B>.pt` | selected indices, sample ids, labels, per-class counts, sampler config, per-step trace, sanity report, timings, fingerprints |
 | `<run>_probe_budget_<B>.pt` | the probe's linear weights, plus run/budget/seed/**encoder** metadata |
-| `<run>_predictions_budget_<B>.pt` | test-set class probabilities and true labels |
+| `<run>_predictions_budget_<B>.pt` | test-set class probabilities and true labels, **scored in whatever feature space that budget's probe was trained in** |
 | `<run>_results.pt` | accuracy / precision / recall / macro-F1 and timings for every budget |
 | `<run>.log` | everything printed during the run |
 
@@ -580,15 +591,15 @@ two actually drove a selection. A sampler records only what it genuinely
 computes: `coreset`, `typiclust` and `activeft` fit no classifier and so have
 no uncertainty, and `random` has no score at all.
 
-A run reports **accuracy, precision, recall and macro-F1 only**. PALM and every
-other curve-level metric are fitted by `evaluate_al_sampler.ipynb` from these
-files: the fit needs the whole sweep to have finished, which a resumed or
+A run reports **accuracy, precision, recall and macro-F1 only**. PALM, ALDA and
+every other curve-level metric are fitted by `evaluate_al_sampler.ipynb` from
+these files: the fit needs the whole sweep to have finished, which a resumed or
 GPU-split run cannot guarantee mid-sweep, and re-fitting costs seconds against
 re-running the sweep.
 
-`<run>` defaults to the sampler name, extended for `scalpel` with the config
+`<run>` defaults to the sampler name, extended for `pact` with the config
 axes that would otherwise overwrite each other
-(`scalpel_disagreement`, `scalpel_visual_margin`, …), and suffixed `_s<seed>`
+(`pact_disagreement`, `pact_visual_margin`, …), and suffixed `_s<seed>`
 for any seed other than the config default. `_default_run_name` also accepts
 `encoder` (default `"dinov2"`, a non-default value appends e.g. `_conch`) and
 `use_text` with `description_style` (appends e.g. `_text-llm_short`), so a
@@ -610,6 +621,16 @@ crashes on a shape mismatch or, if the two widths ever coincided, would be
 silently scored against the wrong features. A checkpoint written before this
 field existed has no `encoder_kind` key and is read as DINOv2, so nothing
 already published needs to be regenerated.
+
+**The saved probabilities follow the encoder, like the metrics do.** For a
+LoRA run they come from the adapted encoder, not the frozen cache — `main.py`
+takes them from `finetune_and_evaluate`'s return value rather than recomputing
+them. It used to recompute, which raised nothing (both spaces are 768-d) and
+silently wrote a predictions file that disagreed with the same run's own
+reported accuracy by up to 0.37. Archives written before 2026-09-05 by a LoRA
+run still carry those wrong probabilities: their `_results.pt` is correct, but
+anything derived from `_predictions_*.pt` (confusion matrix, per-class F1,
+calibration) is not valid for those runs.
 
 Everything a later plot needs is written **during** the run, because none of it
 survives otherwise: the per-step acquisition score exists only inside the greedy
@@ -662,6 +683,63 @@ not during a run — the fit needs every budget of the sweep to be present.
 | budget-to-90 | labels needed to reach 90% of `Amax` | lower |
 | `RMSE` | fit reliability of the five above | lower |
 
+### ALDA — the deployment question
+
+PALM describes a curve; **ALDA** (`evaluation/alda.py`, arXiv 2608.03511, same
+authors and repository as PALM) turns it into the decision a clinical team
+actually faces: *given a short pilot, which sampler gets the remaining budget,
+and how many expert labels will it take?* Three quantities per method, all read
+off the fitted curve:
+
+| ALDA quantity | Meaning | Better |
+|---|---|---|
+| feasible | `Amax >= target` — screened out first, before any cost is computed | — |
+| `B_abs(τ)` | labels needed to reach the target, rounded **up** to a whole episode | lower |
+| `W` | `B_abs(τ+Δτ) − B_abs(τ−Δτ)`: how much the label cost moves if the target is revised | lower |
+
+The recommendation is deliberately **not** `argmin B_abs`. Costs within `eta`
+(default 5%) of the cheapest are treated as equivalent, and inside that
+cost-competitive set ALDA picks the **smallest window** — cheapest among
+equals, then most robust among the cheap. A feasible method whose `W` exceeds
+the recommendation's is flagged `risky`; that flag is about threshold
+sensitivity, not about cost, so a *cheap* method can be risky and an expensive
+one need not be.
+
+Fitting differs from `palm.py` on purpose: ALDA fits with L-BFGS-B and 18
+seeded random restarts (paper §3.1) because `B_abs` and `W` are inversions of
+the fitted parameters, so a less stable fit moves the reported label counts
+directly. `palm.py` keeps its single `curve_fit` call, so PALM tables already
+reported stay reproducible. `tests/test_alda_matches_official.py` pins both
+implementations against the reference clone in `repos/PALM`, comparing
+`B_abs`, `W` and the selection flags rather than restating the formulas.
+
+`PILOT_POINTS` reruns the whole analysis on the first N budgets only, which is
+the paper's prospective scenario: it answers whether a pilot of 3–4 budgets
+would already have committed to the method the full curve prefers.
+
+### Reading results back
+
+`evaluation/results_io.py` reads `<run>_results.pt` straight out of each run's
+zip — accuracy, precision, recall and macro-F1 were all computed during the run
+and PALM/ALDA need only `(budget, accuracy)`, so nothing is re-scored. The
+notebook therefore needs no GPU, no raw dataset and no backbone checkpoint.
+
+Three things that read of saved numbers has to guard, each tested by
+constructing the situation it exists to catch:
+
+* **comparability.** Re-scoring every probe against one freshly built test
+  matrix used to guarantee it. Now `load_curves` refuses runs whose
+  `test_fingerprint` (or `train_fingerprint`) disagrees — grouped by seed,
+  since seeds split differently on purpose.
+* **protocol.** Final-training runs (LoRA / auxiliary loss / augmentation) are
+  excluded by default, identified by the presence of `final_train_cfg`, which
+  `main.py` writes only when that pass actually ran — a structural fact about
+  the run rather than a filename convention.
+* **seed grouping.** The run notebooks append `_s<SEED>` when the seed differs
+  from the config default, so five seeds arrive as five distinct `run_name`s.
+  `method_label` strips the suffix *this run's own recorded seed* implies, so a
+  config axis that happens to end in `_s<digits>` is not truncated.
+
 ---
 
 ## Papers
@@ -675,31 +753,37 @@ local-only, outside this repository).
 TypiClust (ICML 2022) · ActiveFT (CVPR 2023) · MaxHerding (ECCV 2024) ·
 UncertaintyHerding (ICLR 2025)
 
-**Hybrid** — TCM (ICLR 2024 Workshop) · DropQuery (TMLR 2024) ·
-CB+SQ (TMLR 2025) · REFINE (CVPR 2026)
+**Hybrid** — CB+SQ (TMLR 2025) · REFINE (CVPR 2026)
 
 **Medical / pathology AL** — PEAL (CVPR 2024) · OpenPath (MICCAI 2025)
 
-**Evaluation** — PALM (ICCV 2025)
+**Evaluation** — PALM (ICCV 2025) · ALDA (EMA4MICCAI 2026) ·
+Mechanism-Driven Phase Transitions (ECCV 2026, not implemented)
 
 Reference implementations are cloned read-only under `repos/` for line-by-line
 comparison: `badge`, `coreset`, `typiclust`, `activeft`, `uherding`,
-`dropquery`, `refine`, `PALM`.
+`dropquery`, `refine`, `PALM`. The `PALM` clone carries all three of that
+group's papers — PALM itself, ALDA (`deep-al/tools/alda/`), and the
+mechanism-driven phase analysis (`deep-al/tools/mechanistic/`). The third is
+**not implemented here**: four of its six operational proxies could be computed
+from what a run already saves, but empirical-risk reduction is measured inside
+the AL loop and is not recoverable afterwards.
 
 ---
 
 ## Appendix — results measured before the 2026-08-22 audit
 
 **These numbers are not reproducible with the current code.** The baseline audit
-of 2026-08-22 changed selection behaviour in `typiclust` and `tcm` (k-means
-restarts pinned to the defaults the references relied on), `activeft` (the
-detached factor in the diversity term), `tcm` (transition at 3·C with step C,
-per the paper's own regime) and `refine` (official ensemble, candidate-batch
+of 2026-08-22 changed selection behaviour in `typiclust` (k-means restarts
+pinned to the defaults the references relied on), `activeft` (the detached
+factor in the diversity term) and `refine` (official ensemble, candidate-batch
 total and pool cap). They are kept as a regression reference only — for "did the
-rewrite move this baseline, and by how much", not as reported results.
+rewrite move this baseline, and by how much", not as reported results. The
+`TCM` and `DropQuery` rows have been dropped along with those baselines.
 
-`SCALPEL` in these tables is the retired stain-shortcut method (v9), unrelated
-to the current disagreement-based sampler of the same name. `CODAPath`, this
+`SCALPEL` in these tables is the retired stain-shortcut method (v9) — a
+different method that happened to share the name, not an earlier run of
+**PACT**. `CODAPath`, this
 project's own earlier dual-VLM sampler, has since been **deleted from the
 code** (`sampling/baselines/codapath.py`); it appears in these tables only as
 historical measurement, never as a runnable sampler.
@@ -713,11 +797,9 @@ historical measurement, never as a runnable sampler.
 | Random | 0.3736 | 0.5138 | 0.6852 | 0.7312 | 0.7523 | 0.7557 | 0.7800 | 0.8036 | 0.8159 | 0.8216 | 0.8280 | 0.8316 | 0.8361 | 0.8436 | 0.8461 | 0.8466 | 0.8504 | 0.8514 | 0.8600 | 0.8611 |
 | Coreset | 0.1982 | 0.2743 | 0.3680 | 0.4152 | 0.4455 | 0.4945 | 0.5414 | 0.5909 | 0.6088 | 0.5902 | 0.6252 | 0.6250 | 0.6484 | 0.6809 | 0.6789 | 0.7034 | 0.7173 | 0.7023 | 0.7205 | 0.7200 |
 | UHerding | 0.5591 | 0.6625 | 0.6893 | 0.7400 | 0.7502 | 0.7752 | 0.7857 | 0.7862 | 0.7920 | 0.7977 | 0.7884 | 0.7879 | 0.7932 | 0.8102 | 0.8241 | 0.8161 | 0.8212 | 0.8257 | 0.8423 | 0.8520 |
-| TCM | 0.4770 | 0.5877 | 0.6443 | 0.6930 | 0.7348 | 0.7530 | 0.7602 | 0.7629 | 0.7771 | 0.7873 | 0.7905 | 0.8016 | 0.8134 | 0.8218 | 0.8375 | 0.8388 | 0.8438 | 0.8404 | 0.8471 | 0.8523 |
 | REFINE | 0.4980 | 0.6089 | 0.6641 | 0.7175 | 0.7488 | 0.7655 | 0.7848 | 0.8014 | 0.8205 | 0.8370 | 0.8455 | 0.8461 | 0.8502 | 0.8636 | 0.8693 | 0.8730 | 0.8721 | 0.8770 | 0.8836 | 0.8918 |
 | TypiClust | 0.5271 | 0.6695 | 0.7070 | 0.7280 | 0.7630 | 0.7929 | 0.7896 | 0.8045 | 0.8139 | 0.8159 | 0.8216 | 0.8454 | 0.8407 | 0.8525 | 0.8570 | 0.8648 | 0.8754 | 0.8686 | 0.8855 | 0.8839 |
 | ActiveFT | 0.4454 | 0.5586 | 0.6493 | 0.7214 | 0.7538 | 0.7679 | 0.7989 | 0.8077 | 0.8136 | 0.8189 | 0.8248 | 0.8295 | 0.8379 | 0.8529 | 0.8312 | 0.8338 | 0.8471 | 0.8505 | 0.8586 | 0.8573 |
-| DropQuery | 0.6648 | 0.7209 | 0.7111 | 0.7902 | 0.7864 | 0.7832 | 0.8161 | 0.8189 | 0.8261 | 0.8321 | 0.8373 | 0.8371 | 0.8471 | 0.8423 | 0.8632 | 0.8811 | 0.8820 | 0.8586 | 0.8832 | 0.8818 |
 | Entropy | 0.3682 | 0.4627 | 0.5504 | 0.6191 | 0.6786 | 0.6588 | 0.7145 | 0.7179 | 0.7316 | 0.7364 | 0.7902 | 0.7834 | 0.7961 | 0.7882 | 0.8227 | 0.8073 | 0.8470 | 0.8439 | 0.8504 | 0.8589 |
 | Margin | 0.4729 | 0.5477 | 0.6750 | 0.7491 | 0.7780 | 0.8030 | 0.8129 | 0.8168 | 0.8434 | 0.8405 | 0.8573 | 0.8621 | 0.8582 | 0.8836 | 0.8825 | 0.8820 | 0.8895 | 0.8862 | 0.9027 | 0.8954 |
 | BADGE | 0.5091 | 0.6118 | 0.6396 | 0.7109 | 0.7704 | 0.7846 | 0.8134 | 0.8152 | 0.8288 | 0.8429 | 0.8495 | 0.8609 | 0.8454 | 0.8725 | 0.8761 | 0.8632 | 0.8821 | 0.8779 | 0.8857 | 0.8962 |
@@ -730,11 +812,9 @@ historical measurement, never as a runnable sampler.
 | Random | 0.8569 | 0.5321 | -0.3770 | 0.6489 | 0.7843 | 147.6 | 0.0145 |
 | Coreset | 0.7784 | 0.2102 | 0.2797 | 0.8032 | 0.5736 | 419.4 | 0.0127 |
 | UHerding | 0.9171 | 0.6986 | -0.6500 | 0.2335 | 0.7800 | 424.7 | 0.0104 |
-| TCM | 0.9255 | 0.5805 | -0.4079 | 0.3564 | 0.7693 | 395.4 | 0.0073 |
 | REFINE | 0.9299 | 0.5314 | 0.0281 | 0.4684 | 0.8020 | 267.4 | 0.0039 |
 | TypiClust | 1.0000 | 0.6920 | -0.6609 | 0.2537 | 0.8062 | — | 0.0075 |
 | ActiveFT | 0.8504 | 0.4210 | 0.4426 | 0.7945 | 0.7857 | 141.8 | 0.0078 |
-| DropQuery | 1.0000 | 0.6249 | 0.5385 | 0.2556 | 0.8208 | — | 0.0122 |
 | Entropy | 0.9797 | 0.4112 | -0.2603 | 0.4531 | 0.7280 | None | 0.0145 |
 | Margin | 0.8952 | 0.4277 | 0.4233 | 0.7306 | 0.8146 | 163.3 | 0.0136 |
 | BADGE | 0.8905 | 0.3495 | 1.3583 | 0.7912 | 0.8078 | 174.5 | 0.0104 |
@@ -749,11 +829,9 @@ historical measurement, never as a runnable sampler.
 | Random | 0.3815 | 0.6089 | 0.6878 | 0.6980 | 0.7172 | 0.7475 | 0.7592 | 0.7512 | 0.7786 | 0.7834 | 0.7871 | 0.8012 | 0.8037 | 0.8204 | 0.8231 | 0.8218 | 0.8265 | 0.8295 | 0.8362 | 0.8420 |
 | Coreset | 0.1795 | 0.2281 | 0.2963 | 0.3221 | 0.3405 | 0.3919 | 0.4049 | 0.4264 | 0.4400 | 0.4616 | 0.4617 | 0.4804 | 0.4664 | 0.4996 | 0.4876 | 0.4997 | 0.4900 | 0.4883 | 0.4998 | 0.5288 |
 | UHerding | 0.5200 | 0.5871 | 0.7179 | 0.7348 | 0.7421 | 0.7417 | 0.7649 | 0.7637 | 0.7706 | | | | | | | | | | | |
-| TCM | 0.5712 | 0.6462 | 0.6713 | 0.6948 | 0.7278 | 0.7428 | 0.7686 | 0.7810 | 0.7944 | 0.8035 | 0.8093 | 0.8185 | 0.7977 | 0.8203 | 0.8277 | 0.8295 | 0.8341 | 0.8264 | 0.8332 | 0.8406 |
 | REFINE | 0.5577 | 0.6335 | 0.6923 | 0.7200 | 0.7488 | 0.7645 | 0.7819 | 0.7795 | 0.8003 | 0.8058 | 0.8157 | 0.8241 | 0.8193 | 0.8261 | 0.8309 | 0.8317 | 0.8306 | 0.8214 | 0.8353 | 0.8383 |
 | TypiClust | 0.5596 | 0.6612 | 0.6758 | 0.7020 | 0.7404 | 0.7329 | 0.7520 | 0.7608 | 0.7802 | 0.7815 | 0.7955 | 0.7912 | 0.8009 | 0.8090 | 0.8092 | 0.8092 | 0.8119 | 0.8172 | 0.8202 | 0.8244 |
 | ActiveFT | 0.5053 | 0.6374 | 0.6455 | 0.6990 | 0.7240 | 0.7275 | 0.7338 | 0.7481 | 0.7591 | 0.7659 | 0.7734 | 0.7853 | 0.7951 | 0.7954 | 0.7974 | 0.7879 | 0.7971 | 0.7941 | 0.8104 | 0.8112 |
-| DropQuery | 0.6559 | 0.6895 | 0.7189 | 0.7381 | 0.7456 | 0.7512 | 0.7756 | 0.7785 | 0.7847 | 0.7807 | 0.7940 | 0.8067 | 0.8010 | 0.8225 | 0.8296 | 0.8372 | 0.8279 | 0.8223 | 0.8321 | 0.8466 |
 | Entropy | 0.3447 | 0.5659 | 0.4964 | 0.5020 | 0.5974 | 0.6130 | 0.6397 | 0.7487 | 0.7564 | 0.7479 | 0.7465 | 0.7610 | 0.7676 | 0.7951 | 0.7993 | 0.8026 | 0.8158 | 0.8122 | 0.8188 | 0.8217 |
 | Margin | 0.4677 | 0.5785 | 0.6883 | 0.7075 | 0.7507 | 0.7719 | 0.7804 | 0.7974 | 0.8123 | 0.8154 | 0.8219 | 0.8286 | 0.8117 | 0.8387 | 0.8453 | 0.8471 | 0.8531 | 0.8325 | 0.8569 | 0.8578 |
 | BADGE | 0.4308 | 0.5647 | 0.6689 | 0.7182 | 0.7298 | 0.7458 | 0.7739 | 0.7856 | 0.7993 | 0.7998 | 0.8125 | 0.8180 | 0.8139 | 0.8352 | 0.8420 | 0.8420 | 0.8475 | 0.8492 | 0.8589 | 0.8515 |
@@ -766,11 +844,9 @@ historical measurement, never as a runnable sampler.
 | Random | 1.0000 | 0.6108 | -0.9515 | 0.2230 | 0.7657 | None | 0.0068 |
 | Coreset | 0.5172 | 0.1723 | 1.2384 | 0.9938 | 0.4240 | 278.1 | 0.0097 |
 | UHerding | | | | | | | |
-| TCM | 0.8479 | 0.3758 | 2.4630 | 0.7116 | 0.7757 | 170.8 | 0.0070 |
 | REFINE | 0.8442 | 0.5373 | 0.7731 | 0.5875 | 0.7826 | 141.8 | 0.0045 |
 | TypiClust | 1.0000 | 0.6229 | -0.5779 | 0.1965 | 0.7660 | None | 0.0065 |
 | ActiveFT | 0.9381 | 0.6472 | -0.7395 | 0.2196 | 0.7502 | None | 0.0080 |
-| DropQuery | 1.0000 | 0.5941 | 1.1110 | 0.2318 | 0.7838 | None | 0.0068 |
 | Entropy | 0.8246 | 0.0198 | 7.1284 | 1.6698 | 0.7026 | 250.7 | 0.0347 |
 | Margin | 0.8612 | 0.5626 | -0.1096 | 0.5577 | 0.7854 | 159.6 | 0.0094 |
 | BADGE | 0.8839 | 0.5952 | -0.5062 | 0.4414 | 0.7773 | 220.3 | 0.0081 |
@@ -785,11 +861,9 @@ historical measurement, never as a runnable sampler.
 | Random | 0.6812 | 0.8162 | 0.8373 | 0.8673 | 0.8766 | 0.8829 | 0.8877 | 0.9047 | 0.9070 | 0.9120 | 0.9110 | 0.9156 | 0.9095 | 0.9131 | 0.9159 | 0.9181 | 0.9184 | 0.9116 | 0.9181 | 0.9206 |
 | Coreset | 0.5731 | 0.5153 | 0.5189 | 0.5812 | 0.6333 | 0.6543 | 0.6716 | 0.6696 | 0.6753 | 0.6613 | 0.6571 | 0.6524 | 0.6535 | 0.6818 | 0.6866 | 0.6900 | 0.6890 | 0.6964 | 0.6907 | 0.6883 |
 | UHerding | 0.4922 | 0.7614 | 0.8341 | 0.8383 | 0.6312 | 0.7990 | 0.7982 | 0.8487 | 0.8525 | 0.8575 | 0.8787 | 0.8805 | | | | | | | | |
-| TCM | 0.6280 | 0.7518 | 0.8159 | 0.8430 | 0.8457 | 0.8758 | 0.8799 | 0.8834 | 0.8903 | 0.8958 | 0.8894 | 0.8976 | 0.9077 | 0.8976 | 0.9015 | 0.9013 | 0.9093 | 0.9039 | 0.9058 | 0.9149 |
 | REFINE | 0.7088 | 0.8046 | 0.8351 | 0.8536 | 0.8499 | 0.8742 | 0.8937 | 0.8894 | 0.8974 | 0.9070 | 0.9187 | 0.9019 | 0.9000 | 0.9095 | 0.9166 | 0.9219 | 0.9205 | 0.9010 | 0.9192 | 0.9240 |
 | TypiClust | 0.7302 | 0.8206 | 0.8093 | 0.8797 | 0.8727 | 0.8745 | 0.8968 | 0.8903 | 0.8916 | 0.9102 | 0.9093 | 0.8930 | 0.9011 | 0.9035 | 0.9224 | 0.9024 | 0.8937 | 0.9052 | 0.8915 | 0.9033 |
 | ActiveFT | 0.6515 | 0.8280 | 0.8290 | 0.8558 | 0.8642 | 0.8825 | 0.8864 | 0.8968 | 0.8808 | 0.9093 | 0.9064 | 0.8907 | 0.8943 | 0.9097 | 0.9043 | 0.9035 | 0.9054 | 0.8919 | 0.9121 | 0.9063 |
-| DropQuery | 0.7827 | 0.8258 | 0.8338 | 0.8500 | 0.8825 | 0.8898 | 0.8791 | 0.9025 | 0.9058 | 0.8859 | 0.9109 | 0.9159 | 0.9141 | 0.9196 | 0.8923 | 0.9104 | 0.9045 | 0.9046 | 0.8955 | 0.9116 |
 | Entropy | 0.6407 | 0.7085 | 0.7350 | 0.8049 | 0.8276 | 0.8458 | 0.8372 | 0.8730 | 0.8648 | 0.8421 | 0.8880 | 0.8791 | 0.8890 | 0.8759 | 0.8915 | 0.9102 | 0.9088 | 0.8982 | 0.9033 | 0.8990 |
 | Margin | 0.6302 | 0.6377 | 0.8462 | 0.8706 | 0.8717 | 0.9199 | 0.8950 | 0.9058 | 0.9208 | 0.9022 | 0.9116 | 0.9139 | 0.9040 | 0.8968 | 0.9199 | 0.9036 | 0.9235 | 0.9167 | 0.9330 | 0.9149 |
 | BADGE | 0.6054 | 0.7556 | 0.8123 | 0.8405 | 0.8404 | 0.9099 | 0.8905 | 0.8813 | 0.9019 | 0.9175 | 0.9156 | 0.9191 | 0.9078 | 0.9104 | 0.9032 | 0.9174 | 0.9263 | 0.9124 | 0.9214 | 0.9153 |
@@ -802,11 +876,9 @@ historical measurement, never as a runnable sampler.
 | Random | 0.9335 | 0.8494 | -0.7355 | 0.2771 | 0.8919 | 69.0 | 0.0044 |
 | Coreset | 0.6884 | 0.0091 | 13.6785 | 1.8789 | 0.6493 | 132.6 | 0.0237 |
 | UHerding | | | | | | | |
-| TCM | 0.9119 | 0.7569 | -0.3516 | 0.4476 | 0.8731 | 83.1 | 0.0049 |
 | REFINE | 0.9474 | 0.8171 | -0.5611 | 0.2514 | 0.8866 | 97.8 | 0.0077 |
 | TypiClust | 0.9046 | 0.6823 | 0.8253 | 0.6194 | 0.8837 | 56.4 | 0.0116 |
 | ActiveFT | 0.9348 | 0.8714 | -0.9424 | 0.1895 | 0.8827 | 69.6 | 0.0086 |
-| DropQuery | 0.9088 | 0.0087 | 13.7856 | 2.0158 | 0.8881 | 51.9 | 0.0089 |
 | Entropy | 0.9094 | 0.5289 | 1.1834 | 0.6050 | 0.8505 | 129.1 | 0.0123 |
 | Margin | 0.9314 | 0.0055 | 6.4602 | 2.6047 | 0.8837 | 91.7 | 0.0234 |
 | BADGE | 0.9224 | 0.7297 | -0.3341 | 0.4926 | 0.8822 | 87.1 | 0.0110 |

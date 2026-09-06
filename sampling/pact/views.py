@@ -1,4 +1,4 @@
-"""The two feature views SCALPEL selects on.
+"""The two feature views PACT selects on.
 
 Both are returned L2-normalized, because `sampling.kernels` reads a dot product
 AS a cosine and a non-unit row silently flattens the coverage kernel.

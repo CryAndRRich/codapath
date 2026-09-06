@@ -4,7 +4,7 @@
 histopathology tiles carry diagnostic information in their color (stain
 intensity correlates with tissue state), and this project has already lost a
 method to a stain-shortcut failure from exactly this kind of augmentation
-(see CLAUDE.md's deleted-methods note: "the stain-shortcut SCALPEL v9").
+(see CLAUDE.md's deleted-methods note: "the stain-shortcut PACT v9").
 Flip and 90-degree rotation are label-preserving for a tile with no fixed
 orientation (a patch of tissue does not have an "up"), so they add
 positional invariance without touching color statistics at all.

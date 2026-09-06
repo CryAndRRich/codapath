@@ -75,14 +75,10 @@ samplers:
     probe_lr: 0.001
     chunk_size: 2000   
 
-  tcm:
-    probe_epochs: 50
-    probe_lr: 0.001
-    k_nn: 20
-    chunk_size: 5000
-    transition_class_multiple: 3   # paper: 3 TypiClust steps before switching to Margin (Tiny/Low regime)
-    step_class_multiple: 1         # paper: step size = initial sample size = number of classes
-
+  # Not a runnable baseline (no entry in sampling/specs.py). These settings
+  # exist because refine's candidate-generation ensemble calls dropquery by
+  # name through the registry, and it needs the same hyperparameters the
+  # official refine config gives it.
   dropquery:
     probe_epochs: 50
     probe_lr: 0.001
@@ -105,8 +101,8 @@ samplers:
     chunk_size: 2000           # stage-2 UncertaintyHerding coverage chunk
 
   # The project's own method: Uncertainty Herding's objective with the weight
-  # replaced by visual/cell disagreement. See sampling/scalpel/.
-  scalpel:
+  # replaced by visual/cell disagreement. See sampling/pact/.
+  pact:
     uncertainty_mode: "disagreement"   # disagreement | visual_margin (ablation: plain UHerding weight)
     cell_source: "cellvit_embedding"   # cellvit_embedding | crop_dino (which cache field to read)
     cell_pooling: "mean"               # mean | rff | moments — how per-cell embeddings become one vector
@@ -128,12 +124,12 @@ samplers:
     # 150-200. A floor at 0.0654 leaves room for the shrink to continue.
     sigma_floor_ratio: 0.10
     # Ceiling for the ECE temperature search, tighter than the paper grid's
-    # 19.9. SCALPEL compares TWO probes, and dividing both by a large T
+    # 19.9. PACT compares TWO probes, and dividing both by a large T
     # flattens each softmax toward uniform -- two near-uniform distributions
     # cannot disagree. Measured retention of the Jensen-Shannon signal:
     # 100% at T=1, 9.9% at T=5, 0.7% at T=19.9. A real histoset run logged
     # `tau=19.9/19.9 js=0.0001`. The Uncertainty Herding and REFINE
-    # baselines keep the full paper grid; only scalpel caps.
+    # baselines keep the full paper grid; only pact caps.
     max_temperature: 5.0
     probe_epochs: 100                  # matches training.probe_epochs (the evaluation probe) so
                                        # selection and final training share one budget. Every loop
@@ -145,7 +141,7 @@ samplers:
     # Semi-supervised coupling on the UNLABELED pool, masked to the region
     # both probes already call confidently (top pool_confidence_quantile of
     # each head's own confidence). The mask is what keeps it from fighting
-    # acquisition: the contested region -- exactly what scalpel ranks on --
+    # acquisition: the contested region -- exactly what pact ranks on --
     # is excluded from the loss. 0 disables the term entirely.
     # Watch `pool_mask_fraction` in the trace: 0 means the gate never opened
     # and the run is the baseline under another filename.

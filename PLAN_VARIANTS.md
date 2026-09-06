@@ -83,7 +83,7 @@ khác nhau, mỗi câu hỏi một bảng riêng.
 | Linear head đánh giá | DINOv2 | **CONCH** |
 | Vòng 1 | `U ≡ 1` (coverage thuần) | text embedding từ LLM description |
 | Training | linear probe | linear + LoRA + center loss (+ augment) |
-| Chạy cho | **11 baseline** + scalpel | chỉ pipeline đầy đủ |
+| Chạy cho | **9 baseline** + PACT | chỉ pipeline đầy đủ |
 | Trả lời | "sampler nào chọn mẫu tốt hơn" | "pipeline đầy đủ có hơn DINO+linear không" |
 
 **Quy tắc một encoder xuyên suốt:** vòng 1 dùng encoder nào thì dùng encoder đó
@@ -173,8 +173,8 @@ viết bài và lúc set transform:
   release adapter.
 - HF yêu cầu email cơ quan là email **chính** của account, không nhận gmail.
 - **448×448, OpenAI-CLIP normalize, tokenizer riêng, hai không gian embedding.**
-  Đã đọc code + paper, chi tiết đầy đủ ở `references/CONCH.md` và
-  `PLAN_IMPLEMENT.md` §10. Tóm tắt: dùng `preprocess` do
+  Đã đọc code + paper, chi tiết đầy đủ ở `references/CONCH.md`.
+  Tóm tắt: dùng `preprocess` do
   `create_model_from_pretrained` trả về, đừng tự viết transform.
 
 Các model ungated còn lại giữ trong bảng làm phương án thay thế nếu CONCH gặp
@@ -212,24 +212,24 @@ không σ) và kết hợp bằng `(1−α)·coverage + α·U` — cộng, khôn
 **τ: dùng `model.logit_scale.exp()` đã học** (ĐÃ CHỐT), không hard-code. Đó là
 cách code chính thức của CONCH tính, và checkpoint mang giá trị đã train.
 
-Trục phụ `description_style` — nay có thêm một baseline **bắt buộc**:
+Trục phụ `description_style` — hai option, cả hai do LLM sinh:
 
 | Option | Nguồn |
 |---|---|
-| `manual` | 1 câu viết tay trong `config.yaml` |
-| **`conch_official`** | 22 template × 4–5 classname/lớp, tác giả CONCH tinh chỉnh cho **đúng** NCT-CRC-HE-100K = 9 lớp PathMNIST |
-| `llm_short` / `llm_morphology` | LLM sinh |
+| `llm_short` | 1 câu dày thông tin / lớp |
+| `llm_morphology` | 2–4 câu về hình thái tế bào |
 
-`conch_official` là đối thủ mạnh nhất và **phải** có trong bảng: contribution
-"LLM làm giàu nhãn" chỉ có giá trị nếu thắng được prompt do người viết. Cách
-ensemble phải theo đúng bản gốc — normalize **từng** (classname × template), mean
-cả hai chiều, rồi normalize lại. Chỉ PathMNIST có file này; HistoSet/SkinTissue
-không có.
+`DESCRIPTION_STYLES` trong `extract_vlm_features.ipynb` là một LIST: image
+feature không phụ thuộc prompt, nên một lần extract phục vụ mọi style và thêm
+một style chỉ tốn 14 chuỗi qua text tower.
 
-Hai chi tiết đã kiểm bằng file thật (`PLAN_IMPLEMENT.md` §4.3): nội dung JSON
-**lồng dưới khoá `"0"`**, và thứ tự 9 lớp của nó **khớp 1-1** với thứ tự
-`datasets.pathmnist.descriptions` trong `config.yaml`, nên so với nhãn số của
-PathMNIST không cần bảng ánh xạ.
+**Đã bỏ (2026-09-03):** `manual` (câu viết tay trong `config.yaml`) và
+`conch_official` (22 template × 4–5 classname của tác giả CONCH cho
+NCT-CRC-HE-100K). `conch_official` từng được dự tính làm baseline so sánh với
+con số ~0.79 của paper, nhưng chỉ dùng được cho PathMNIST (9 lớp của nó là của
+CRC100K), và khi zero-shot chuyển từ *gate* sang *báo cáo* thì không còn ai
+tiêu thụ phép so sánh đó. Control yếu nhất giờ là fallback tên lớp trong
+`extract_vlm_features.ipynb`.
 
 ---
 
@@ -237,6 +237,11 @@ PathMNIST không cần bảng ánh xạ.
 
 Vòng 1 `U ≡ 1`, objective thành MaxHerding thuần. Lúc này chỉ cần **một model
 encode ảnh**, không cần text tower.
+
+Đây là nhánh `USE_TEXT=False`. Với `USE_TEXT=True` (chỉ chạy được khi
+`IMAGE_ENCODER="conch"`), vòng 1 lấy trọng số từ margin của phân bố zero-shot
+ảnh–text thay vì `U ≡ 1` — xem contribution #1 trong `CLAUDE.md`. Bảng backbone
+dưới đây áp cho nhánh không text.
 
 | Option (`visual_backbone`) | HF repo | dim | Ghi chú |
 |---|---|---|---|
@@ -248,7 +253,7 @@ encode ảnh**, không cần text tower.
 
 Lưu ý: đổi backbone là đổi không gian feature ⇒ **không so trực tiếp** với bảng
 đang có. Muốn claim "backbone pathology tốt hơn DINOv2" thì phải chạy lại **tất
-cả** sampler trên backbone mới, không chỉ scalpel.
+cả** sampler trên backbone mới, không chỉ PACT.
 
 Trục feature lấy ra từ backbone (`visual_pool`): `cls` (đang dùng) /
 `mean_patch` / `cls + mean_patch` nối lại (nhớ normalize từng nửa).

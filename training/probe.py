@@ -5,7 +5,7 @@ the same single-layer probe on the same frozen backbone, so a difference in
 accuracy can only come from which samples were selected.
 
 `train_dual_probe` fits the visual and cell probes together. It exists because
-`scalpel` needs both heads in the same round to measure how much they disagree,
+`pact` needs both heads in the same round to measure how much they disagree,
 and because an optional consistency term couples them during training.
 """
 
@@ -228,15 +228,15 @@ def train_dual_probe(
     A labeled-slice version (`consistency_weight`) existed here and was
     removed: it coupled the heads on the very rows they were already fitting,
     measured as doing almost nothing below weight ~5, and unlike the pool term
-    it had no mask keeping it off `scalpel`'s acquisition signal.
+    it had no mask keeping it off `pact`'s acquisition signal.
 
     It is deliberately restricted to points where BOTH probes are already
     confident. That restriction is what keeps it from cannibalising
-    acquisition: the pool-wide `JS(visual, cell)` IS `scalpel`'s per-point
+    acquisition: the pool-wide `JS(visual, cell)` IS `pact`'s per-point
     weight, so an unmasked pool consistency term would directly minimise the
     very quantity the sampler ranks on. Masking to the confident region means
     the term only sharpens agreement where the two views already agree, and
-    leaves the contested region -- exactly the region `scalpel` wants to
+    leaves the contested region -- exactly the region `pact` wants to
     sample -- untouched. This is the standard confidence-thresholded
     consistency of semi-supervised learning (FixMatch and relatives), used
     here for the same reason.

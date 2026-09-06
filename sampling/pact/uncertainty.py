@@ -1,7 +1,7 @@
-"""SCALPEL's per-round acquisition weight.
+"""PACT's per-round acquisition weight.
 
 Uncertainty Herding weights each pool point by how close the classifier is to
-a decision boundary there (`1 - margin`). SCALPEL replaces that weight with how
+a decision boundary there (`1 - margin`). PACT replaces that weight with how
 much two views of the same patch DISAGREE: a probe on full-image DINOv2
 features and a probe on pooled CellViT cell embeddings. A patch both heads read
 the same way is not informative even when neither is confident; a patch where
@@ -40,7 +40,7 @@ UNCERTAINTY_MODES = ("disagreement", "visual_margin")
 # Ceiling for the temperature search, tighter than the paper grid's 19.9.
 #
 # Uncertainty Herding calibrates ONE probe, where a large temperature merely
-# flattens a single confidence. SCALPEL compares TWO, and dividing both by a
+# flattens a single confidence. PACT compares TWO, and dividing both by a
 # large T pushes each softmax toward uniform -- and two near-uniform
 # distributions cannot disagree. Measured on 14-class logits from two
 # genuinely different probes, the mean Jensen-Shannon divergence retained is:
@@ -323,9 +323,19 @@ def text_prior_weights(
     probabilities under different temperatures. Pass the model's own learned
     `logit_scale.exp()` when it is known; the default 1.0 is the raw cosine.
 
-    Both arrays must be L2-normalized per row -- `image @ text.T` is read AS a
-    cosine, the same contract `sampling/kernels.py` documents. Raising here is
-    cheaper than a silently wrong weight.
+    `image @ text.T` is read AS a cosine, the same contract
+    `sampling/kernels.py` documents, so both sides must be unit rows. The two
+    sides are handled DIFFERENTLY on purpose:
+
+    * text prototypes are CHECKED and a non-unit row raises. They are 14-ish
+      vectors written once by the extraction notebook; a wrong norm there is a
+      bug in that notebook, and it measurably shifts the ranking (~1.5% of
+      predictions move), so failing loudly is right.
+    * image rows are NORMALIZED here rather than checked. A caller may hand in
+      RAW_SPACE features, which are not unit by construction, and rescaling a
+      whole image row is uniform across classes -- it cannot change that row's
+      argmax or its top-2 gap. Rejecting them would force every caller to
+      duplicate this one line.
     """
     image_embeddings = np.asarray(image_embeddings, dtype=np.float32)
     text_prototypes = np.asarray(text_prototypes, dtype=np.float32)

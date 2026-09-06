@@ -1,4 +1,4 @@
-"""Temperature scaling used by Uncertainty Herding and by `scalpel`.
+"""Temperature scaling used by Uncertainty Herding and by `pact`.
 
 Raw probe logits from a few dozen labels are badly over-confident, so a margin
 read off them is not comparable across rounds. Uncertainty Herding's Sec. 3.2
@@ -6,8 +6,8 @@ read off them is not comparable across rounds. Uncertainty Herding's Sec. 3.2
 minimise Expected Calibration Error on a held-out slice of the labeled set.
 
 Shared here rather than duplicated: `baselines.uncertainty_herding`,
-`baselines.refine` (its stage-2 head is Uncertainty Herding) and `scalpel` all
-need the same procedure, and `scalpel` calibrates each of its two probes.
+`baselines.refine` (its stage-2 head is Uncertainty Herding) and `pact` all
+need the same procedure, and `pact` calibrates each of its two probes.
 """
 
 from typing import List, Sequence
@@ -69,14 +69,14 @@ def calibrate_temperature(
 
     `max_temperature` truncates the grid. The default is None -- the full
     paper grid, which the Uncertainty Herding and REFINE baselines must keep
-    to stay faithful. `scalpel` passes a cap, because a temperature at the
+    to stay faithful. `pact` passes a cap, because a temperature at the
     grid's ceiling is destructive there in a way it is not for a single-probe
     method: dividing BOTH probes' logits by ~20 flattens each softmax toward
     uniform, and two near-uniform distributions cannot disagree. Measured on
     14-class logits, mean Jensen-Shannon divergence between two genuinely
     different probes falls 0.349 -> 0.0023 (150x) as T goes 1.0 -> 19.9,
     which is exactly the `tau=19.9/19.9 js=0.0001` seen in a real histoset
-    run: the disagreement signal -- the whole of what SCALPEL adds over
+    run: the disagreement signal -- the whole of what PACT adds over
     Uncertainty Herding -- was annihilated by its own calibration step.
 
     A ceiling temperature is also weak evidence to begin with at these

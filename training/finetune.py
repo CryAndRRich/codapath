@@ -6,7 +6,7 @@ fine-tunes the backbone on just those points and re-evaluates.
 
 **Every axis here is final-training only -- none of them changes what gets
 selected.** `AUGMENT` used to be the exception: `make_augmented_feature_provider`
-(below) was handed to `sampling/scalpel` so the per-round uncertainty probe
+(below) was handed to `sampling/pact` so the per-round uncertainty probe
 trained on augmented pixels. That was removed after measuring it on histoset
 seed 42: it changed the SELECTED SET, with only ~55% of points overlapping
 the un-augmented run at every budget. The cause is structural, not a bug --
@@ -529,7 +529,13 @@ def finetune_and_evaluate(
             )
     else:
         eval_features = test_features
-    predictions = np.argmax(probe.predict_proba(eval_features, device), axis=1)
+    # Kept and returned, not just consumed: `main.py` writes the saved
+    # `_predictions_budget_*.pt` from this. Recomputing it there from the
+    # frozen `test_features` cache would score a LoRA probe in a feature space
+    # it was never trained on -- the same trap this function's own
+    # `test_dataset` requirement exists to close, reopened one caller away.
+    probabilities = probe.predict_proba(eval_features, device)
+    predictions = np.argmax(probabilities, axis=1)
     from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
     metrics = {
@@ -537,6 +543,7 @@ def finetune_and_evaluate(
         "precision": float(precision_score(test_labels, predictions, average="macro", zero_division=0)),
         "recall": float(recall_score(test_labels, predictions, average="macro", zero_division=0)),
         "f1": float(f1_score(test_labels, predictions, average="macro", zero_division=0)),
+        "probabilities": probabilities,
     }
     return probe, metrics
 
@@ -606,10 +613,10 @@ def make_augmented_feature_provider(
 ):
     """Return `provider(indices) -> np.ndarray` of freshly-augmented features.
 
-    **No longer used for SELECTION.** It once fed `sampling/scalpel` an opaque
+    **No longer used for SELECTION.** It once fed `sampling/pact` an opaque
     callable so the per-round uncertainty probe trained on augmented pixels;
     that path is gone (see the module docstring for the measurement that
-    removed it). `sampling/scalpel/uncertainty.py` still accepts an
+    removed it). `sampling/pact/uncertainty.py` still accepts an
     `augmented_feature_provider` and its tests still cover that branch, but
     `main.run` never passes one -- augmentation is a final-training axis.
 
@@ -627,7 +634,7 @@ def make_augmented_feature_provider(
     train-with-augmentation/infer-without arrangement. Inside the AL loop it
     was not, because two things could not follow:
 
-    * `sampling/scalpel`'s CELL probe cannot be augmented at all -- CellViT
+    * `sampling/pact`'s CELL probe cannot be augmented at all -- CellViT
       embeddings come from a cache with no pixels behind them, so
       `uncertainty_mode="disagreement"` compared an augmented visual probe
       against an un-augmented cell probe and read the difference as

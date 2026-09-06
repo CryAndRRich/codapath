@@ -1,7 +1,7 @@
 """Single entry point: run one sampler over a budget sweep and score it.
 
 Usage:
-    python main.py --dataset pathmnist --sampler scalpel
+    python main.py --dataset pathmnist --sampler pact
 
 Every sampler is compared under the same protocol — same frozen DINOv2
 features, same linear probe, same test metrics — so a difference in accuracy
@@ -112,7 +112,7 @@ def _default_run_name(
     `encoder` and `use_text` default to the values every run had before
     `features/vlm.py` existed, so a caller that does not pass them gets
     EXACTLY the old name back (`test_default_run_name_is_unchanged`) --
-    every already-published baseline/scalpel run stays resumable and
+    every already-published baseline/pact run stays resumable and
     unorphaned.
 
     Without these two params in the signature at all, a DINOv2 run and a
@@ -134,7 +134,7 @@ def _default_run_name(
     check ("does `<name>_results.pt` exist") would skip the second entirely.
     """
     parts = [sampler_name]
-    if sampler_name == "scalpel":
+    if sampler_name == "pact":
         parts.append(sampler_cfg.get("uncertainty_mode", "disagreement"))
         pooling = sampler_cfg.get("cell_pooling", "mean")
         if pooling != "mean":
@@ -228,7 +228,7 @@ def _load_cell_view(
         # exactly which DINOv2 checkpoint. Any run whose own visual_backbone
         # is not that same checkpoint -- including every CONCH run, whose
         # `visual_backbone` is a CONCH model id -- would be mixing a CONCH
-        # image space with a DINOv2 cell space, which `sampling/scalpel`
+        # image space with a DINOv2 cell space, which `sampling/pact`
         # assumes are the same space.
         raise ValueError(
             f"cell_source='crop_dino' was extracted with DINOv2 backbone "
@@ -362,7 +362,7 @@ def run(
     """
     `image_encoder` ("dinov2" | "conch") decides the ONE feature space every
     stage of this run uses -- the coverage kernel, the disagreement probes
-    inside `scalpel`, and the final evaluation probe -- because a run mixing
+    inside `pact`, and the final evaluation probe -- because a run mixing
     encoders across stages is not a comparable protocol
     `"conch"` reads `RAW_SPACE` (proj_contrast=False,
     normalize=False) from `features/vlm.py::get_or_extract_vlm_features`, never
@@ -545,9 +545,9 @@ def run(
         #
         # The text prior below is deliberately NOT in `spec.needs`: that field
         # lists arrays a sampler ALWAYS requires, and drives whether a cache is
-        # loaded at all. `use_text` is optional per run -- the same `scalpel`
+        # loaded at all. `use_text` is optional per run -- the same `pact`
         # runs with or without it -- so declaring it there would make every
-        # scalpel run demand a VLM cache, including the DINOv2 ones that have
+        # pact run demand a VLM cache, including the DINOv2 ones that have
         # no text tower to read.
         selection_features = train_features
         sampler_inputs: Dict[str, object] = {}
@@ -555,7 +555,7 @@ def run(
 
         # Contribution #1: the round-1 cold start.
         #
-        # Round 1 has no labels, so `scalpel`'s two probes cannot exist and the
+        # Round 1 has no labels, so `pact`'s two probes cannot exist and the
         # round falls back to pure coverage. A VLM's text tower scores every
         # patch against one prototype per class WITHOUT a label, and the margin
         # of that zero-shot distribution is the same "near a decision boundary"
@@ -819,6 +819,9 @@ def run(
                     ft_metrics["acc"], ft_metrics["precision"],
                     ft_metrics["recall"], ft_metrics["f1"],
                 )
+                # Scored in whatever space the probe was trained in -- for a
+                # LoRA run that is the ADAPTED encoder, not the frozen cache.
+                test_probabilities = ft_metrics["probabilities"]
             else:
                 probe = train_probe(
                     labeled_features, labeled_labels, num_classes, probe_epochs, probe_lr, device
@@ -826,6 +829,9 @@ def run(
                 accuracy, precision, recall, f1 = evaluate_probe(
                     probe, test_features, test_labels, device
                 )
+                # The frozen path trains and scores in the cache's own space,
+                # so the cache IS the right feature matrix here.
+                test_probabilities = probe.predict_proba(test_features, device)
             results[budget] = {
                 "acc": accuracy, "precision": precision, "recall": recall, "f1": f1,
                 "selection_seconds": selection_seconds,
@@ -865,12 +871,20 @@ def run(
             # Test-set predictions are what a confusion matrix or a per-class
             # error plot needs, and re-deriving them means re-running the
             # backbone over the whole test set.
+            #
+            # `test_probabilities` comes from the branch above rather than
+            # being recomputed here, because the two branches score in
+            # DIFFERENT feature spaces: a LoRA run's probe reads the adapted
+            # encoder's output, and `test_features` is the frozen cache. Both
+            # are 768-d, so recomputing here raised no error -- it silently
+            # wrote probabilities from the wrong encoder, disagreeing with
+            # this run's own reported accuracy by up to 0.37.
             _save(
                 os.path.join(save_dir, f"{output_name}_predictions_budget_{budget}.pt"),
                 {
                     "run_name": output_name,
                     "budget": budget,
-                    "probabilities": probe.predict_proba(test_features, device),
+                    "probabilities": test_probabilities,
                     "test_labels": np.asarray(test_labels),
                     "class_names": list(class_names),
                     "test_fingerprint": test_fingerprint,

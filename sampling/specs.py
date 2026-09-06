@@ -14,7 +14,9 @@ budget B. True means: running once at max(budgets) and taking the first B
 picks yields exactly what running directly at B would have produced, so the
 sweep can share one run. False means every budget needs its own run.
 
-The two are genuinely orthogonal. `tcm` is multi-round yet prefix-exact.
+The two are genuinely orthogonal, and must stay separate fields even though
+no CURRENT sampler is multi-round-and-prefix-exact: `tcm` was that case and
+has been removed, so the combination is unpopulated rather than impossible.
 `typiclust` and `activeft` are single-pass yet NOT prefix-exact, because their
 one pass reads B directly (`typiclust` sets `num_clusters` from it, `activeft`
 parameterises the optimisation by it), so a large-B run is not a superset of a
@@ -62,25 +64,17 @@ SAMPLER_SPECS: Dict[str, SamplerSpec] = {
     "activeft": SamplerSpec(
         "single", False, why="optimises a parameterisation defined by B",
     ),
-    # --- multi round, prefix-exact ---
-    "tcm": SamplerSpec(
-        "multi", True, prefix_exact_min_class_multiple=3,
-        why="TypiClust->Margin transition sits at 3*num_classes and the Margin "
-            "step at num_classes, both independent of B; below 3*num_classes "
-            "the transition clamps to B and changes the clustering itself",
-    ),
     # --- multi round, NOT prefix-exact: each budget needs its own run ---
     "margin": SamplerSpec("multi", False, why="probe is retrained per round"),
     "entropy": SamplerSpec("multi", False, why="probe is retrained per round"),
     "badge": SamplerSpec("multi", False, why="gradient embeddings follow the probe"),
-    "dropquery": SamplerSpec("multi", False, why="candidate threshold is scaled by B"),
     "uncertainty_herding": SamplerSpec(
         "multi", False, why="coverage/uncertainty phase switch sits at 0.2*B",
     ),
     "refine": SamplerSpec(
         "multi", False, why="stage-2 head is Uncertainty Herding, same 0.2*B switch",
     ),
-    "scalpel": SamplerSpec(
+    "pact": SamplerSpec(
         "multi", False, needs=("cell_embeddings", "cell_reliability"),
         why="probes are retrained and sigma re-adapts every round",
     ),
@@ -90,7 +84,7 @@ SAMPLER_SPECS: Dict[str, SamplerSpec] = {
 # it can run from the DINOv2 visual cache alone. Derived rather than hand-listed
 # a second time, so it cannot drift out of sync with SAMPLER_SPECS itself.
 BASELINE_SAMPLERS = frozenset(
-    name for name in SAMPLER_SPECS if name != "scalpel"
+    name for name in SAMPLER_SPECS if name != "pact"
 )
 
 

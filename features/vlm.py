@@ -8,7 +8,7 @@ actual model code, not from the README or the paper's prose alone.
 `CoCa.encode_image`):
 
     encode_image(x, proj_contrast=False, normalize=False)   512-d, pre-projection
-        -> linear probe, coverage kernel, everything scalpel's disagreement
+        -> linear probe, coverage kernel, everything pact's disagreement
            machinery reads
     encode_image(x, proj_contrast=True,  normalize=True)    512-d, projected + L2-normed
         -> comparing an image against text (the round-1 cold-start prior)

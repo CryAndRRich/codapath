@@ -1,4 +1,4 @@
-"""SCALPEL — Uncertainty Herding driven by visual/cell disagreement.
+"""PACT — Uncertainty Herding driven by visual/cell disagreement.
 
 One objective, evaluated the same way in every round, is Uncertainty Herding's
 weighted facility location on the DINOv2 space that the evaluation probe also
@@ -52,8 +52,8 @@ from .uncertainty import (
 from .views import build_cell_view, normalize_rows
 
 
-@register_sampler("scalpel")
-def scalpel_sampling(**kwargs) -> List[int]:
+@register_sampler("pact")
+def pact_sampling(**kwargs) -> List[int]:
     visual_raw = np.asarray(kwargs["image_embeddings"], dtype=np.float32)
     cell_raw = np.asarray(kwargs["cell_embeddings"], dtype=np.float32)
     reliability = np.clip(np.asarray(kwargs["cell_reliability"], dtype=np.float32), 0.0, 1.0)
@@ -121,7 +121,7 @@ def scalpel_sampling(**kwargs) -> List[int]:
     unknown = sorted(set(kwargs) - _KNOWN)
     if unknown:
         raise TypeError(
-            f"scalpel_sampling got unknown config key(s): {unknown}. "
+            f"pact_sampling got unknown config key(s): {unknown}. "
             "If one was removed from the code, delete it from config.yaml / "
             "OVERRIDES too rather than leaving it to be ignored."
         )
@@ -221,7 +221,7 @@ def scalpel_sampling(**kwargs) -> List[int]:
         coverage = running_max_coverage(coverage_features, selected, sigma, chunk_size)
         picks = greedy_weighted_coverage(
             coverage_features, weights, coverage, sigma, n_select, selected_set, chunk_size,
-            trace=trace, desc=f"scalpel b={budget} r={round_index}",
+            trace=trace, desc=f"pact b={budget} r={round_index}",
         )
         selected.extend(picks)
         elapsed = time.time() - started
@@ -248,7 +248,7 @@ def scalpel_sampling(**kwargs) -> List[int]:
         if diag:
             disagreement = diagnostics["mean_disagreement"]
             print(
-                f"[scalpel b={budget} r={round_index}] picked={len(picks)} "
+                f"[pact b={budget} r={round_index}] picked={len(picks)} "
                 f"in {format_duration(elapsed)} | mode={uncertainty_mode} "
                 f"sigma={sigma:.4f} missing={missing_fraction:.3f} "
                 f"tau={diagnostics['tau_visual']:.1f}/{diagnostics['tau_cell']:.1f} "

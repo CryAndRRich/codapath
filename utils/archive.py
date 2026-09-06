@@ -76,7 +76,7 @@ def main_archive_stem(
 
     Same shape as `results_archive_stem`, plus `encoder` -- the axis
     `results_archive_stem` never needed because every baseline runs on
-    DINOv2 only. A DINOv2 `scalpel` run and a CONCH `scalpel` run of the same
+    DINOv2 only. A DINOv2 `pact` run and a CONCH `pact` run of the same
     config are two different protocols (different feature space at every
     stage: coverage kernel, disagreement probes, evaluation probe --
     so they must not share an archive name. Only
@@ -88,7 +88,7 @@ def main_archive_stem(
     INSTEAD of `sampler` -- because that is the string that already encodes
     every variant axis of the run (cell_pooling, use_lora, aux_loss, augment,
     ...). Without it a 48-combination sweep produces 48 zips all called
-    `pathmnist_scalpel_seed42.zip`: each download overwrites the last in the
+    `pathmnist_pact_seed42.zip`: each download overwrites the last in the
     browser, and each Kaggle Dataset publish versions over the previous one.
     The `sampler` name is already a prefix of `run_name`, so passing it does
     not lose information -- it adds the axes that distinguish the runs.
@@ -96,7 +96,7 @@ def main_archive_stem(
     stem = f"{dataset}_{run_name or sampler}_seed{seed}"
     # `run_name` comes from `main._default_run_name`, which ALREADY appends the
     # encoder when it is not the default -- so appending it again here produced
-    # `..._scalpel_disagreement_conch_seed42_conch`. The suffix is only needed
+    # `..._pact_disagreement_conch_seed42_conch`. The suffix is only needed
     # when the caller passed a bare sampler name instead.
     suffix = encoder.replace("/", "_")
     if encoder != "dinov2" and not stem.endswith(f"_{suffix}_seed{seed}"):
