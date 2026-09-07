@@ -34,7 +34,18 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-__all__ = ["center_loss", "supcon_loss", "triplet_loss"]
+__all__ = ["center_loss", "supcon_loss", "triplet_loss", "NEEDS_SAME_CLASS_PAIR"]
+
+# Which losses are undefined on a batch whose classes are all singletons.
+# `supcon` and `triplet` compare an anchor against a POSITIVE, so a batch with
+# no same-class pair gives them nothing to compute; `center` measures distance
+# to a per-class mean, and a one-member class is simply its own mean.
+#
+# Declared here rather than in the caller so the fact lives next to the code it
+# describes: `training/finetune.py` widens the training batch to keep pairs
+# available, which is only worth its cost -- VRAM, quadratic in batch size on
+# a 448px encoder under LoRA -- for the losses named here.
+NEEDS_SAME_CLASS_PAIR = frozenset({"supcon", "triplet"})
 
 
 def center_loss(

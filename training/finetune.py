@@ -62,7 +62,12 @@ from torch.utils.data import DataLoader, Dataset
 
 from data.augment import build_augment_transform
 from data.loaders import RawRGBDataset, default_num_workers, default_transform
-from training.losses import center_loss, supcon_loss, triplet_loss
+from training.losses import (
+    NEEDS_SAME_CLASS_PAIR,
+    center_loss,
+    supcon_loss,
+    triplet_loss,
+)
 from training.probe import LinearProbe, _EarlyStopper, class_weights
 
 __all__ = [
@@ -382,7 +387,19 @@ def finetune_and_evaluate(
     batch_size = min(batch_size, len(dataset))
     min_tail = _min_tail_batch(num_classes)
     remainder = len(dataset) % batch_size
-    if 0 < remainder < min_tail and len(dataset) > batch_size:
+    # Only for the losses that actually need a same-class pair. Widening is not
+    # free: under LoRA the encoder keeps activations for backward, and at
+    # CONCH's 448x448 that is ~160 MiB per image, so growing 32 -> 50 adds
+    # ~2.8 GiB. Measured: budget 50 over 14 classes widens to exactly 50 (the
+    # whole labeled set in one batch) and died with `torch.OutOfMemoryError` at
+    # 14.37 of a T4's 14.56 GiB, while budget 25 (batch 25) ran fine -- the
+    # split that made this look like a budget-dependent mystery.
+    #
+    # `center` is unaffected by a thin batch by construction: a class with one
+    # member is its own mean, distance zero. So paying VRAM to widen for it
+    # bought nothing at all.
+    widen = aux_loss in NEEDS_SAME_CLASS_PAIR
+    if widen and 0 < remainder < min_tail and len(dataset) > batch_size:
         # Grow the batch until the split is even, or until one batch holds
         # everything (the full-batch case, which has no remainder at all).
         while batch_size < len(dataset):
