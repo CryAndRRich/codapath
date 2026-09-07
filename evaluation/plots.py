@@ -167,16 +167,20 @@ def plot_accuracy_curves(
     std_data: Optional[List[Dict[str, List[float]]]] = None,
     band_methods: Optional[List[str]] = None,
     panel_size: Tuple[float, float] = (5.0, 5.2),
-    linewidth: float = 1.4,
-    markersize: float = 6.0,
-    highlight_scale: float = 1.5,
+    linewidth: float = 1.2,
+    markersize: float = 4.0,
+    highlight_scale: float = 1.0,
 ) -> None:
     """Raw accuracy vs cumulative budget, one square-ish panel per dataset.
 
     Unlike plot_acc_diff (which plots the gap to random), this plots accuracy
     values directly so a method's rank is read off its vertical position, the
-    way AL papers usually show it. `highlight` is drawn thicker/on top so the
-    method under study stands out against the baseline cluster.
+    way AL papers usually show it. `highlight` is drawn on top (zorder) and at
+    full opacity so it reads clearly against the baseline cluster, but at the
+    default `highlight_scale=1.0` it is not drawn thicker or with bigger
+    markers than any other method -- the figure should show the method
+    winning on its own vertical position, not on line weight. Pass a
+    `highlight_scale` > 1 only if a specific figure genuinely needs it.
 
     `std_data` mirrors `acc_data` -- same list-of-dicts shape, same keys -- and
     holds the between-seed standard deviation of each point. When given, each
@@ -192,9 +196,9 @@ def plot_accuracy_curves(
     a rectangular layout. Note that a wide panel does not by itself separate
     curves bunched at the top: what compresses them is a weak baseline
     (coreset, entropy) dragging the shared y-axis down, which is a VERTICAL
-    problem. `linewidth`, `markersize` and `highlight_scale` (how much thicker
-    the highlighted method is drawn) are exposed for the same reason -- a heavy
-    line covers the very gaps the figure exists to show.
+    problem. `linewidth` and `markersize` set the SHARED size every method
+    (highlight included) is drawn at -- keep both small on a ten-method panel
+    or the markers themselves cover the gaps the figure exists to show.
     """
     _PALETTE = [
         "#d62728", "#7f7f7f", "#ff7f0e", "#2ca02c", "#17becf",

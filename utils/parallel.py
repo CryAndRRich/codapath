@@ -93,6 +93,7 @@ def run_variants_parallel(
     variants: Sequence[Tuple[str, Dict[str, Any]]],
     entry_point: Callable[..., Any],
     num_workers: Optional[int] = None,
+    abort_on_failure: bool = False,
 ) -> List[WorkerResult]:
     """Run `(label, kwargs)` variants across GPUs, returning one result each.
 
@@ -104,6 +105,15 @@ def run_variants_parallel(
     Failures are collected, not raised: one variant crashing must not lose the
     others' hours of GPU time. Every result is returned with its traceback so
     the caller can report and decide.
+
+    `abort_on_failure=True` inverts that trade, and exists for BUDGET SHARDS.
+    Independent variants are worth finishing individually, but two shards of a
+    single run are merged afterwards, so losing one makes the other's hours
+    worthless -- measured on a CONCH+LoRA run where shard1 died at 6.3 minutes
+    and shard0 kept going for 3.35 hours before the caller could assert. With
+    this set, the first failure terminates the surviving workers instead. Those
+    workers are killed mid-budget, so their results are reported as aborted
+    rather than successful: a partial sweep must never merge as if complete.
 
     Work is assigned round-robin up front, so a worker that finishes early does
     NOT steal from a slower one. That is a deliberate trade: static assignment
@@ -158,10 +168,37 @@ def run_variants_parallel(
     results: List[WorkerResult] = []
     # Collect before joining: a full result queue blocks the child at exit,
     # which would deadlock a join-first ordering.
+    aborted = False
     for _ in range(len(variants)):
-        results.append(result_queue.get())
+        result = result_queue.get()
+        results.append(result)
+        if abort_on_failure and not result["ok"]:
+            # Kill the peers now rather than paying for work whose only
+            # consumer is a merge that can no longer happen. `terminate` is
+            # the right blunt instrument here: the child owns a CUDA context
+            # and its own files, and there is no partial state worth draining.
+            print(f"[parallel] {result['label']} failed -- aborting the "
+                  "remaining shards; their partial sweeps cannot be merged")
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+            aborted = True
+            break
     for process in processes:
         process.join()
+
+    if aborted:
+        # Name every variant that never reported, so the caller's failure list
+        # is the whole truth. Without this the run looks like one failed shard
+        # and one that simply vanished.
+        reported = {result["label"] for result in results}
+        for label, _kwargs in variants:
+            if label not in reported:
+                results.append(WorkerResult(
+                    label=label, ok=False, seconds=0.0, device=-1,
+                    error="aborted: a peer shard of this run failed, so this "
+                          "shard was terminated before it could finish",
+                ))
 
     for result in results:
         status = "ok" if result["ok"] else "FAILED"
