@@ -16,12 +16,16 @@ global state, so a parallel run selects exactly what a serial run would.
 after any `torch.cuda` call) is undefined behaviour. Consequently the worker
 target must be importable and its arguments picklable, so the work is described
 by a plain dict of primitives and re-resolved inside the child.
+
+That same import is why placement does NOT go through `CUDA_VISIBLE_DEVICES`:
+unpickling the target imports its module, which imports torch, so anything the
+worker body sets afterwards is too late. Each worker instead names its card
+explicitly as `device_string="cuda:<index>"`. See `_worker`.
 """
 
 from __future__ import annotations
 
 import multiprocessing as _multiprocessing
-import os
 import traceback
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -65,14 +69,42 @@ def _worker(
     background feeder thread that the spawned child does not inherit, so its
     first `get()` can block forever.
 
-    A worker owns exactly one device for its whole life, so `CUDA_VISIBLE_DEVICES`
-    is pinned once before torch initialises. Inside the child, that device is
-    then always `cuda:0`.
+    A worker owns exactly one device for its whole life, and it says so with an
+    explicit `cuda:<index>` rather than through `CUDA_VISIBLE_DEVICES`.
+
+    **Why the environment variable is not used.** Setting it here is too late,
+    because `spawn` must unpickle `entry_point` before this function body
+    runs, and unpickling a function reference imports its module -- and
+    `main.py` does `import torch` at module level. Torch is
+    therefore already imported by the time any line here executes. That was
+    enough for both workers to end up on the SAME card on a real Kaggle T4 x2
+    run: the OOM named two processes on one 14.56 GiB device (4.12 GiB +
+    10.24 GiB), with byte-identical numbers across two separate runs.
+
+    Setting it anyway would be worse than not setting it: with the variable in
+    effect the child sees one card as index 0, so an explicit `cuda:1` would
+    point past the end of the visible devices. The two mechanisms cannot both
+    be half-applied -- this picks the one whose timing does not depend on when
+    torch was imported.
+
+    So the device index is passed to the work itself, as `device_string`, and
+    a variant that carries that key has it OVERWRITTEN with `cuda:<index>`.
+    Overwritten, not defaulted: both run notebooks pass a literal
+    `device_string="cuda:0"` in their base kwargs (correct back when
+    `CUDA_VISIBLE_DEVICES` made every worker's own card device 0), and
+    honouring it is exactly how both shards landed on card 0. The worker is
+    the only party that knows which card it owns, so it wins.
+
+    Only rewritten when the key is already there: `entry_point` is any
+    callable, and several (the CellViT shard worker, this module's own tests)
+    take no such parameter -- injecting it unconditionally makes them raise
+    `TypeError` before doing any work.
     """
     import time
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
     for label, kwargs in assigned:
+        if "device_string" in kwargs:
+            kwargs = dict(kwargs, device_string=f"cuda:{device_index}")
         started = time.time()
         try:
             entry_point(**kwargs)
@@ -118,7 +150,7 @@ def run_variants_parallel(
     Work is assigned round-robin up front, so a worker that finishes early does
     NOT steal from a slower one. That is a deliberate trade: static assignment
     keeps one process pinned to one device for its whole life, which is what
-    makes `CUDA_VISIBLE_DEVICES` reliable. Order the variants so that expensive
+    makes the explicit per-worker device index correct. Order so that expensive
     ones alternate (`refine` then `random`, not both `refine` first) if the
     imbalance matters.
     """
@@ -127,8 +159,8 @@ def run_variants_parallel(
     for label, kwargs in variants:
         if "device" in kwargs:
             raise ValueError(
-                f"Variant {label!r} passes an explicit `device`. The worker pins "
-                "one GPU per process and supplies 'cuda:0' itself; passing a "
+                f"Variant {label!r} passes an explicit `device`. The worker owns "
+                "one GPU per process and supplies its own `device_string`; passing a "
                 "device here would send both workers to the same card."
             )
 
