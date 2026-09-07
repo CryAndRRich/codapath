@@ -197,15 +197,16 @@ def pact_sampling(**kwargs) -> List[int]:
             # The no-weight ablation: keep the round's sigma update (coverage
             # still tightens as labels arrive) but leave U=1, so no probe is
             # trained and the objective stays pure MaxHerding throughout.
-            # The dict must carry the same keys round_weights returns -- the
-            # trace and the round log below read them unconditionally.
             sigma = max(labeled_min_sigma(coverage_features, selected, sigma), sigma_floor)
             weights_np = None
+            # Exactly the keys round_weights returns -- the trace and the round
+            # log below read them unconditionally. `weight_uniform_by_design`
+            # must NOT be here: add_round takes it as its own argument, so a
+            # copy in this dict collides with it when **diagnostics expands.
             diagnostics = {
                 "tau_visual": 1.0, "tau_cell": 1.0,
                 "mean_disagreement": float("nan"), "tau_at_cap": 0.0,
                 "pool_mask_fraction": float("nan"),
-                "weight_uniform_by_design": 1.0,
             }
         else:
             sigma = max(labeled_min_sigma(coverage_features, selected, sigma), sigma_floor)
