@@ -14,6 +14,27 @@ files, per the naming convention `features/visual.py` and
 `scripts/extract_cellvit_features.py` actually use. Nothing here changes that
 convention; it only searches for it.
 
+`find_dir_containing` matches a fixed multi-segment path (e.g.
+`"pathmnist_seed42/manifest.json"`) under some number of unknown leading
+directories -- it does not care how deep the file is, but it does require
+that exact trailing segment sequence. `find_visual_cache`/`find_vlm_cache`
+rely on this safely because their cache files are self-naming
+(`pathmnist_seed42_facebook_dinov2-base_train.npy` already encodes dataset and
+seed in the FILENAME, independent of whatever directories it sits under).
+`find_cellvit_cache` cannot: its cache is a bare `manifest.json` inside a
+directory conventionally named `{dataset}_seed{seed}`, so if someone
+re-uploads that cache with the dataset and seed split across two directory
+levels instead (`pathmnist/seed42/manifest.json`), no `find_dir_containing`
+depth search recovers it -- the trailing segment `pathmnist_seed42` simply
+does not exist on disk as one name. `find_cellvit_cache` therefore does not
+use `find_dir_containing` at all: it globs for every `manifest.json` under the
+search roots (arbitrarily deep, directory names ignored entirely) and reads
+`dataset`/`seed` back out of each manifest's own JSON content, which
+`scripts/extract_cellvit_features.py` always writes. This is strictly more
+reliable than inferring dataset/seed from path segments, since it cannot be
+fooled by a re-upload that changes directory layout without touching what the
+manifest itself says.
+
 This module is the READ side only. Archive WRITING lives in `utils/archive.py`
 instead: every publishing notebook (both extraction notebooks,
 `run_al_baseline.ipynb`, `run_al_main.ipynb`, `extract_vlm_features.ipynb`)
@@ -25,6 +46,7 @@ thing left for the Output tab to show. `kaggle.py` is the READ side,
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import List, Optional, Sequence
 
@@ -150,6 +172,53 @@ def find_vlm_cache(
 
 
 def find_cellvit_cache(dataset: str, seed: int, hint: Optional[str] = None) -> Optional[Path]:
-    """Directory containing `{dataset}_seed{seed}/manifest.json` -- the layout
-    `scripts/extract_cellvit_features.py` writes."""
-    return find_dir_containing(f"{dataset}_seed{seed}/manifest.json", hint=hint)
+    """Directory `D` such that `D / f"{dataset}_seed{seed}"` holds the CellViT
+    cache -- the parent `main.py::_load_cell_view` joins that name onto.
+
+    Finds every `manifest.json` under the search roots (any depth, directory
+    names ignored) and keeps the one whose own JSON content names this
+    `dataset`/`seed` -- see the module docstring for why content, not path
+    segments. `{dataset}_seed{seed}` need not exist as a real directory: when
+    the cache was instead uploaded as `<dataset>/seed<seed>/manifest.json`
+    (dataset and seed split across two levels), a symlink named
+    `{dataset}_seed{seed}` pointing at that real directory is created under a
+    fresh temp dir and that temp dir returned, so `main.py`'s own
+    `os.path.join` still resolves to the right cache without main.py knowing
+    the upload used a different layout.
+    """
+    search_roots: List[Path] = []
+    if hint:
+        search_roots.append(Path(hint))
+    search_roots.extend(_DEFAULT_SEARCH_ROOTS)
+    search_roots.append(Path("/kaggle/input"))
+
+    canonical_name = f"{dataset}_seed{seed}"
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for manifest_path in sorted(root.rglob("manifest.json")):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as handle:
+                    manifest = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if manifest.get("dataset") != dataset or manifest.get("seed") != seed:
+                continue
+            cache_dir = manifest_path.parent
+            if cache_dir.name == canonical_name:
+                return cache_dir.parent
+            return _canonical_cellvit_parent(cache_dir, canonical_name)
+    return None
+
+
+def _canonical_cellvit_parent(cache_dir: Path, canonical_name: str) -> Path:
+    """Symlink farm so a non-canonically-named cache directory still resolves
+    under `os.path.join(parent, canonical_name)`, without touching the
+    (possibly read-only, Kaggle-input-mounted) cache directory itself."""
+    import tempfile
+
+    parent = Path(tempfile.mkdtemp(prefix="cellvit_cache_"))
+    link = parent / canonical_name
+    if not link.exists():
+        link.symlink_to(cache_dir, target_is_directory=True)
+    return parent
