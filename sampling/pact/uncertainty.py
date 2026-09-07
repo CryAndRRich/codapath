@@ -35,7 +35,13 @@ from ..uncertainty import (
     rank_normalize,
 )
 
-UNCERTAINTY_MODES = ("disagreement", "visual_margin")
+# "coverage" is the no-weight ablation: U=1 in EVERY round, so the objective
+# reduces to plain MaxHerding (which is also what round 0 already does, since
+# it has no labels to fit a probe with). It exists so an ablation can show
+# that an uncertainty weight helps at all, before showing which weight is
+# best -- without it, `visual_margin` vs `disagreement` only compares two
+# weights against each other and never against having none.
+UNCERTAINTY_MODES = ("disagreement", "visual_margin", "coverage")
 
 # Ceiling for the temperature search, tighter than the paper grid's 19.9.
 #

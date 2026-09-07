@@ -193,6 +193,20 @@ def pact_sampling(**kwargs) -> List[int]:
                     visual_np, text_prototypes, logit_scale=text_logit_scale,
                 )
                 diagnostics.update(text_diagnostics)
+        elif uncertainty_mode == "coverage":
+            # The no-weight ablation: keep the round's sigma update (coverage
+            # still tightens as labels arrive) but leave U=1, so no probe is
+            # trained and the objective stays pure MaxHerding throughout.
+            # The dict must carry the same keys round_weights returns -- the
+            # trace and the round log below read them unconditionally.
+            sigma = max(labeled_min_sigma(coverage_features, selected, sigma), sigma_floor)
+            weights_np = None
+            diagnostics = {
+                "tau_visual": 1.0, "tau_cell": 1.0,
+                "mean_disagreement": float("nan"), "tau_at_cap": 0.0,
+                "pool_mask_fraction": float("nan"),
+                "weight_uniform_by_design": 1.0,
+            }
         else:
             sigma = max(labeled_min_sigma(coverage_features, selected, sigma), sigma_floor)
             weights_np, diagnostics = round_weights(
