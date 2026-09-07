@@ -526,8 +526,27 @@ def run(
             else:
                 from features.vlm import load_conch
 
+                # CPU, not `device` -- deliberately, and NOT symmetric with
+                # what `load_conch`'s other callers want. They (the VLM
+                # extraction scripts) encode immediately, so loading straight
+                # onto the GPU is right for them. Here the encoder is loaded
+                # before the SELECTION loop and is not touched until the
+                # final-training pass many minutes later: selection reads the
+                # feature cache and never calls the encoder at all. Leaving
+                # CONCH resident on the GPU through selection cost a real run
+                # -- CONCH + its activations sat on the card while the pool
+                # consistency term pushed a 20k-row pool matrix onto the same
+                # device, and the first LoRA training batch then died with
+                # `CUDA OutOfMemoryError` at budget 50.
+                #
+                # The DINOv2 branch above never had this problem because
+                # `from_pretrained` returns a CPU model and only
+                # `finetune_and_evaluate`'s `.to(device)` moves it, which is
+                # exactly the behaviour this reproduces. Same code path, two
+                # different memory profiles, is what made the failure look
+                # like a CONCH-specific mystery rather than a placement bug.
                 ft_encoder_model, ft_conch_preprocess = load_conch(
-                    visual_backbone, device, hf_token=hf_token
+                    visual_backbone, torch.device("cpu"), hf_token=hf_token
                 )
                 if ft_use_lora:
                     from training.lora import apply_lora_to_conch
