@@ -61,7 +61,7 @@ constructed here, since a run that starts at `r=0` and is later swept to
 from __future__ import annotations
 
 import math
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -74,6 +74,8 @@ __all__ = [
     "apply_lora_to_dinov2",
     "apply_lora_to_conch",
     "lora_parameters",
+    "lora_state_dict",
+    "load_lora_state_dict",
     "reset_lora_parameters",
 ]
 
@@ -442,6 +444,69 @@ def lora_parameters(model: nn.Module) -> List[nn.Parameter]:
         if any(name.endswith(f".{n}") or name == n for n in names) and param.requires_grad:
             params.append(param)
     return params
+
+
+LORA_PARAM_NAMES = ("lora_A", "lora_B", "lora_A_q", "lora_B_q", "lora_A_v", "lora_B_v")
+
+
+def _is_lora_param(name: str) -> bool:
+    return any(name.endswith(f".{n}") or name == n for n in LORA_PARAM_NAMES)
+
+
+def lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Every LoRA delta as a NAME -> tensor map, ready to save.
+
+    `lora_parameters` returns a bare list for the optimizer, which is enough to
+    train but not to reload: nothing in it says which tensor belongs to which
+    block. This keeps the qualified parameter name, so `load_lora_state_dict`
+    can put each delta back exactly where it came from.
+
+    Returns detached CPU copies -- a saved checkpoint must not hold a reference
+    into a live CUDA graph, and `torch.save` of a GPU tensor pins the file to a
+    device that may not exist when it is read back.
+    """
+    return {
+        name: param.detach().cpu().clone()
+        for name, param in model.named_parameters()
+        if _is_lora_param(name)
+    }
+
+
+def load_lora_state_dict(model: nn.Module, state: Dict[str, torch.Tensor]) -> int:
+    """Copy saved deltas back into an already-wrapped `model`; returns the count.
+
+    The model must be wrapped at the SAME rank the state was saved at --
+    `apply_lora_to_*(model, r=..., alpha=...)` with the values recorded beside
+    the state. A rank mismatch is a shape mismatch and raises here rather than
+    silently loading a subset, and alpha never appears in the tensors at all
+    (it scales the delta at forward time), so loading at a different alpha
+    would reproduce neither the encoder nor any error.
+    """
+    own = dict(model.named_parameters())
+    missing = [k for k in state if k not in own]
+    if missing:
+        raise KeyError(
+            f"saved LoRA state has {len(missing)} parameter(s) the model does not: "
+            f"{missing[:3]} -- the model was wrapped differently than the run that saved it"
+        )
+    extra = [k for k in own if _is_lora_param(k) and k not in state]
+    if extra:
+        raise KeyError(
+            f"model has {len(extra)} LoRA parameter(s) absent from the saved state: "
+            f"{extra[:3]} -- refusing to load a partial adapter"
+        )
+    loaded = 0
+    with torch.no_grad():
+        for name, tensor in state.items():
+            param = own[name]
+            if param.shape != tensor.shape:
+                raise ValueError(
+                    f"{name}: saved shape {tuple(tensor.shape)} != model shape "
+                    f"{tuple(param.shape)} -- wrapped at a different rank"
+                )
+            param.copy_(tensor.to(param.device))
+            loaded += 1
+    return loaded
 
 
 def reset_lora_parameters(model: nn.Module, seed: Optional[int] = None) -> int:

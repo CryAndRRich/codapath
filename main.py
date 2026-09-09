@@ -887,6 +887,37 @@ def run(
                     **({"final_train_cfg": final_train_cfg} if run_final_training else {}),
                 },
             )
+            # `run_final_training` first: `ft_metrics` only exists on that
+            # branch, so testing the dict alone raises NameError on every
+            # frozen run.
+            if run_final_training and "lora_state" in ft_metrics:
+                # The adapter that produced this budget's numbers. It must be
+                # written HERE, inside the budget loop: the next budget starts
+                # with `reset_lora_parameters`, and the encoder itself is
+                # deleted after the sweep, so this is the only moment the
+                # trained deltas exist. Saving the probe alone leaves the
+                # feature space it reads unreconstructable.
+                #
+                # `lora_r` and `lora_alpha` travel with the tensors because
+                # neither is recoverable from them: rank is implied by the
+                # shapes but alpha scales the delta at forward time and leaves
+                # no trace, so reloading at a different alpha would rebuild a
+                # DIFFERENT encoder without any shape mismatch to say so.
+                _save(
+                    os.path.join(save_dir, f"{output_name}_lora_budget_{budget}.pt"),
+                    {
+                        "run_name": output_name,
+                        "budget": budget,
+                        "seed": random_seed,
+                        "dataset": dataset_key,
+                        "encoder": visual_backbone,
+                        "encoder_kind": image_encoder,
+                        "lora_r": ft_lora_r,
+                        "lora_alpha": ft_lora_alpha,
+                        "state": ft_metrics["lora_state"],
+                    },
+                )
+
             # Test-set predictions are what a confusion matrix or a per-class
             # error plot needs, and re-deriving them means re-running the
             # backbone over the whole test set.

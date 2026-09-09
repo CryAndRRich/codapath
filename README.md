@@ -100,7 +100,7 @@ evaluation/
   palm.py                PALM learning-curve fit
   alda.py                ALDA risk-aware deployment advice (B_abs, W, C_eta)
 scripts/                 CellViT extraction and its preflight
-notebooks/               four Kaggle notebooks, one per pipeline stage
+notebooks/               Kaggle notebooks, one per pipeline stage
 ```
 
 `tests/` exists locally but is untracked (see `.gitignore`). Run it with
@@ -380,6 +380,7 @@ see "Class descriptions" above).
 | `run_al_baseline.ipynb` | one of the 11 published baselines; no CellViT, no VLM |
 | `run_al_main.ipynb` | `pact`, this project's own method — either image encoder |
 | `evaluate_al_sampler.ipynb` | read the finished runs' saved metrics; PALM + ALDA |
+| `retrain_lora_from_selection.ipynb` | recover a finished LoRA run's adapter by re-running only its final-training pass over the selection already on disk |
 
 **The notebooks carry no prose.** No markdown cells, no explanatory comments —
 only code, plus a single `# a | b | c` comment on each editable variable naming

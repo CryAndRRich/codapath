@@ -62,6 +62,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from data.augment import build_augment_transform
 from data.loaders import RawRGBDataset, default_num_workers, default_transform
+from training.lora import lora_state_dict
 from training.losses import (
     NEEDS_SAME_CLASS_PAIR,
     center_loss,
@@ -562,6 +563,16 @@ def finetune_and_evaluate(
         "f1": float(f1_score(test_labels, predictions, average="macro", zero_division=0)),
         "probabilities": probabilities,
     }
+    if use_lora:
+        # The trained adapter, returned so the caller can persist it. Without
+        # this the encoder these features came from is unrecoverable: `main.py`
+        # deletes the model after the sweep and `reset_lora_parameters` wipes
+        # the adapter at the START of the next budget, so nothing outside this
+        # function ever sees the weights that produced the numbers above.
+        # Saving the probe alone is not enough -- a probe is a set of
+        # coordinates in the adapted encoder's feature space, and that space
+        # cannot be rebuilt from a frozen checkpoint.
+        metrics["lora_state"] = lora_state_dict(encoder_model)
     return probe, metrics
 
 
