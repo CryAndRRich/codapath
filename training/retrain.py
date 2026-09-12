@@ -88,6 +88,7 @@ def retrain_run(
     probe_lr: float,
     image_encoder: str,
     visual_backbone: str,
+    sampler_cfg: Optional[Dict[str, Any]] = None,
     test_features: Optional[np.ndarray] = None,
     hf_token: Optional[str] = None,
     encoder_model=None,
@@ -130,6 +131,7 @@ def retrain_run(
     )
     train_dataset, test_dataset = train_loader.dataset, test_loader.dataset
     train_fingerprint = sample_order_fingerprint(get_sample_ids(train_dataset))
+    test_fp = sample_order_fingerprint(get_sample_ids(test_dataset))
     train_labels = _dataset_labels(train_dataset)
     test_labels = _dataset_labels(test_dataset)
 
@@ -239,9 +241,17 @@ def retrain_run(
         )
         torch.save(
             {
+                # Same key names `main.py` writes -- `test_labels`, not
+                # `labels`, and the fingerprint and class names alongside.
+                # Anything reading predictions (confusion matrix, per-class F1,
+                # the recompute check that catches a probe paired with another
+                # run's probabilities) reaches for main.py's spelling, and a
+                # recovered archive that renames the field reads as corrupt.
                 "run_name": run_name, "budget": budget,
                 "probabilities": metrics["probabilities"],
-                "labels": np.asarray(test_labels),
+                "test_labels": np.asarray(test_labels),
+                "class_names": list(class_names),
+                "test_fingerprint": test_fp,
                 "retrained_from_selection": True,
             },
             os.path.join(save_dir, f"{run_name}_predictions_budget_{budget}.pt"),
@@ -256,12 +266,20 @@ def retrain_run(
             # invisible to every downstream table.
             "dataset": dataset_key,
             "sampler": sampler_name,
+            # Carried through even though this pass does not select: every
+            # downstream classifier of a run reads `sampler_config` to tell
+            # which TABLE ROW it is (uncertainty_mode + pool_consistency_weight
+            # are what separate A0..A3 and T1..T4). Omitting it leaves a
+            # recovered archive unclassifiable except by parsing its filename,
+            # which is exactly the naming-convention dependency
+            # `_default_run_name` exists to avoid.
+            "sampler_config": dict(sampler_cfg) if sampler_cfg else None,
             "class_names": list(class_names),
             "run_name": run_name, "seed": random_seed,
             "visual_backbone": visual_backbone,
             "final_train_cfg": final_train_cfg,
             "train_fingerprint": train_fingerprint,
-            "test_fingerprint": sample_order_fingerprint(get_sample_ids(test_dataset)),
+            "test_fingerprint": test_fp,
             "num_classes": num_classes,
             "budgets": sorted(results),
             "linear": results,
