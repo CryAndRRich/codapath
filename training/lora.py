@@ -322,21 +322,6 @@ class MultiheadAttentionLoRA(nn.Module):
         return out, None
 
 
-def _get_submodule(root: nn.Module, path: str) -> nn.Module:
-    module = root
-    for part in path.split("."):
-        module = getattr(module, part)
-    return module
-
-
-def _set_submodule(root: nn.Module, path: str, value: nn.Module) -> None:
-    parts = path.split(".")
-    parent = root
-    for part in parts[:-1]:
-        parent = getattr(parent, part)
-    setattr(parent, parts[-1], value)
-
-
 def apply_lora_to_dinov2(model: nn.Module, r: int, alpha: float) -> nn.Module:
     """Wrap every attention block's `query` and `value` projections
     (`Dinov2SelfAttention.query`/`.value`) with `LinearLoRA`, in place.

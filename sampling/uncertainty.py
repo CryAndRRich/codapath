@@ -30,13 +30,6 @@ def js_disagreement_from_logits(
     return np.clip(jsd, 0.0, 1.0).astype(np.float32)
 
 
-def row_layer_norm(values: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float32)
-    mean = values.mean(axis=1, keepdims=True)
-    std = values.std(axis=1, keepdims=True)
-    return ((values - mean) / (std + eps)).astype(np.float32)
-
-
 def rank_normalize(values: np.ndarray, mask: np.ndarray = None) -> np.ndarray:
     """Map `values` onto [0, 1] by RANK, optionally within a sub-group.
 

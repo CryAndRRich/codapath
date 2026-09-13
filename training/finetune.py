@@ -80,6 +80,7 @@ __all__ = [
 
 AUX_LOSS_FNS = {"center": center_loss, "supcon": supcon_loss, "triplet": triplet_loss}
 
+
 # Smallest trailing batch worth forming. The pairwise auxiliary losses need
 # one same-class pair, and the chance a batch has none grows sharply as the
 # batch shrinks relative to the class count: measured over 14 classes,

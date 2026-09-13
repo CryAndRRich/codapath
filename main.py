@@ -337,8 +337,6 @@ def run(
     sampler_name: str,
     num_classes: int,
     cumulative_budget: List[int],
-    data_descriptions: Dict[str, str],
-    prompt_templates: List[str],
     sampler_cfg: Dict,
     probe_epochs: int,
     probe_lr: float,
@@ -1046,10 +1044,13 @@ def merge_budget_shards(
 def run_on_worker(**kwargs) -> None:
     """`run` with the device resolved inside the process that will use it.
 
-    `utils.parallel` pins one GPU per worker through `CUDA_VISIBLE_DEVICES`
-    before torch initialises, so inside a worker the pinned card is always
-    `cuda:0`. A `torch.device` built in the parent would also not survive
-    pickling meaningfully, hence the string here.
+    Placement does NOT go through `CUDA_VISIBLE_DEVICES` -- setting it inside a
+    `spawn` worker is too late, because unpickling this function imports
+    `main`, which imports torch first. `utils.parallel._worker` instead
+    OVERWRITES `device_string` with an explicit `cuda:<its index>`, so the
+    default below only applies to a single-process run. A `torch.device` built
+    in the parent would not survive pickling meaningfully either, hence the
+    string.
     """
     device_string = kwargs.pop("device_string", "cuda:0")
     run(device=torch.device(device_string), **kwargs)
@@ -1177,8 +1178,6 @@ def main() -> None:
         sampler_name=args.sampler,
         num_classes=dataset_info["num_classes"],
         cumulative_budget=config["cumulative_budget"],
-        data_descriptions=dataset_info.get("descriptions", {}),
-        prompt_templates=config.get("prompt_templates", []),
         sampler_cfg=sampler_cfg,
         probe_epochs=args.probe_epochs or training_cfg["probe_epochs"],
         probe_lr=args.probe_lr or training_cfg["probe_lr"],

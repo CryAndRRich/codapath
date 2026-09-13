@@ -33,9 +33,12 @@ def extract_shard_on_worker(
 ) -> None:
     """Extract one shard, seeding and resolving the device inside the child.
 
-    torch is imported here rather than at module scope: `utils.parallel` pins
-    `CUDA_VISIBLE_DEVICES` in the child before the target runs, and that only
-    takes effect if torch initialises afterwards.
+    torch is imported inside the function rather than at module scope, so a
+    parent that only wants `build_*_shard_jobs` does not pay for it. Device
+    placement comes from `device_string`, which `utils.parallel._worker`
+    overwrites with an explicit `cuda:<its index>` -- NOT from
+    `CUDA_VISIBLE_DEVICES`, which under `spawn` would be set after unpickling
+    has already imported torch.
 
     `set_seed` runs per process. The forward pass itself is deterministic under
     `inference_mode` with a frozen backbone, but the train/test split of an

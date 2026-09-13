@@ -144,6 +144,7 @@ def _stage2_coverage_select(
 
     return [candidate_indices[i] for i in selected_local]
 
+
 @register_sampler("refine")
 def refine_sampling(**kwargs) -> List[int]:
     """REFINE (CVPR 2026): progressive ensemble pool-filtering -> UHerding coverage.

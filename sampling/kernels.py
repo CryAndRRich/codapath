@@ -29,7 +29,7 @@ header warns about, so the dead pair was removed rather than left to be
 imported by mistake.
 """
 
-from typing import List, Optional, Sequence
+from typing import List, Sequence
 
 import numpy as np
 import torch
@@ -135,48 +135,6 @@ def running_max_coverage(
     del labeled
     clear_memory()
     return coverage
-
-
-def marginal_gains(
-    features: torch.Tensor,
-    weights: torch.Tensor,
-    coverage: torch.Tensor,
-    sigma: float,
-    candidate_indices: Optional[np.ndarray],
-    chunk_size: int,
-) -> np.ndarray:
-    """`g(i) = sum_n weights_n * max(k_sigma(x_n, x_i) - K_n, 0)` for each
-    candidate i. Both axes are chunked, so peak temporary memory is about
-    `chunk_size ** 2` floats regardless of pool size.
-
-    `candidate_indices` restricts the candidate axis; None means the full pool.
-    """
-    num_samples = features.shape[0]
-    if candidate_indices is None:
-        candidates = np.arange(num_samples, dtype=np.int64)
-    else:
-        candidates = np.asarray(candidate_indices, dtype=np.int64)
-    if len(candidates) == 0:
-        return np.empty(0, dtype=np.float32)
-
-    gains = np.zeros(len(candidates), dtype=np.float32)
-    for cand_start in range(0, len(candidates), chunk_size):
-        cand_end = min(cand_start + chunk_size, len(candidates))
-        index = torch.as_tensor(
-            candidates[cand_start:cand_end], device=features.device, dtype=torch.long
-        )
-        candidate_features = features[index]
-        score = torch.zeros(cand_end - cand_start, device=features.device, dtype=torch.float32)
-        for start in range(0, num_samples, chunk_size):
-            end = min(start + chunk_size, num_samples)
-            kernel = gaussian_kernel(features[start:end], candidate_features, sigma)
-            gain = torch.clamp(kernel - coverage[start:end].unsqueeze(1), min=0.0)
-            score += (weights[start:end].unsqueeze(1) * gain).sum(dim=0)
-            del kernel, gain
-        gains[cand_start:cand_end] = score.detach().cpu().numpy().astype(np.float32)
-        del index, candidate_features, score
-        clear_memory()
-    return gains
 
 
 def greedy_weighted_coverage(

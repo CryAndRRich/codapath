@@ -195,13 +195,6 @@ cellvit_extraction:
       input_mpp: 0.2531646
       model_mpp: 0.25
 
-prompt_templates:
-  - "Photomicrograph showing {}."
-  - "Histopathology of {}."
-  - "H&E stained microscopic image of {}."
-  - "Pathological tissue section demonstrating {}."
-  - "Cellular morphology characteristic of {}."
-
 datasets:
   pathmnist:
     path: "data/pathmnist_224.npz"

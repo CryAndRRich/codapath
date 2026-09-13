@@ -1,7 +1,8 @@
 """Run one CellViT extraction shard as a subprocess pinned to one GPU.
 
-`utils.parallel` spawns one worker per GPU and pins `CUDA_VISIBLE_DEVICES`
-before the target runs. The target here re-invokes
+`utils.parallel` spawns one worker per GPU and hands each its card as an
+explicit `device_string` (not via `CUDA_VISIBLE_DEVICES`, which arrives too
+late under `spawn`). The target here re-invokes
 `scripts/extract_cellvit_features.py` as a child process rather than importing
 it: that script is a `main()`-style CLI whose CellViT model, postprocessor and
 DINO encoder all live in module-local state, and running it out-of-process

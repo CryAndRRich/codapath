@@ -7,6 +7,7 @@ import ctypes
 import numpy as np
 import torch
 
+
 def set_seed(seed: int) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -24,6 +25,7 @@ def set_seed(seed: int) -> None:
     torch.use_deterministic_algorithms(False)
 
     print(f"Random seed: {seed}")
+
 
 def clear_memory() -> None:
     gc.collect()

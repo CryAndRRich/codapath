@@ -1,25 +1,34 @@
-"""Test-set metrics, PALM/ALDA curve analysis, and plots."""
+"""Test-set metrics and re-scoring finished runs from their SAVED WEIGHTS.
 
-from .alda import alda_advise, format_alda_report
+There is deliberately no reader for `<run>_results.pt` here. Those files are a
+run's own report of itself: they load and print whatever was written, so a
+table built from them is identical whether the weights beside them are usable
+or corrupt. `rescore` loads the probe (and the LoRA adapter when the run
+trained one) and computes the metrics against real test features, which is the
+only thing that exercises what the archive actually ships.
+
+Plotting lives in `evaluation/visualize/` -- standalone scripts, not importable
+modules, so nothing here pulls in matplotlib.
+"""
+
 from .metrics import evaluate_probe
-from .palm import format_palm_report, palm_evaluate
-from .results_io import (
-    average_seeds,
-    discover_runs,
-    format_metric_table,
-    load_curves,
-    load_run_result,
+from .rescore import (
+    compare_to_recorded,
+    find_run_dir,
+    load_test_features,
+    make_lora_encoder,
+    probe_feature_paths,
+    read_run_metadata,
+    rescore_run,
 )
 
 __all__ = [
     "evaluate_probe",
-    "format_palm_report",
-    "palm_evaluate",
-    "alda_advise",
-    "format_alda_report",
-    "average_seeds",
-    "discover_runs",
-    "format_metric_table",
-    "load_curves",
-    "load_run_result",
+    "compare_to_recorded",
+    "find_run_dir",
+    "load_test_features",
+    "make_lora_encoder",
+    "probe_feature_paths",
+    "read_run_metadata",
+    "rescore_run",
 ]

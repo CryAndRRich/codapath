@@ -96,9 +96,9 @@ sampling/
 training/                linear probe, dual probe, checkpoint IO
 evaluation/
   metrics.py             test metrics, computed once during a run
-  results_io.py          read finished runs' metrics back out of their zips
-  palm.py                PALM learning-curve fit
-  alda.py                ALDA risk-aware deployment advice (B_abs, W, C_eta)
+  rescore.py             re-score a run's SAVED WEIGHTS on the test set
+  sanity.py              degenerate-selection checks, run during acquisition
+  visualize/             figure scripts (run, not imported) -> assets/img/
 scripts/                 CellViT extraction and its preflight
 notebooks/               Kaggle notebooks, one per pipeline stage
 ```
@@ -305,6 +305,21 @@ fallback, which derives the prompt from the class name itself
 maintain — it also lets that notebook run before any description file
 exists.
 
+**Read them with `features/descriptions.py::load_descriptions(dataset, style)`,
+never by parsing the JSON directly** — that function also validates the class
+order against `config.yaml`'s current `class_names`. Do not hand-edit a file
+either: the payload's `sha256` would no longer match its content. Regenerate
+with `OVERWRITE=True` and commit instead.
+
+Note what that hash does and does not prove. It is computed over the
+descriptions with keys **sorted**, so it identifies the TEXT regardless of key
+order — **a matching hash does not mean the file is loadable.** The class order
+inside the JSON must separately match `config.yaml`, which is what
+`load_descriptions` checks. `json.dump(..., sort_keys=True)` once alphabetized
+the nested `descriptions` dict on the way to disk, producing files whose hash
+was correct and which `load_descriptions` refused; the notebook now writes with
+`sort_keys=False`.
+
 ---
 
 ## CONCH extraction
@@ -379,8 +394,7 @@ see "Class descriptions" above).
 | `extract_vlm_features.ipynb` | CONCH image features (both embedding spaces) + text prototypes |
 | `run_al_baseline.ipynb` | one of the 11 published baselines; no CellViT, no VLM |
 | `run_al_main.ipynb` | `pact`, this project's own method — either image encoder |
-| `evaluate_al_sampler.ipynb` | read the finished runs' saved metrics; PALM + ALDA |
-| `retrain_lora_from_selection.ipynb` | recover a finished LoRA run's adapter by re-running only its final-training pass over the selection already on disk |
+| `evaluate_al_sampler.ipynb` | load each run's saved probe (+ LoRA adapter) and re-score it on the test set |
 
 **The notebooks carry no prose.** No markdown cells, no explanatory comments —
 only code, plus a single `# a | b | c` comment on each editable variable naming
@@ -592,11 +606,11 @@ two actually drove a selection. A sampler records only what it genuinely
 computes: `coreset`, `typiclust` and `activeft` fit no classifier and so have
 no uncertainty, and `random` has no score at all.
 
-A run reports **accuracy, precision, recall and macro-F1 only**. PALM, ALDA and
-every other curve-level metric are fitted by `evaluate_al_sampler.ipynb` from
-these files: the fit needs the whole sweep to have finished, which a resumed or
-GPU-split run cannot guarantee mid-sweep, and re-fitting costs seconds against
-re-running the sweep.
+A run reports **accuracy, precision, recall and macro-F1 only**. Those numbers
+are the run's report of ITSELF, which is why `evaluate_al_sampler.ipynb` does
+not read them: it re-scores each saved probe against the test set, so the table
+says what the shipped weights actually do rather than what a finished run said
+they did.
 
 `<run>` defaults to the sampler name, extended for `pact` with the config
 axes that would otherwise overwrite each other
@@ -615,7 +629,7 @@ does — produces exactly the name it always has.
 
 **A probe checkpoint states which feature space it was trained on.**
 `metadata["encoder"]` (the backbone name) and `metadata["encoder_kind"]`
-(`"dinov2"` today) let `evaluate_al_sampler.ipynb` build the matching test
+(`"dinov2"` today) let `evaluate_al_sampler.ipynb` load the matching test
 features for each run instead of assuming one encoder for everything —
 without this, a checkpoint trained on a different feature space either
 crashes on a shape mismatch or, if the two widths ever coincided, would be
@@ -669,77 +683,47 @@ which is how round 1 of a coverage method legitimately runs plain MaxHerding
 without being flagged. Nothing raises: an alarm at budget 200 must not throw
 away the hours already spent, so findings are reported, not enforced.
 
-Accuracy at a handful of budgets is a noisy ranking: a method can win at one
-budget and lose at the next. PALM fits the whole learning curve and reports
-interpretable parameters instead. It is fitted in `evaluate_al_sampler.ipynb`,
-not during a run — the fit needs every budget of the sweep to be present.
+### Re-scoring a finished run
 
-| PALM metric | Meaning | Better |
-|---|---|---|
-| `Amax` | accuracy ceiling | higher |
-| `delta` | coverage efficiency per label | higher |
-| `alpha` | cold-start offset | lower |
-| `beta` | budget-scaling exponent | higher |
-| `AUC` | overall curve area | higher |
-| budget-to-90 | labels needed to reach 90% of `Amax` | lower |
-| `RMSE` | fit reliability of the five above | lower |
+`evaluation/rescore.py` loads `<run>_probe_budget_<b>.pt` — and
+`<run>_lora_budget_<b>.pt` when the run trained an adapter — and computes the
+metrics against real test features. No results file is read, and none is
+available to read: **`PACT.zip` and `baselines.zip` contain weights and
+nothing else**, so there is no recorded metric to fall back on by
+construction. What each run WAS — its encoder, dataset, seed, run name — comes
+from the `metadata` dict `save_probe` writes inside each checkpoint, which is
+why that dict exists.
 
-### ALDA — the deployment question
+`<run>_results.pt` still exists, under `data_upload/selected/`, alongside the
+selections. It is a run's report of itself: it loads and prints the same
+values whether the probe beside it is usable or corrupt, so it is kept for
+provenance and deliberately kept OUT of the weight archives.
 
-PALM describes a curve; **ALDA** (`evaluation/alda.py`, arXiv 2608.03511, same
-authors and repository as PALM) turns it into the decision a clinical team
-actually faces: *given a short pilot, which sampler gets the remaining budget,
-and how many expert labels will it take?* Three quantities per method, all read
-off the fitted curve:
+The cost is real: test labels come from the image dataset, so the notebook
+needs it mounted, and a LoRA run needs a GPU and one forward pass over the test
+set per budget.
 
-| ALDA quantity | Meaning | Better |
-|---|---|---|
-| feasible | `Amax >= target` — screened out first, before any cost is computed | — |
-| `B_abs(τ)` | labels needed to reach the target, rounded **up** to a whole episode | lower |
-| `W` | `B_abs(τ+Δτ) − B_abs(τ−Δτ)`: how much the label cost moves if the target is revised | lower |
+Three things re-scoring has to guard, each tested by constructing the
+situation it exists to catch:
 
-The recommendation is deliberately **not** `argmin B_abs`. Costs within `eta`
-(default 5%) of the cheapest are treated as equivalent, and inside that
-cost-competitive set ALDA picks the **smallest window** — cheapest among
-equals, then most robust among the cheap. A feasible method whose `W` exceeds
-the recommendation's is flagged `risky`; that flag is about threshold
-sensitivity, not about cost, so a *cheap* method can be risky and an expensive
-one need not be.
-
-Fitting differs from `palm.py` on purpose: ALDA fits with L-BFGS-B and 18
-seeded random restarts (paper §3.1) because `B_abs` and `W` are inversions of
-the fitted parameters, so a less stable fit moves the reported label counts
-directly. `palm.py` keeps its single `curve_fit` call, so PALM tables already
-reported stay reproducible. `tests/test_alda_matches_official.py` pins both
-implementations against the reference clone in `repos/PALM`, comparing
-`B_abs`, `W` and the selection flags rather than restating the formulas.
-
-`PILOT_POINTS` reruns the whole analysis on the first N budgets only, which is
-the paper's prospective scenario: it answers whether a pilot of 3–4 budgets
-would already have committed to the method the full curve prefers.
-
-### Reading results back
-
-`evaluation/results_io.py` reads `<run>_results.pt` straight out of each run's
-zip — accuracy, precision, recall and macro-F1 were all computed during the run
-and PALM/ALDA need only `(budget, accuracy)`, so nothing is re-scored. The
-notebook therefore needs no GPU, no raw dataset and no backbone checkpoint.
-
-Three things that read of saved numbers has to guard, each tested by
-constructing the situation it exists to catch:
-
-* **comparability.** Re-scoring every probe against one freshly built test
-  matrix used to guarantee it. Now `load_curves` refuses runs whose
-  `test_fingerprint` (or `train_fingerprint`) disagrees — grouped by seed,
-  since seeds split differently on purpose.
-* **protocol.** Final-training runs (LoRA / auxiliary loss / augmentation) are
-  excluded by default, identified by the presence of `final_train_cfg`, which
-  `main.py` writes only when that pass actually ran — a structural fact about
-  the run rather than a filename convention.
-* **seed grouping.** The run notebooks append `_s<SEED>` when the seed differs
-  from the config default, so five seeds arrive as five distinct `run_name`s.
-  `method_label` strips the suffix *this run's own recorded seed* implies, so a
-  config axis that happens to end in `_s<digits>` is not truncated.
+* **feature space.** The cache is derived from the run's own
+  `visual_backbone`, never named by hand, and `load_test_features` refuses a
+  CONCH manifest whose `space` is not RAW — PROJ is the same 512 width, so the
+  wrong one would score and report silently. It also refuses a cache whose
+  `test_fingerprint` disagrees with the run's: same width, same row count,
+  every label against the wrong patch.
+* **the adapted space.** A run that saved `*_lora_budget_*.pt` trained its
+  encoder, so its probe indexes a space no cache holds. `rescore_run` REFUSES
+  to score it from a cache and requires an `encode_test` callable that
+  re-encodes the test set through that budget's adapter — the same mistake
+  once measured 0.10–0.21 accuracy against a 0.071 floor, invisible because
+  the widths matched. `SCORE_LORA_RUNS=False` skips those runs instead, since
+  the honest alternative costs a forward pass per budget.
+* **the adapter itself.** `make_lora_encoder` reads `lora_alpha` from the file
+  rather than assuming it (alpha scales the delta at forward time and leaves no
+  trace in the weights), rejects tensor names that do not resolve against the
+  wrapped module, and refuses an adapter whose every `lora_B` is zero — that
+  state rebuilds the FROZEN encoder with correct shapes and no error.
 
 ---
 
@@ -758,8 +742,9 @@ UncertaintyHerding (ICLR 2025)
 
 **Medical / pathology AL** — PEAL (CVPR 2024) · OpenPath (MICCAI 2025)
 
-**Evaluation** — PALM (ICCV 2025) · ALDA (EMA4MICCAI 2026) ·
-Mechanism-Driven Phase Transitions (ECCV 2026, not implemented)
+**Evaluation** — PALM (ICCV 2025), ALDA (EMA4MICCAI 2026) and
+Mechanism-Driven Phase Transitions (ECCV 2026) are **not implemented**; the
+PALM/ALDA curve-fitting code was removed on 2026-09-12 (see CLAUDE.md)
 
 Reference implementations are cloned read-only under `repos/` for line-by-line
 comparison: `badge`, `coreset`, `typiclust`, `activeft`, `uherding`,
@@ -771,116 +756,3 @@ from what a run already saves, but empirical-risk reduction is measured inside
 the AL loop and is not recoverable afterwards.
 
 ---
-
-## Appendix — results measured before the 2026-08-22 audit
-
-**These numbers are not reproducible with the current code.** The baseline audit
-of 2026-08-22 changed selection behaviour in `typiclust` (k-means restarts
-pinned to the defaults the references relied on), `activeft` (the detached
-factor in the diversity term) and `refine` (official ensemble, candidate-batch
-total and pool cap). They are kept as a regression reference only — for "did the
-rewrite move this baseline, and by how much", not as reported results. The
-`TCM` and `DropQuery` rows have been dropped along with those baselines.
-
-`SCALPEL` in these tables is the retired stain-shortcut method (v9) — a
-different method that happened to share the name, not an earlier run of
-**PACT**. `CODAPath`, this
-project's own earlier dual-VLM sampler, has since been **deleted from the
-code** (`sampling/baselines/codapath.py`); it appears in these tables only as
-historical measurement, never as a runnable sampler.
-
-### HistoSet
-
-#### Accuracy (linear) theo budget
-
-| Phương pháp | 25 | 50 | 75 | 100 | 125 | 150 | 175 | 200 | 225 | 250 | 275 | 300 | 325 | 350 | 375 | 400 | 425 | 450 | 475 | 500 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Random | 0.3736 | 0.5138 | 0.6852 | 0.7312 | 0.7523 | 0.7557 | 0.7800 | 0.8036 | 0.8159 | 0.8216 | 0.8280 | 0.8316 | 0.8361 | 0.8436 | 0.8461 | 0.8466 | 0.8504 | 0.8514 | 0.8600 | 0.8611 |
-| Coreset | 0.1982 | 0.2743 | 0.3680 | 0.4152 | 0.4455 | 0.4945 | 0.5414 | 0.5909 | 0.6088 | 0.5902 | 0.6252 | 0.6250 | 0.6484 | 0.6809 | 0.6789 | 0.7034 | 0.7173 | 0.7023 | 0.7205 | 0.7200 |
-| UHerding | 0.5591 | 0.6625 | 0.6893 | 0.7400 | 0.7502 | 0.7752 | 0.7857 | 0.7862 | 0.7920 | 0.7977 | 0.7884 | 0.7879 | 0.7932 | 0.8102 | 0.8241 | 0.8161 | 0.8212 | 0.8257 | 0.8423 | 0.8520 |
-| REFINE | 0.4980 | 0.6089 | 0.6641 | 0.7175 | 0.7488 | 0.7655 | 0.7848 | 0.8014 | 0.8205 | 0.8370 | 0.8455 | 0.8461 | 0.8502 | 0.8636 | 0.8693 | 0.8730 | 0.8721 | 0.8770 | 0.8836 | 0.8918 |
-| TypiClust | 0.5271 | 0.6695 | 0.7070 | 0.7280 | 0.7630 | 0.7929 | 0.7896 | 0.8045 | 0.8139 | 0.8159 | 0.8216 | 0.8454 | 0.8407 | 0.8525 | 0.8570 | 0.8648 | 0.8754 | 0.8686 | 0.8855 | 0.8839 |
-| ActiveFT | 0.4454 | 0.5586 | 0.6493 | 0.7214 | 0.7538 | 0.7679 | 0.7989 | 0.8077 | 0.8136 | 0.8189 | 0.8248 | 0.8295 | 0.8379 | 0.8529 | 0.8312 | 0.8338 | 0.8471 | 0.8505 | 0.8586 | 0.8573 |
-| Entropy | 0.3682 | 0.4627 | 0.5504 | 0.6191 | 0.6786 | 0.6588 | 0.7145 | 0.7179 | 0.7316 | 0.7364 | 0.7902 | 0.7834 | 0.7961 | 0.7882 | 0.8227 | 0.8073 | 0.8470 | 0.8439 | 0.8504 | 0.8589 |
-| Margin | 0.4729 | 0.5477 | 0.6750 | 0.7491 | 0.7780 | 0.8030 | 0.8129 | 0.8168 | 0.8434 | 0.8405 | 0.8573 | 0.8621 | 0.8582 | 0.8836 | 0.8825 | 0.8820 | 0.8895 | 0.8862 | 0.9027 | 0.8954 |
-| BADGE | 0.5091 | 0.6118 | 0.6396 | 0.7109 | 0.7704 | 0.7846 | 0.8134 | 0.8152 | 0.8288 | 0.8429 | 0.8495 | 0.8609 | 0.8454 | 0.8725 | 0.8761 | 0.8632 | 0.8821 | 0.8779 | 0.8857 | 0.8962 |
-| **SCALPEL** | 0.5625 | **0.7293** | 0.7598 | 0.7621 | 0.7898 | 0.8057 | 0.8146 | 0.8346 | 0.8386 | 0.8480 | 0.8532 | 0.8607 | 0.8529 | 0.8702 | 0.8800 | 0.8814 | 0.8812 | 0.8741 | 0.8854 | 0.8912 |
-
-#### PALM (linear)
-
-| Phương pháp | Amax | delta | alpha | beta | AUC | Budget to 90 | RMSE |
-|---|---|---|---|---|---|---|---|
-| Random | 0.8569 | 0.5321 | -0.3770 | 0.6489 | 0.7843 | 147.6 | 0.0145 |
-| Coreset | 0.7784 | 0.2102 | 0.2797 | 0.8032 | 0.5736 | 419.4 | 0.0127 |
-| UHerding | 0.9171 | 0.6986 | -0.6500 | 0.2335 | 0.7800 | 424.7 | 0.0104 |
-| REFINE | 0.9299 | 0.5314 | 0.0281 | 0.4684 | 0.8020 | 267.4 | 0.0039 |
-| TypiClust | 1.0000 | 0.6920 | -0.6609 | 0.2537 | 0.8062 | — | 0.0075 |
-| ActiveFT | 0.8504 | 0.4210 | 0.4426 | 0.7945 | 0.7857 | 141.8 | 0.0078 |
-| Entropy | 0.9797 | 0.4112 | -0.2603 | 0.4531 | 0.7280 | None | 0.0145 |
-| Margin | 0.8952 | 0.4277 | 0.4233 | 0.7306 | 0.8146 | 163.3 | 0.0136 |
-| BADGE | 0.8905 | 0.3495 | 1.3583 | 0.7912 | 0.8078 | 174.5 | 0.0104 |
-| **SCALPEL** | 1.0000 | **0.7013** | **-0.8495** | 0.1983 | 0.8304 | — | 0.0079 |
-
-### SkinTissue
-
-#### Accuracy (linear) theo budget
-
-| Phương pháp | 25 | 50 | 75 | 100 | 125 | 150 | 175 | 200 | 225 | 250 | 275 | 300 | 325 | 350 | 375 | 400 | 425 | 450 | 475 | 500 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Random | 0.3815 | 0.6089 | 0.6878 | 0.6980 | 0.7172 | 0.7475 | 0.7592 | 0.7512 | 0.7786 | 0.7834 | 0.7871 | 0.8012 | 0.8037 | 0.8204 | 0.8231 | 0.8218 | 0.8265 | 0.8295 | 0.8362 | 0.8420 |
-| Coreset | 0.1795 | 0.2281 | 0.2963 | 0.3221 | 0.3405 | 0.3919 | 0.4049 | 0.4264 | 0.4400 | 0.4616 | 0.4617 | 0.4804 | 0.4664 | 0.4996 | 0.4876 | 0.4997 | 0.4900 | 0.4883 | 0.4998 | 0.5288 |
-| UHerding | 0.5200 | 0.5871 | 0.7179 | 0.7348 | 0.7421 | 0.7417 | 0.7649 | 0.7637 | 0.7706 | | | | | | | | | | | |
-| REFINE | 0.5577 | 0.6335 | 0.6923 | 0.7200 | 0.7488 | 0.7645 | 0.7819 | 0.7795 | 0.8003 | 0.8058 | 0.8157 | 0.8241 | 0.8193 | 0.8261 | 0.8309 | 0.8317 | 0.8306 | 0.8214 | 0.8353 | 0.8383 |
-| TypiClust | 0.5596 | 0.6612 | 0.6758 | 0.7020 | 0.7404 | 0.7329 | 0.7520 | 0.7608 | 0.7802 | 0.7815 | 0.7955 | 0.7912 | 0.8009 | 0.8090 | 0.8092 | 0.8092 | 0.8119 | 0.8172 | 0.8202 | 0.8244 |
-| ActiveFT | 0.5053 | 0.6374 | 0.6455 | 0.6990 | 0.7240 | 0.7275 | 0.7338 | 0.7481 | 0.7591 | 0.7659 | 0.7734 | 0.7853 | 0.7951 | 0.7954 | 0.7974 | 0.7879 | 0.7971 | 0.7941 | 0.8104 | 0.8112 |
-| Entropy | 0.3447 | 0.5659 | 0.4964 | 0.5020 | 0.5974 | 0.6130 | 0.6397 | 0.7487 | 0.7564 | 0.7479 | 0.7465 | 0.7610 | 0.7676 | 0.7951 | 0.7993 | 0.8026 | 0.8158 | 0.8122 | 0.8188 | 0.8217 |
-| Margin | 0.4677 | 0.5785 | 0.6883 | 0.7075 | 0.7507 | 0.7719 | 0.7804 | 0.7974 | 0.8123 | 0.8154 | 0.8219 | 0.8286 | 0.8117 | 0.8387 | 0.8453 | 0.8471 | 0.8531 | 0.8325 | 0.8569 | 0.8578 |
-| BADGE | 0.4308 | 0.5647 | 0.6689 | 0.7182 | 0.7298 | 0.7458 | 0.7739 | 0.7856 | 0.7993 | 0.7998 | 0.8125 | 0.8180 | 0.8139 | 0.8352 | 0.8420 | 0.8420 | 0.8475 | 0.8492 | 0.8589 | 0.8515 |
-| SCALPEL | 0.6278 | 0.6896 | 0.7164 | 0.7169 | 0.7321 | 0.7594 | 0.7800 | | | | | | | | | | | | | |
-
-#### PALM (linear)
-
-| Phương pháp | Amax | delta | alpha | beta | AUC | Budget to 90 | RMSE |
-|---|---|---|---|---|---|---|---|
-| Random | 1.0000 | 0.6108 | -0.9515 | 0.2230 | 0.7657 | None | 0.0068 |
-| Coreset | 0.5172 | 0.1723 | 1.2384 | 0.9938 | 0.4240 | 278.1 | 0.0097 |
-| UHerding | | | | | | | |
-| REFINE | 0.8442 | 0.5373 | 0.7731 | 0.5875 | 0.7826 | 141.8 | 0.0045 |
-| TypiClust | 1.0000 | 0.6229 | -0.5779 | 0.1965 | 0.7660 | None | 0.0065 |
-| ActiveFT | 0.9381 | 0.6472 | -0.7395 | 0.2196 | 0.7502 | None | 0.0080 |
-| Entropy | 0.8246 | 0.0198 | 7.1284 | 1.6698 | 0.7026 | 250.7 | 0.0347 |
-| Margin | 0.8612 | 0.5626 | -0.1096 | 0.5577 | 0.7854 | 159.6 | 0.0094 |
-| BADGE | 0.8839 | 0.5952 | -0.5062 | 0.4414 | 0.7773 | 220.3 | 0.0081 |
-| SCALPEL | | | | | | | |
-
-### PathMNIST
-
-#### Accuracy (linear) theo budget
-
-| Phương pháp | 25 | 50 | 75 | 100 | 125 | 150 | 175 | 200 | 225 | 250 | 275 | 300 | 325 | 350 | 375 | 400 | 425 | 450 | 475 | 500 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Random | 0.6812 | 0.8162 | 0.8373 | 0.8673 | 0.8766 | 0.8829 | 0.8877 | 0.9047 | 0.9070 | 0.9120 | 0.9110 | 0.9156 | 0.9095 | 0.9131 | 0.9159 | 0.9181 | 0.9184 | 0.9116 | 0.9181 | 0.9206 |
-| Coreset | 0.5731 | 0.5153 | 0.5189 | 0.5812 | 0.6333 | 0.6543 | 0.6716 | 0.6696 | 0.6753 | 0.6613 | 0.6571 | 0.6524 | 0.6535 | 0.6818 | 0.6866 | 0.6900 | 0.6890 | 0.6964 | 0.6907 | 0.6883 |
-| UHerding | 0.4922 | 0.7614 | 0.8341 | 0.8383 | 0.6312 | 0.7990 | 0.7982 | 0.8487 | 0.8525 | 0.8575 | 0.8787 | 0.8805 | | | | | | | | |
-| REFINE | 0.7088 | 0.8046 | 0.8351 | 0.8536 | 0.8499 | 0.8742 | 0.8937 | 0.8894 | 0.8974 | 0.9070 | 0.9187 | 0.9019 | 0.9000 | 0.9095 | 0.9166 | 0.9219 | 0.9205 | 0.9010 | 0.9192 | 0.9240 |
-| TypiClust | 0.7302 | 0.8206 | 0.8093 | 0.8797 | 0.8727 | 0.8745 | 0.8968 | 0.8903 | 0.8916 | 0.9102 | 0.9093 | 0.8930 | 0.9011 | 0.9035 | 0.9224 | 0.9024 | 0.8937 | 0.9052 | 0.8915 | 0.9033 |
-| ActiveFT | 0.6515 | 0.8280 | 0.8290 | 0.8558 | 0.8642 | 0.8825 | 0.8864 | 0.8968 | 0.8808 | 0.9093 | 0.9064 | 0.8907 | 0.8943 | 0.9097 | 0.9043 | 0.9035 | 0.9054 | 0.8919 | 0.9121 | 0.9063 |
-| Entropy | 0.6407 | 0.7085 | 0.7350 | 0.8049 | 0.8276 | 0.8458 | 0.8372 | 0.8730 | 0.8648 | 0.8421 | 0.8880 | 0.8791 | 0.8890 | 0.8759 | 0.8915 | 0.9102 | 0.9088 | 0.8982 | 0.9033 | 0.8990 |
-| Margin | 0.6302 | 0.6377 | 0.8462 | 0.8706 | 0.8717 | 0.9199 | 0.8950 | 0.9058 | 0.9208 | 0.9022 | 0.9116 | 0.9139 | 0.9040 | 0.8968 | 0.9199 | 0.9036 | 0.9235 | 0.9167 | 0.9330 | 0.9149 |
-| BADGE | 0.6054 | 0.7556 | 0.8123 | 0.8405 | 0.8404 | 0.9099 | 0.8905 | 0.8813 | 0.9019 | 0.9175 | 0.9156 | 0.9191 | 0.9078 | 0.9104 | 0.9032 | 0.9174 | 0.9263 | 0.9124 | 0.9214 | 0.9153 |
-| SCALPEL | 0.7790 | 0.8326 | 0.8639 | 0.8799 | 0.8841 | 0.8840 | 0.8825 | 0.8861 | 0.8923 | 0.8939 | 0.9003 | 0.9004 | 0.9035 | | | | | | | |
-
-#### PALM (linear)
-
-| Phương pháp | Amax | delta | alpha | beta | AUC | Budget to 90 | RMSE |
-|---|---|---|---|---|---|---|---|
-| Random | 0.9335 | 0.8494 | -0.7355 | 0.2771 | 0.8919 | 69.0 | 0.0044 |
-| Coreset | 0.6884 | 0.0091 | 13.6785 | 1.8789 | 0.6493 | 132.6 | 0.0237 |
-| UHerding | | | | | | | |
-| REFINE | 0.9474 | 0.8171 | -0.5611 | 0.2514 | 0.8866 | 97.8 | 0.0077 |
-| TypiClust | 0.9046 | 0.6823 | 0.8253 | 0.6194 | 0.8837 | 56.4 | 0.0116 |
-| ActiveFT | 0.9348 | 0.8714 | -0.9424 | 0.1895 | 0.8827 | 69.6 | 0.0086 |
-| Entropy | 0.9094 | 0.5289 | 1.1834 | 0.6050 | 0.8505 | 129.1 | 0.0123 |
-| Margin | 0.9314 | 0.0055 | 6.4602 | 2.6047 | 0.8837 | 91.7 | 0.0234 |
-| BADGE | 0.9224 | 0.7297 | -0.3341 | 0.4926 | 0.8822 | 87.1 | 0.0110 |
-| SCALPEL | | | | | | | |

@@ -142,20 +142,6 @@ def get_sample_ids(dataset: Dataset) -> List[str]:
     return [raw.sample_id(i) for i in range(len(raw))]
 
 
-class ActiveLearningDataset(Dataset):
-    def __init__(self,
-                 subset: Dataset,
-                 labels: torch.Tensor) -> None:
-        self.subset = subset
-        self.labels = labels
-
-    def __len__(self) -> int:
-        return len(self.subset)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        img, _ = self.subset[idx]
-        return img, self.labels[idx]
-
 def default_num_workers(data_path: str) -> int:
     """DataLoader workers to use for `data_path`.
 
