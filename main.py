@@ -48,6 +48,7 @@ from evaluation.sanity import (
     format_report as format_sanity_report,
 )
 from features.vlm import (
+    PROJ_SPACE,
     RAW_SPACE,
     text_prototype_cache_paths,
     vlm_feature_cache_paths,
@@ -326,6 +327,10 @@ def _load_vlm_features(
     PROJ_SPACE is never read here; using it would not crash (both are 512-d
     for CONCH) but would silently train on features meant only for comparing
     an image against text.
+
+    The round-1 text prior is the ONE consumer that needs the other space, and
+    it gets it from `_load_vlm_text_space_features` rather than from here --
+    see that function for what reusing this array instead measured.
     """
     paths = vlm_feature_cache_paths(vlm_cache_dir, dataset_key, random_seed, vlm_name)
     if not (os.path.exists(paths["train"]) and os.path.exists(paths["test"])
@@ -367,6 +372,76 @@ def _load_vlm_features(
         )
     print(f"[vlm] Loaded RAW_SPACE cache -> {paths['train']}")
     return train_features.astype(np.float32), test_features.astype(np.float32)
+
+
+def _load_vlm_text_space_features(
+    vlm_cache_dir: str,
+    dataset_key: str,
+    random_seed: int,
+    vlm_name: str,
+    n_train: int,
+    train_fingerprint: str,
+):
+    """Read the TRAIN rows of `PROJ_SPACE` -- the only space text may be
+    compared against.
+
+    This exists because the round-1 text prior takes a dot product between an
+    image row and a text prototype, and `encode_text_prototypes` writes
+    prototypes in the PROJECTED space. Everything else in a run (probe,
+    coverage kernel, disagreement) uses RAW_SPACE, so the two spaces must be
+    loaded separately rather than one standing in for the other.
+
+    That substitution is exactly the bug this function was added to fix
+    (2026-09-15). `pact_sampling` was handing the text prior its RAW
+    selection features, which only ran at all because **CONCH's RAW and PROJ
+    are both 512-d** -- the coincidence CLAUDE.md warns makes a wrong space
+    invisible to any shape check. Measured on the real histoset seed-42 cache:
+    zero-shot accuracy off RAW is **0.0448**, BELOW the 0.0714 random floor,
+    against **0.4937** off PROJ, and the two rankings are uncorrelated
+    (Kendall tau -0.011, 9 of the top 200 shared). So the weight was noise,
+    not a weaker signal. QuiltNet (RAW 768, PROJ 512) turned it into a loud
+    `ValueError` instead, which is how it was found.
+
+    Only TRAIN is read: the prior scores the unlabeled POOL, and nothing
+    compares test rows against text.
+    """
+    paths = vlm_feature_cache_paths(vlm_cache_dir, dataset_key, random_seed, vlm_name)
+    if not (os.path.exists(paths["proj_train"]) and os.path.exists(paths["proj_manifest"])):
+        raise FileNotFoundError(
+            f"No PROJ_SPACE cache for {dataset_key}_seed{random_seed}_{vlm_name} "
+            f"under {vlm_cache_dir!r}. use_text=True compares image rows against "
+            "text prototypes, which live in the projected space. Re-run "
+            "extract_vlm_features.ipynb: it writes both spaces in one pass."
+        )
+    with open(paths["proj_manifest"], "r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    # The mirror image of the RAW loader's guard. Both are needed: that one
+    # refuses to TRAIN on projected features, this one refuses to compare text
+    # against unprojected ones.
+    if manifest.get("space") != PROJ_SPACE:
+        raise ValueError(
+            f"{paths['proj_manifest']} declares space={manifest.get('space')!r}, "
+            f"expected {PROJ_SPACE!r} -- the text prior must not read RAW_SPACE"
+        )
+    if manifest.get("dataset") != dataset_key or manifest.get("seed") != random_seed:
+        raise ValueError(
+            f"PROJ cache manifest at {paths['proj_manifest']} does not match this "
+            f"run (dataset={dataset_key!r}, seed={random_seed}): got {manifest}"
+        )
+    if manifest.get("train_fingerprint") != train_fingerprint:
+        raise ValueError(
+            f"{paths['proj_manifest']} was built from a different train split "
+            "(sample-order fingerprint mismatch) than this run's RAW cache -- "
+            "the two spaces must index the same rows, or the prior scores the "
+            "wrong patches."
+        )
+    proj_train = np.load(paths["proj_train"])
+    if proj_train.shape[0] != n_train:
+        raise ValueError(
+            f"PROJ cache has {proj_train.shape[0]} train rows, expected {n_train}"
+        )
+    print(f"[vlm] Loaded PROJ_SPACE cache (text prior) -> {paths['proj_train']}")
+    return proj_train.astype(np.float32)
 
 
 def run(
@@ -662,6 +737,13 @@ def run(
                     f"prototypes but this run has {num_classes} classes"
                 )
             sampler_inputs["text_prototypes"] = text_prototypes
+            # The IMAGE side of that same comparison, in the projected space
+            # the prototypes live in -- NOT the RAW selection features. See
+            # `_load_vlm_text_space_features` for what reusing RAW measured.
+            sampler_inputs["text_image_features"] = _load_vlm_text_space_features(
+                vlm_cache_dir, dataset_key, random_seed, visual_backbone,
+                n_train=len(train_dataset), train_fingerprint=train_fingerprint,
+            )
 
             # The model's learned temperature, read from the cache because an
             # AL run never loads CONCH. It is not cosmetic: a positive scale
@@ -690,6 +772,7 @@ def run(
             sampler_inputs["text_logit_scale"] = float(text_manifest["logit_scale"])
             print(
                 f"[text] {description_style}: {text_prototypes.shape} prototypes "
+                f"vs {sampler_inputs['text_image_features'].shape} PROJ_SPACE image rows "
                 f"(logit_scale={sampler_inputs['text_logit_scale']:.2f}) "
                 "-> round-1 acquisition weight"
             )

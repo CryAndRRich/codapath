@@ -97,6 +97,12 @@ def pact_sampling(**kwargs) -> List[int]:
     # text prior and the encoder has a text tower; None keeps round 1 as plain
     # MaxHerding, which is what every result measured before this existed used.
     text_prototypes = kwargs.get("text_prototypes")
+    # The IMAGE side of the text comparison, in the prototypes' own PROJECTED
+    # space. It is a SEPARATE array from `image_embeddings` on purpose: this
+    # sampler selects in RAW space, and the two are not interchangeable even
+    # when they happen to share a width (they do for CONCH -- 512 and 512 --
+    # which is precisely why passing the wrong one went unnoticed).
+    text_image_features = kwargs.get("text_image_features")
     # The model's own learned temperature. It does not change an argmax, but it
     # DOES change the top-2 gap the margin reads, so it is not cosmetic here.
     text_logit_scale = float(kwargs.get("text_logit_scale", 1.0))
@@ -113,7 +119,7 @@ def pact_sampling(**kwargs) -> List[int]:
         "sigma_floor_ratio", "probe_epochs", "probe_lr", "probe_weight_decay",
         "pool_consistency_weight", "pool_confidence_quantile",
         "max_temperature", "diag",
-        "text_prototypes", "text_logit_scale",
+        "text_prototypes", "text_image_features", "text_logit_scale",
         "augmented_feature_provider", "cell_source", "cell_pooling",
         "reliability_mode", "rff_dim", "rff_bandwidth",
         "rff_bandwidth_sample_size", "rff_transform_batch_size",
@@ -185,12 +191,41 @@ def pact_sampling(**kwargs) -> List[int]:
                 # the two probes cannot exist -- but a VLM's text tower places
                 # each patch against one prototype per class with no label at
                 # all, and the margin of THAT is the same "close to a boundary"
-                # quantity rounds 2+ use. `visual_np` is the image side of the
-                # VLM's own space here (main.py passes the CONCH cache), so the
-                # dot product is the zero-shot comparison the model was
-                # trained for, not two unrelated encoders being compared.
+                # quantity rounds 2+ use.
+                #
+                # The image side is `text_image_features` -- the PROJECTED
+                # space the prototypes live in -- and NOT `visual_np`, which
+                # is the RAW space this sampler selects in. Until 2026-09-15
+                # this passed `visual_np`, which ran only because CONCH's two
+                # spaces share a width; measured on histoset seed 42 that made
+                # the zero-shot comparison score 0.0448, BELOW the 0.0714
+                # random floor, so round 1's weight was noise. Refuse rather
+                # than fall back: a silent fallback here is the bug itself.
+                if (
+                    text_image_features is not None
+                    and len(text_image_features) != num_samples
+                ):
+                    # The weight vector is indexed POSITIONALLY against the
+                    # pool, so a different row count does not misalign a few
+                    # rows -- it scores a different patch for every index.
+                    raise ValueError(
+                        f"text_image_features has {len(text_image_features)} rows "
+                        f"but the pool has {num_samples}; the round-1 weight is "
+                        "indexed by pool position, so these must be the same "
+                        "rows in the same order."
+                    )
+                if text_image_features is None:
+                    raise ValueError(
+                        "text_prototypes were supplied without "
+                        "`text_image_features`. The prototypes live in the "
+                        "VLM's PROJECTED space and must be compared against "
+                        "image rows from that same space; the sampler's own "
+                        "`image_embeddings` are RAW and would silently score "
+                        "the wrong quantity."
+                    )
                 weights_np, text_diagnostics = text_prior_weights(
-                    visual_np, text_prototypes, logit_scale=text_logit_scale,
+                    text_image_features, text_prototypes,
+                    logit_scale=text_logit_scale,
                 )
                 diagnostics.update(text_diagnostics)
         elif uncertainty_mode == "coverage":
