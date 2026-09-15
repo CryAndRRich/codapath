@@ -98,6 +98,43 @@ def _prefix_trace(master: Optional[SelectionTrace], budget: int):
     return clipped
 
 
+# The image encoders a run can be built on. "dinov2" extracts its own
+# features; the VLM ones READ a cache `extract_vlm_features.ipynb` published,
+# because building one needs an HF token and a multi-hour forward pass that a
+# 2-GPU AL sweep must not repeat per worker.
+#
+# `image_encoder` is also a RUN-NAME axis (`_default_run_name` appends it), so
+# adding one here is what keeps a QuiltNet run from overwriting the CONCH run of
+# the same sampler config -- the notebook's resume check is "does
+# <name>_results.pt exist", which would otherwise SKIP the second one.
+VLM_ENCODERS = ("conch", "quilt")
+IMAGE_ENCODERS = ("dinov2",) + VLM_ENCODERS
+
+# Which config key holds each VLM's checkpoint name. Kept as a mapping rather
+# than one `vlm:` key so the two checkpoints coexist in config.yaml and a run
+# switches between them with a flag instead of an edit.
+_VLM_CONFIG_KEYS = {
+    "conch": ("vlm", "MahmoodLab/CONCH"),
+    "quilt": ("vlm_quilt", "wisdomik/QuiltNet-B-16-PMB"),
+}
+
+
+def _vlm_checkpoint(model_cfg: Dict, image_encoder: str) -> str:
+    """The checkpoint name for a VLM encoder, from config with a fallback.
+
+    Raises for a non-VLM encoder rather than returning a default: reaching
+    here with "dinov2" means a caller skipped the `in VLM_ENCODERS` branch,
+    and a silent default would read a cache built by a different model.
+    """
+    if image_encoder not in _VLM_CONFIG_KEYS:
+        raise ValueError(
+            f"{image_encoder!r} is not a VLM encoder; expected one of "
+            f"{sorted(_VLM_CONFIG_KEYS)}"
+        )
+    key, default = _VLM_CONFIG_KEYS[image_encoder]
+    return model_cfg.get(key, default)
+
+
 def _default_run_name(
     sampler_name: str,
     sampler_cfg: Dict,
@@ -294,7 +331,7 @@ def _load_vlm_features(
     if not (os.path.exists(paths["train"]) and os.path.exists(paths["test"])
              and os.path.exists(paths["manifest"])):
         raise FileNotFoundError(
-            f"No CONCH feature cache for {dataset_key}_seed{random_seed}_{vlm_name} "
+            f"No VLM feature cache for {dataset_key}_seed{random_seed}_{vlm_name} "
             f"under {vlm_cache_dir!r}. Run extract_vlm_features.ipynb with "
             f"DATASET={dataset_key!r}, SEED={random_seed}, VLM={vlm_name!r} first -- "
             "an AL run reads this cache, it does not build it."
@@ -381,8 +418,10 @@ def run(
     largest -- a full learning curve, not a single point, because the
     research question is whether LoRA helps more at low or high budgets.
     """
-    if image_encoder not in ("dinov2", "conch"):
-        raise ValueError(f"image_encoder must be 'dinov2' or 'conch', got {image_encoder!r}")
+    if image_encoder not in IMAGE_ENCODERS:
+        raise ValueError(
+            f"image_encoder must be one of {sorted(IMAGE_ENCODERS)}, got {image_encoder!r}"
+        )
 
     # A token left unset falls back to the ambient environment, which is how
     # `huggingface_hub.login()` (extract_vlm_features.ipynb) and a Kaggle
@@ -471,8 +510,8 @@ def run(
         # only for labels, sample IDs and the fingerprint, all of which come
         # from `sample_id`, not pixels (tests/test_loaders_transform.py pins
         # this).
-        if image_encoder == "conch":
-            visual_backbone = model_cfg.get("vlm", "MahmoodLab/CONCH")
+        if image_encoder in VLM_ENCODERS:
+            visual_backbone = _vlm_checkpoint(model_cfg, image_encoder)
             train_features, test_features = _load_vlm_features(
                 vlm_cache_dir, dataset_key, random_seed, visual_backbone,
                 n_train=len(train_dataset), n_test=len(test_dataset),
@@ -522,7 +561,7 @@ def run(
                 else:
                     ft_encoder_model.requires_grad_(False)
             else:
-                from features.vlm import load_conch
+                from features.vlm import load_vlm
 
                 # CPU, not `device` -- deliberately, and NOT symmetric with
                 # what `load_conch`'s other callers want. They (the VLM
@@ -543,7 +582,24 @@ def run(
                 # exactly the behaviour this reproduces. Same code path, two
                 # different memory profiles, is what made the failure look
                 # like a CONCH-specific mystery rather than a placement bug.
-                ft_encoder_model, ft_conch_preprocess = load_conch(
+                if image_encoder != "conch" and ft_use_lora:
+                    # `apply_lora_to_conch` walks `visual.trunk.blocks[i].attn.qkv`,
+                    # which is CONCH's own timm ViT wrapped by its CoCa code.
+                    # open_clip's TimmModel (QuiltNet) nests its trunk at
+                    # `visual.trunk.blocks[i].attn.qkv` too, but the wrapper
+                    # walks `model.visual.trunk` expecting CONCH's module
+                    # layout around it, so
+                    # the walk finds nothing and would silently train a frozen
+                    # encoder. Refuse instead: T3/T4 are frozen-backbone rows,
+                    # so nothing in the reported tables needs this path.
+                    raise NotImplementedError(
+                        f"use_lora=True is implemented for image_encoder='conch' and "
+                        f"'dinov2', not {image_encoder!r}: the adapter targets a fused "
+                        "qkv Linear that this architecture does not have. Run "
+                        f"{image_encoder!r} with use_lora=False (a frozen backbone)."
+                    )
+
+                ft_encoder_model, ft_conch_preprocess = load_vlm(
                     visual_backbone, torch.device("cpu"), hf_token=hf_token
                 )
                 if ft_use_lora:
@@ -583,11 +639,11 @@ def run(
         # different space with no text tower pointing into it. `run` raises
         # rather than silently comparing two unrelated encoders.
         if use_text:
-            if image_encoder != "conch":
+            if image_encoder not in VLM_ENCODERS:
                 raise ValueError(
                     f"use_text=True needs a text tower in the same space as the "
                     f"image features, and image_encoder={image_encoder!r} has "
-                    "none. Use image_encoder='conch'."
+                    f"none. Use one of {sorted(VLM_ENCODERS)}."
                 )
             text_paths = text_prototype_cache_paths(
                 vlm_cache_dir, dataset_key, description_style
@@ -1093,20 +1149,20 @@ def main() -> None:
     parser.add_argument("--cellvit_cache_dir", default=None)
     parser.add_argument("--run_name", default=None)
     parser.add_argument(
-        "--image_encoder", default="dinov2", choices=["dinov2", "conch"],
+        "--image_encoder", default="dinov2", choices=sorted(IMAGE_ENCODERS),
         help="which frozen image encoder this run's whole pipeline uses",
     )
     parser.add_argument(
         "--vlm_cache_dir", default=None,
         help="directory extract_vlm_features.ipynb published its cache into "
-             "(only read when --image_encoder=conch)",
+             "(only read for a VLM encoder: --image_encoder=conch or quilt)",
     )
     parser.add_argument(
         "--hf_token", default=None,
         help="Hugging Face token for the gated CONCH checkpoint. Only needed "
              "when --image_encoder=conch AND the final-training pass loads the "
              "model (--use_lora / --augment); reading the feature cache needs "
-             "no token. Defaults to the HF_TOKEN environment variable, which "
+             "no token, and QuiltNet is not gated at all. Defaults to the HF_TOKEN environment variable, which "
              "is preferred -- a token on the command line lands in shell "
              "history and in `ps` output.",
     )

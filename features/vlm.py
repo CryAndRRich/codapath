@@ -45,6 +45,40 @@ which it wraps), so every function here that touches an actual model imports
 That keeps this module importable, and its pure logic (cache naming, manifest
 shape, the official prompt ensemble math, class-order validation) testable,
 without the package installed.
+
+## A second family: QuiltNet (added 2026-09-15)
+
+`image_encoder="quilt"` runs the same pipeline on **QuiltNet-B-16-PMB**
+(`wisdomik/QuiltNet-B-16-PMB`), so the text-prior rows are not a property of
+one checkpoint. It is an `open_clip` **CustomTextCLIP**: a timm ViT-B/16 image
+tower (`visual.trunk`, 768-d) with a `visual.head` projection to 512-d, paired
+with a **PubMedBERT** text tower. The repo ships `open_clip_pytorch_model.bin`
+and no HF-format weights, and its `config.json` names a `BertCLIPModel` with
+no `auto_map`, so it loads through `open_clip`, never `transformers`.
+
+**Why this checkpoint and not PLIP.** The reported text rows run the
+`llm_morphology` descriptions, which measure 100-130 PubMedBERT tokens.
+QuiltNet's text context is **256**, so every description fits whole (measured:
+0 of 39 truncated across all three datasets). A 77-token CLIP tower -- PLIP,
+or QuiltNet-B-32 -- truncates **every one of them** (measured: 39 of 39, with
+only ~53-61% of tokens surviving), which would make the second VLM's row
+measure a different prior than the CONCH rows rather than the same prior on a
+different model.
+
+**The two families are told apart by the VISION tower, in both directions.**
+`extract_vlm_image_features` and `encode_text_prototypes` dispatch on the same
+attributes, so they cannot disagree about what a model is. Both tests are
+POSITIVE (CONCH: `visual.use_attentional_pool_contrast`; QuiltNet:
+`visual.trunk` + `visual.head`) rather than "not the other one" -- a negative
+test routes anything unrecognised, including a checkpoint that failed to load,
+into the wrong branch and raises about the wrong thing.
+
+RAW/PROJ for QuiltNet is `visual.trunk(x)` then `visual.head(raw)`, because
+`TimmModel.forward` is exactly `head(trunk(x))` -- so PROJ is derived from RAW
+without a second trunk pass, the same saving the CONCH path makes. Verified
+against the real checkpoint: PROJ matches `model.encode_image` to 7.8e-08.
+Note the widths DIFFER here (768 vs 512), unlike CONCH where both spaces are
+512 and a wrong space is invisible to any shape check.
 """
 
 from __future__ import annotations
@@ -63,6 +97,11 @@ __all__ = [
     "vlm_feature_cache_paths",
     "text_prototype_cache_paths",
     "load_conch",
+    "load_quilt",
+    "load_vlm",
+    "vlm_family",
+    "CONCH_FAMILY",
+    "QUILT_FAMILY",
     "extract_vlm_image_features",
     "get_or_extract_vlm_features",
     "extract_vlm_features_shard",
@@ -75,6 +114,55 @@ __all__ = [
 # fragments so "which space is this" is never inferred from context.
 RAW_SPACE = "raw"    # proj_contrast=False, normalize=False -- for the probe
 PROJ_SPACE = "proj"  # proj_contrast=True,  normalize=True  -- for text comparison
+
+# Which loader/extractor a checkpoint needs. This is a decision about MODEL
+# ARCHITECTURE, not about the weights: CONCH is CoCa (a custom `conch`
+# package, `visual.forward_no_head` + `proj_contrast`), QuiltNet is an
+# `open_clip` CustomTextCLIP whose vision tower is a TimmModel
+# (`visual.trunk` + `visual.head`). Neither has the other's attributes, so a
+# single code path cannot serve both and a wrong guess raises
+# `AttributeError` deep inside a forward pass rather than here.
+# Filled by `_encode_text_prototypes_open_clip` on every call: how much of each
+# prompt this text tower actually read. `None` until a CLIP-family tower has
+# encoded something (CONCH's 128-token limit fits every style in this project,
+# so its path leaves this alone). The notebook writes it into the text
+# manifest, because "which prior was this row measured under" is not
+# recoverable from the prototypes afterwards.
+LAST_TEXT_TRUNCATION: Optional[Dict[str, object]] = None
+
+CONCH_FAMILY = "conch"
+QUILT_FAMILY = "quilt"
+
+# Substrings that identify a family in a checkpoint name. Matched on the
+# lowercased name so "wisdomik/QuiltNet-B-16-PMB" and a lowercased spelling
+# behave the same.
+_FAMILY_MARKERS = (
+    (CONCH_FAMILY, ("conch",)),
+    (QUILT_FAMILY, ("quilt",)),
+)
+
+
+def vlm_family(vlm_name: str) -> str:
+    """Which family `vlm_name` belongs to, or raise naming the supported set.
+
+    Deliberately a hard failure rather than a default: defaulting to CONCH
+    would send a QuiltNet checkpoint into `create_model_from_pretrained
+    ("conch_ViT-B-16", ...)`, which fails with a shape/key error about a
+    config file the user never chose. Every caller that loads a model routes
+    through here, so adding a third VLM is one entry in `_FAMILY_MARKERS`
+    plus its loader and extractor branch.
+    """
+    lowered = vlm_name.lower()
+    for family, markers in _FAMILY_MARKERS:
+        if any(marker in lowered for marker in markers):
+            return family
+    raise ValueError(
+        f"Cannot tell which VLM family {vlm_name!r} belongs to. Supported: "
+        f"{CONCH_FAMILY} (e.g. 'MahmoodLab/CONCH'), {QUILT_FAMILY} (e.g. "
+        f"'wisdomik/QuiltNet-B-16-PMB'). Add a marker to "
+        "features/vlm.py::_FAMILY_MARKERS together with a loader and an "
+        "extractor branch."
+    )
 
 
 def _safe_name(name: str) -> str:
@@ -155,6 +243,52 @@ def load_conch(vlm_name: str, device: torch.device, hf_token: Optional[str] = No
     return model, preprocess
 
 
+def load_quilt(vlm_name: str, device: torch.device, hf_token: Optional[str] = None):
+    """Load a QuiltNet-family (`open_clip` CustomTextCLIP) checkpoint.
+
+    QuiltNet-B-16-PMB (Ikezogwo et al., NeurIPS 2023, `wisdomik/QuiltNet-B-16-PMB`)
+    is a timm ViT-B/16 image tower paired with a **PubMedBERT** text tower, so
+    it is neither CONCH's CoCa nor a stock HF `CLIPModel`: the repo ships
+    `open_clip_pytorch_model.bin` and no HF-format weights, and its
+    `config.json` names a `BertCLIPModel` with no `auto_map`. It therefore
+    loads through `open_clip`, not `transformers`.
+
+    The reason this checkpoint is used at all is its **256-token** text
+    context. `llm_morphology` descriptions run 100-130 PubMedBERT tokens, so
+    they fit whole -- where a 77-token CLIP tower (PLIP, QuiltNet-B-32) would
+    truncate every one of them and measure a different prior than the CONCH
+    rows do.
+
+    Returns `(model, preprocess)` with the same contract as `load_conch`:
+    `preprocess` comes from the checkpoint's own factory and must be used
+    as-is (224x224, OpenAI CLIP normalization).
+
+    `open_clip` is imported lazily, like `conch`, so this module stays
+    importable without it.
+    """
+    import open_clip
+
+    checkpoint = vlm_name if vlm_name.startswith("hf-hub:") else f"hf-hub:{vlm_name}"
+    model, _, preprocess = open_clip.create_model_and_transforms(checkpoint)
+    model.eval()
+    model = model.to(device)
+    return model, preprocess
+
+
+def load_vlm(vlm_name: str, device: torch.device, hf_token: Optional[str] = None):
+    """Load any supported VLM, dispatching on `vlm_family(vlm_name)`.
+
+    Prefer this over `load_conch`/`load_quilt` in code that is meant to work
+    for more than one checkpoint (the extraction worker, the notebook). The
+    family-specific loaders stay public because the preflight cells assert on
+    family-specific attributes.
+    """
+    family = vlm_family(vlm_name)
+    if family == CONCH_FAMILY:
+        return load_conch(vlm_name, device, hf_token=hf_token)
+    return load_quilt(vlm_name, device, hf_token=hf_token)
+
+
 @torch.inference_mode()
 def extract_vlm_image_features(
     dataloader,
@@ -202,27 +336,57 @@ def extract_vlm_image_features(
     model = model.to(device)
     model.eval()
 
+    # Which pair of "one trunk pass -> RAW, then one projection -> PROJ" steps
+    # to run. Decided once, outside the loop, and by ARCHITECTURE rather than
+    # by the checkpoint name: `visual.trunk`/`visual.head` is open_clip's
+    # TimmModel shape (QuiltNet), `visual.forward_no_head`/`proj_contrast` is
+    # CONCH's CoCa shape. Neither has the other's attributes, so a wrong
+    # branch raises here instead of producing a plausible wrong array.
     visual = getattr(model, "visual", None)
-    if visual is None or not getattr(visual, "use_attentional_pool_contrast", False):
+    is_conch = visual is not None and getattr(visual, "use_attentional_pool_contrast", False)
+    # open_clip's TimmModel: `forward` is exactly `head(trunk(x))`, so the
+    # trunk output IS the pre-projection space and the head IS the projection.
+    is_quilt = (
+        not is_conch
+        and visual is not None
+        and hasattr(visual, "trunk")
+        and hasattr(visual, "head")
+    )
+
+    if not is_conch and not is_quilt:
         raise AttributeError(
-            "extract_vlm_image_features assumes model.visual.use_attentional_pool_contrast "
-            "is True (conch_ViT-B-16.json's config) so RAW and PROJ can share one trunk "
-            "pass via forward_no_head + proj_contrast. This checkpoint's vision tower does "
-            "not have that shape -- extend this function for it rather than silently "
-            "falling back to two full forward passes."
+            "extract_vlm_image_features supports two vision-tower shapes: CONCH's "
+            "(model.visual.use_attentional_pool_contrast True, so RAW and PROJ share "
+            "one trunk pass via forward_no_head + proj_contrast) and open_clip's "
+            "TimmModel (model.visual.trunk + model.visual.head, as QuiltNet uses). "
+            "This checkpoint has neither -- extend this function for it rather than "
+            "silently falling back to two full forward passes."
         )
 
     raw_batches: List[np.ndarray] = []
     proj_batches: List[np.ndarray] = []
     for images, _ in tqdm(dataloader, desc="Extracting VLM features", leave=False):
         images = images.to(device, non_blocking=True)
-        # RAW_SPACE: exactly what encode_image(proj_contrast=False, normalize=False)
-        # returns -- the trunk + attention-pool + layernorm, nothing more.
-        raw = visual.forward_no_head(images, normalize=False)
-        # PROJ_SPACE: the one additional step encode_image(proj_contrast=True,
-        # normalize=True) takes past that same `raw` vector -- see the
-        # docstring above for the exact line-by-line correspondence.
-        proj = F.normalize(raw @ visual.proj_contrast, dim=-1)
+        if is_conch:
+            # RAW_SPACE: exactly what encode_image(proj_contrast=False, normalize=False)
+            # returns -- the trunk + attention-pool + layernorm, nothing more.
+            raw = visual.forward_no_head(images, normalize=False)
+            # PROJ_SPACE: the one additional step encode_image(proj_contrast=True,
+            # normalize=True) takes past that same `raw` vector -- see the
+            # docstring above for the exact line-by-line correspondence.
+            proj = F.normalize(raw @ visual.proj_contrast, dim=-1)
+        else:
+            # RAW_SPACE for open_clip's TimmModel: the TRUNK output, i.e. the
+            # pooled pre-projection vector (768-d on QuiltNet's ViT-B/16).
+            # This is the analogue of CONCH's pre-projection space and what a
+            # linear probe should train on.
+            raw = visual.trunk(images)
+            # PROJ_SPACE: `TimmModel.forward` is exactly `head(trunk(x))`
+            # (verified against open_clip's own source), so applying the head
+            # to `raw` reproduces `encode_image` without a second trunk pass.
+            # L2-normalized to match CONCH's normalize=True, which
+            # `zero_shot_logits` assumes.
+            proj = F.normalize(visual.head(raw), dim=-1)
         raw_batches.append(raw.cpu().numpy().astype(np.float32))
         proj_batches.append(proj.cpu().numpy().astype(np.float32))
 
@@ -297,7 +461,7 @@ def get_or_extract_vlm_features(
     print(f"[vlm] Cache miss -- extracting {vlm_name} features for '{dataset_key}' (seed={seed}).")
     owns_model = model is None
     if owns_model:
-        model, _ = load_conch(vlm_name, device, hf_token=hf_token)
+        model, _ = load_vlm(vlm_name, device, hf_token=hf_token)
     train_raw, train_proj = extract_vlm_image_features(train_loader, model, device)
     test_raw, test_proj = extract_vlm_image_features(test_loader, model, device)
     if owns_model:
@@ -418,7 +582,7 @@ def extract_vlm_features_shard(
             print(f"[vlm] shard {shard_index} {split}: stale/partial shard, recomputing")
 
         if model is None:
-            model, _ = load_conch(vlm_name, device, hf_token=hf_token)
+            model, _ = load_vlm(vlm_name, device, hf_token=hf_token)
 
         subset = torch.utils.data.Subset(loader.dataset, range(start, stop))
         shard_loader = torch.utils.data.DataLoader(
@@ -553,11 +717,79 @@ def description_sha256(descriptions: Dict[str, str]) -> str:
 
 
 @torch.inference_mode()
+def _encode_text_prototypes_open_clip(model, vlm_name, class_prompts, device) -> torch.Tensor:
+    """The same prompt-ensemble math as `encode_text_prototypes`, for an
+    `open_clip` CustomTextCLIP (QuiltNet): normalize each prompt embedding
+    INDIVIDUALLY, mean, normalize the mean.
+
+    Kept as a separate function rather than a branch inside the loop because
+    the tokenizer is obtained differently (`open_clip.get_tokenizer` keyed on
+    the hub name, not CONCH's bundled BPE) even though `encode_text` is
+    spelled the same.
+
+    **Truncation is not expected here and is reported if it happens.**
+    QuiltNet-B-16-PMB's PubMedBERT tower takes 256 tokens, and the
+    `llm_morphology` descriptions this project runs measure 100-130 of them,
+    so they fit whole -- which is the reason this checkpoint was chosen over a
+    77-token CLIP tower. `open_clip`'s tokenizer pads and truncates to
+    `context_length` silently, so the count below is the only thing that would
+    notice a longer description file arriving later.
+    """
+    import open_clip
+    import torch.nn.functional as F
+
+    hub = vlm_name if vlm_name.startswith("hf-hub:") else f"hf-hub:{vlm_name}"
+    tokenizer = open_clip.get_tokenizer(hub)
+    limit = int(getattr(tokenizer, "context_length", 0) or 0)
+
+    truncated = 0
+    lengths = []
+    prototypes = []
+    for prompts in class_prompts:
+        if not prompts:
+            raise ValueError("a class's prompt list must not be empty")
+        prompts = list(prompts)
+        if limit:
+            # Count real (unpadded) length per prompt, so a description file
+            # that outgrows the tower cannot pass unnoticed.
+            for one in prompts:
+                ids = tokenizer(one)
+                row = ids[0] if hasattr(ids, "__len__") and len(ids) else ids
+                nonzero = int((row != 0).sum().item()) if hasattr(row, "sum") else 0
+                lengths.append(nonzero)
+                if nonzero >= limit:
+                    truncated += 1
+        token_ids = tokenizer(prompts).to(device)
+        embeddings = model.encode_text(token_ids)
+        embeddings = F.normalize(embeddings, dim=-1)
+        prototype = embeddings.mean(dim=0)
+        prototype = prototype / prototype.norm()
+        prototypes.append(prototype)
+
+    global LAST_TEXT_TRUNCATION
+    LAST_TEXT_TRUNCATION = {
+        "token_limit": limit,
+        "prompts_total": len(lengths),
+        "prompts_truncated": int(truncated),
+        "longest_prompt_tokens": int(max(lengths)) if lengths else 0,
+    }
+    if truncated:
+        print(
+            f"[vlm] WARNING: {truncated}/{len(lengths)} prompts reached this "
+            f"tower's {limit}-token limit and lost their tail. This checkpoint "
+            "was chosen because llm_morphology fits inside it, so a hit here "
+            "means the descriptions grew -- check them before trusting the row."
+        )
+    return torch.stack(prototypes, dim=0)
+
+
+@torch.inference_mode()
 def encode_text_prototypes(
     model,
     class_names: Sequence[str],
     class_prompts: Sequence[Sequence[str]],
     device: torch.device,
+    vlm_name: Optional[str] = None,
 ) -> torch.Tensor:
     """One 512-d prototype per class, the official CONCH ensemble
     (`downstream/zeroshot_path.py::zero_shot_classifier`, verified line-by-line):
@@ -575,13 +807,42 @@ def encode_text_prototypes(
     Returns a `(C, 512)` tensor, L2-normalized per row, ready to compare
     against `PROJ_SPACE` image embeddings.
     """
-    from conch.open_clip_custom import get_tokenizer, tokenize
     import torch.nn.functional as F
 
     if len(class_names) != len(class_prompts):
         raise ValueError(
             f"{len(class_names)} class names but {len(class_prompts)} prompt lists"
         )
+
+    # QuiltNet (open_clip CustomTextCLIP) also has `encode_text`, so the two
+    # families cannot be told apart by that. The VISION tower is what differs
+    # unambiguously, and it is the same attribute `extract_vlm_image_features`
+    # dispatches on, so the two functions cannot disagree about what a model is.
+    #
+    # Note the test for the open_clip branch is POSITIVE (`visual.trunk` +
+    # `visual.head`) rather than "not CONCH-shaped". A negative test would
+    # route anything unrecognised -- including a CONCH model that failed to
+    # load -- into the open_clip path, where it would raise about a missing
+    # `vlm_name` instead of about the real problem.
+    visual = getattr(model, "visual", None)
+    if hasattr(visual, "trunk") and hasattr(visual, "head"):
+        if not vlm_name:
+            # open_clip keys its tokenizer on the hub name, and the wrong
+            # tokenizer produces valid-looking ids for a different vocabulary
+            # -- prototypes that are silently meaningless. Refuse rather than
+            # guess a default.
+            raise ValueError(
+                "encode_text_prototypes needs `vlm_name` for a non-CONCH "
+                "checkpoint: open_clip resolves the tokenizer from the hub "
+                "name, and the wrong vocabulary yields prototypes that look "
+                "fine and mean nothing."
+            )
+        return _encode_text_prototypes_open_clip(
+            model, vlm_name, class_prompts, device
+        )
+
+    from conch.open_clip_custom import get_tokenizer, tokenize
+
     tokenizer = get_tokenizer()
     # CONCH's own `tokenize` calls `tokenizer.batch_encode_plus`, which
     # transformers 5 removed along with `PreTrainedTokenizerFast` (replaced by

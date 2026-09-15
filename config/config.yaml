@@ -15,6 +15,14 @@ models:
   # biomedbert -- BiomedCLIP/PLIP/PubMedBERT) were CODAPath-era leftovers:
   # nothing in the codebase reads them, superseded by CONCH (features/vlm.py).
   vlm: "MahmoodLab/CONCH"
+  # Read when image_encoder="quilt" (T3/T4): a second pathology VLM, so the
+  # text-prior result is not a property of one checkpoint. open_clip
+  # CustomTextCLIP (timm ViT-B/16 + PubMedBERT, 224x224, RAW 768-d / PROJ
+  # 512-d), not gated. Chosen over PLIP for its 256-token text context:
+  # llm_morphology runs 100-130 tokens and a 77-token CLIP tower would
+  # truncate every one of them, measuring a different prior than the CONCH
+  # rows do.
+  vlm_quilt: "wisdomik/QuiltNet-B-16-PMB"
 
 training:
   probe_epochs: 100

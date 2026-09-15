@@ -27,6 +27,24 @@ transformers>=4.27.0,<5
 # broken environment; the notebooks additionally carry the bound on their own
 # `-U` line, because `-U` ignores what is already installed.
 huggingface_hub>=0.23.2,<1.0
+# QuiltNet-B-16-PMB (image_encoder="quilt") ships open_clip-format weights
+# only -- no HF-format checkpoint and no `auto_map` -- so it loads through
+# open_clip, not transformers. Bounded on BOTH sides for two separate reasons:
+#
+#   * open_clip declares `huggingface-hub` with NO upper bound, so installing
+#     it unpinned resolves hub 1.x and `import transformers` then raises --
+#     the same wall the two pins above exist for. Measured with `pip install
+#     --dry-run open_clip_torch==3.3.0` on its own: it wants hub 1.31.0.
+#     Keeping this file's hub bound is what makes that a no-op, so the two
+#     lines are load-bearing together; neither alone is enough.
+#   * it declares `timm>=1.0.17`, and timm is where CONCH's LoRA target lives
+#     (`visual.trunk.blocks[i].attn.qkv`, a timm `Attention`). An unbounded
+#     upgrade here would silently move a module CONCH-side code walks by path.
+#
+# 3.x is required, not merely preferred: `create_model_and_transforms` only
+# accepts an `hf-hub:` checkpoint string from 2.x on, and 3.3.0 is what the
+# QuiltNet loader was verified against (PROJ matches `encode_image` to 7.8e-08).
+open_clip_torch>=3.0,<4
 PyYAML>=6.0
 
 # Test suite (tests/ is untracked -- see .gitignore).

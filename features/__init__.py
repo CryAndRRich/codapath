@@ -6,8 +6,11 @@ from .vlm import (
     encode_text_prototypes,
     get_or_extract_vlm_features,
     load_conch,
+    load_quilt,
+    load_vlm,
     text_prototype_cache_paths,
     vlm_feature_cache_paths,
+    vlm_family,
     zero_shot_logits,
 )
 
@@ -21,7 +24,10 @@ __all__ = [
     "encode_text_prototypes",
     "get_or_extract_vlm_features",
     "load_conch",
+    "load_quilt",
+    "load_vlm",
     "text_prototype_cache_paths",
     "vlm_feature_cache_paths",
+    "vlm_family",
     "zero_shot_logits",
 ]

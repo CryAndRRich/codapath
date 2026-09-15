@@ -1,4 +1,4 @@
-"""Sharded CONCH (VLM) feature extraction for a Kaggle T4 x2 session.
+"""Sharded VLM (CONCH or QuiltNet) feature extraction for a Kaggle T4 x2 session.
 
 `extract_vlm_shard_on_worker` is the entry point `utils.parallel` dispatches:
 one process per GPU, each extracting a contiguous row range of both splits.
@@ -8,11 +8,11 @@ Import-only module; the notebook drives it. It exists so the worker target
 lives outside the notebook, which `spawn` cannot import from -- the same
 reason `scripts/extract_visual_features.py` exists.
 
-**Each worker loads its own CONCH checkpoint.** Unlike the DINOv2 notebook,
+**Each worker loads its own VLM checkpoint.** Unlike the DINOv2 notebook,
 the model cannot be loaded in the parent and passed down: a CUDA-initialised
 module does not survive `spawn` pickling, and the parent must not touch CUDA
 before forking workers anyway. The checkpoint is downloaded once in the
-parent (into the shared HF cache), so each worker's `load_conch` is a local
+parent (into the shared HF cache), so each worker's `load_vlm` is a local
 read, not a second download.
 """
 
@@ -56,10 +56,11 @@ def extract_vlm_shard_on_worker(
     `get_data_loaders`, so both workers must seed identically or they would
     shard two different splits and the assembled cache would interleave them.
 
-    The loaders are built with CONCH's OWN `preprocess` (448x448 + OpenAI CLIP
-    normalization), never `get_data_loaders`'s DINOv2 default -- a hand-rolled
-    equivalent does not crash, it just silently shifts every embedding
-    (features/vlm.py module docstring).
+    The loaders are built with the VLM's OWN `preprocess` (CONCH: 448x448 +
+    OpenAI CLIP normalization; QuiltNet: 224x224 + CLIP normalization), never
+    `get_data_loaders`'s DINOv2 default -- a hand-rolled equivalent does not
+    crash, it just silently shifts every embedding (features/vlm.py module
+    docstring).
 
     `mmap_cache_dir` is what keeps two workers inside a Kaggle session's RAM.
     An eager .npz read costs ~15 GiB per process on PathMNIST-224, so two of
@@ -70,15 +71,18 @@ def extract_vlm_shard_on_worker(
     import torch
 
     from data.loaders import get_data_loaders
-    from features.vlm import extract_vlm_features_shard, load_conch
+    from features.vlm import extract_vlm_features_shard, load_vlm
     from utils import set_seed
 
     set_seed(seed)
     device = torch.device(device_string)
 
-    # The model comes FIRST: building a loader with the right pixels needs
-    # CONCH's preprocess, which only exists after the checkpoint is loaded.
-    model, preprocess = load_conch(vlm_name, device, hf_token=hf_token or None)
+    # The model comes FIRST: building a loader with the right pixels needs the
+    # VLM's own preprocess, which only exists after the checkpoint is loaded.
+    # `load_vlm` dispatches on the checkpoint name (CONCH's CoCa vs QuiltNet's
+    # open_clip CustomTextCLIP); each returns the transform its own
+    # checkpoint was trained with -- 448x448 for CONCH, 224x224 for QuiltNet.
+    model, preprocess = load_vlm(vlm_name, device, hf_token=hf_token or None)
 
     train_loader, test_loader, _ = get_data_loaders(
         data_path, seed, verbose=False, mmap_cache_dir=mmap_cache_dir,
@@ -87,7 +91,9 @@ def extract_vlm_shard_on_worker(
     # `get_data_loaders`'s own batch size assumes DINOv2's 224x224; CONCH's
     # 448x448 is 4x the pixels, so rebuild at the caller's batch_size. VRAM,
     # not RAM, is the binding constraint here -- a T4 has 16 GiB and this is
-    # the knob that fits the forward pass into it.
+    # the knob that fits the forward pass into it. QuiltNet runs at 224x224, so
+    # it fits a far larger batch than CONCH at the same VRAM; the caller
+    # chooses, this function does not second-guess it.
     train_loader = torch.utils.data.DataLoader(
         train_loader.dataset, batch_size=batch_size, shuffle=False,
         num_workers=train_loader.num_workers, pin_memory=True,
