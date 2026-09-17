@@ -16,8 +16,17 @@ import matplotlib.pyplot as plt
 
 __all__ = ["plot_accuracy_curves"]
 
-# Fraction of figure height reserved above the panels for the legend.
-LEGEND_STRIP = 0.13
+# Fraction of figure height reserved above the panels for ONE legend row.
+# The strip has to scale with the number of rows the legend actually wraps to:
+# a fixed fraction sized for the two-row ten-method legend leaves a band of
+# empty figure above a one-row legend as tall as the legend itself.
+LEGEND_ROW_STRIP = 0.065
+# Extra strip beyond the legend box itself, so it does not sit on the titles.
+LEGEND_GAP = 0.05
+
+# All bands share one zorder, below every curve. Grid lines sit at 1.5 by
+# default, so this keeps the bands above the grid and under the data.
+BAND_ZORDER = 1.6
 
 
 def plot_accuracy_curves(
@@ -34,6 +43,12 @@ def plot_accuracy_curves(
     linewidth: float = 1.2,
     markersize: float = 4.0,
     highlight_scale: float = 1.2,
+    label_fontsize: float = 15.0,
+    tick_fontsize: float = 13.0,
+    title_fontsize: float = 17.0,
+    legend_fontsize: float = 15.0,
+    band_alpha: float = 0.10,
+    highlight_band_alpha: float = 0.22,
 ) -> None:
     """Raw accuracy vs cumulative budget, one square-ish panel per dataset.
 
@@ -49,10 +64,10 @@ def plot_accuracy_curves(
     curve gets a translucent +-1 std band. Omit it and the function behaves
     exactly as before, so single-seed callers need no change.
 
-    `band_methods` restricts the shading to a subset (typically just the
-    highlighted method): with ten baselines on one panel, ten overlapping bands
-    hide the curves they are meant to annotate. Defaults to every method that
-    has std values.
+    `band_methods` restricts the shading to a subset; it defaults to every
+    method that has std values. Ten overlapping bands stay readable only
+    because `band_alpha` is low and every band is drawn under every curve --
+    raise the alpha and the middle of the panel turns to mush.
 
     `panel_size` is the (width, height) of ONE panel in inches -- widen it for
     a rectangular layout. Note that a wide panel does not by itself separate
@@ -62,10 +77,25 @@ def plot_accuracy_curves(
     (highlight included) is drawn at -- keep both small on a ten-method panel
     or the markers themselves cover the gaps the figure exists to show.
     """
+    # Ten colours chosen by maximising the SMALLEST pairwise CIE76 distance
+    # over a candidate pool, not by picking hues that sound different. The
+    # original hand-assembled palette had three pairs under dE=25 -- orange vs
+    # amber at 18.0, blue vs indigo at 18.7 -- which read as one colour at
+    # 1.2pt line width; this set's closest pair is 46.1.
+    #
+    # The pool spans DARK hues as well as bright ones (forest green at L=35,
+    # purple at L=30, navy at L=36 sit beside L=69-71 orange and green), with
+    # only two constraints: CIE L in [25, 78] so nothing is lost against white
+    # paper or indistinguishable from another dark, and saturation >= 0.60 so
+    # every hue stays vivid. Two constraints that sound reasonable were
+    # measured and REJECTED: an all-bright palette crowds into one corner of
+    # the gamut and drops the minimum to 22.8, and forcing a minimum hue gap
+    # drops it to 25.4 by spreading hues evenly instead of maximising the
+    # distance the eye actually uses.
     _PALETTE = [
-        "#d62728", "#7f7f7f", "#ff7f0e", "#2ca02c", "#17becf",
-        "#9467bd", "#8c564b", "#e377c2", "#bcbd22", "#1f77b4",
-        "#aec7e8", "#ffbb78",
+        "#e8000b", "#1b5e20", "#ff8c00", "#6a1b9a", "#00acc1",
+        "#e8118f", "#00c853", "#afb42b", "#d500f9", "#01579b",
+        "#5d4037", "#f9a825",
     ]
     _MARKERS = ["*", "o", "v", "^", "s", "D", "P", "X", "h", "<", "p", ">"]
 
@@ -111,12 +141,16 @@ def plot_accuracy_curves(
             if spread is not None and (band_methods is None or m in band_methods):
                 centre = np.asarray(vals, dtype=float)
                 half = np.asarray(spread, dtype=float)
+                # Every band goes BELOW every curve, not just below its own.
+                # Drawing a band at its method's zorder minus one still lets it
+                # cover the curves of methods ordered after it -- harmless with
+                # one band, and the whole problem once every method has one.
                 ax.fill_between(
                     budget, centre - half, centre + half,
                     color=style[m]["color"],
-                    alpha=0.30 if m == highlight else 0.15,
+                    alpha=highlight_band_alpha if m == highlight else band_alpha,
                     linewidth=0,
-                    zorder=style[m].get("zorder", 2) - 1,
+                    zorder=BAND_ZORDER,
                 )
             ax.plot(
                 budget, vals,
@@ -130,9 +164,10 @@ def plot_accuracy_curves(
             )
 
         ax.set_xticks(budget)
-        ax.set_xlabel("Cumulative Budget", fontsize=12)
-        ax.set_ylabel("Accuracy (%)", fontsize=12)
-        ax.set_title(dataset_titles.get(dset, dset), fontsize=13)
+        ax.tick_params(axis="both", labelsize=tick_fontsize)
+        ax.set_xlabel("Cumulative Budget", fontsize=label_fontsize)
+        ax.set_ylabel("Accuracy (%)", fontsize=label_fontsize)
+        ax.set_title(dataset_titles.get(dset, dset), fontsize=title_fontsize)
         ax.grid(True, linestyle="--", alpha=0.4)
 
     handles, labels = axes[0].get_legend_handles_labels()
@@ -140,10 +175,16 @@ def plot_accuracy_curves(
     # then anchor the legend into that strip. Two failure modes bracket this:
     # anchoring at 1.12 over a `top=0.80` margin leaves a band of empty figure
     # as tall as the legend, and pulling it flush to 1.0 makes it overlap the
-    # panel titles. `LEGEND_STRIP` is the fraction of figure height it gets.
-    plt.tight_layout(rect=(0, 0, 1, 1.0 - LEGEND_STRIP))
+    # panel titles. The strip is sized from the number of rows the legend wraps
+    # to, since that -- not the figure -- is what sets how tall it is.
+    ncol = min(ncols_legend, len(labels))
+    rows = -(-len(labels) // ncol)
+    # The strip holds the legend itself plus a gap to the panel titles; anchor
+    # the legend at the TOP of it so the gap lands between the two.
+    strip = LEGEND_ROW_STRIP * rows + LEGEND_GAP
+    plt.tight_layout(rect=(0, 0, 1, 1.0 - strip))
     fig.legend(handles, labels, loc="upper center",
-               bbox_to_anchor=(0.5, 1.0 - LEGEND_STRIP * 0.08),
-               ncol=min(ncols_legend, len(methods)), fontsize=11, frameon=True)
+               bbox_to_anchor=(0.5, 1.0),
+               ncol=ncol, fontsize=legend_fontsize, frameon=True)
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close(fig)

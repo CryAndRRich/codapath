@@ -27,12 +27,17 @@ def build_cell_view(
 ) -> Tuple[torch.Tensor, float]:
     """Return `(normalized cell view, fraction of patches with no nucleus)`.
 
-    A patch where CellViT found nothing has no cell vector at all, and the
-    choice of what to put there changes selection materially:
+    A patch where CellViT found nothing has no cell vector at all, so some
+    value has to stand in for it:
 
-    * `"mean"` (default) — the mean direction of all valid cell vectors. Such a
-      patch becomes maximally typical rather than maximally novel, so it stops
-      winning coverage on the strength of being unlike everything.
+    * `"mean"` (default) — the mean direction of all valid cell vectors, which
+      keeps the array dense without inventing a novel direction. Note what this
+      value does NOT do: the coverage kernel reads the TISSUE view only
+      (`sampler.coverage_features`), the acquisition weight multiplies the
+      disagreement term by rho so a rho=0 row contributes none of it, and the
+      pool-consistency term is passed only the valid rows. The imputed value is
+      therefore inert in selection, and exists so downstream code never has to
+      special-case a ragged array.
     * `"zero"` — leave the row at zero. Ablation only: a zero row has cosine 0
       with every other row INCLUDING other zero rows, so covering one does not
       cover the next and the greedy over-selects them. Always read the reported

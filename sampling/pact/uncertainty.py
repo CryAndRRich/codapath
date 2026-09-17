@@ -189,12 +189,22 @@ def round_weights(
             device,
             cell_valid=valid[selected_index],
             weight_decay=probe_weight_decay,
-            # The UNLABELED pool, in the same two views the probes read. Rows
-            # are passed whole; `train_dual_probe` does the subsampling, so
-            # the draw is deterministic per round rather than depending on
+            # The UNLABELED pool, in the same two views the probes read,
+            # RESTRICTED to patches that actually contain a detected nucleus.
+            # A patch with rho=0 has no cell vector of its own -- `views.py`
+            # imputes one (the mean direction of the valid rows) purely so the
+            # array stays dense. Feeding that imputed row to the coupling term
+            # would penalise the cell probe for disagreeing on a patch it was
+            # never trained on and has no evidence about, and because every
+            # imputed row is the SAME vector they enter or leave the
+            # confidence mask as one block. The labeled cell loss already
+            # excludes them (`cell_valid`); this keeps the pool term
+            # consistent with that.
+            # Rows are passed whole; `train_dual_probe` does the subsampling,
+            # so the draw is deterministic per round rather than depending on
             # whatever RNG state selection happened to leave behind.
-            pool_visual_features=visual_features if pool_consistency_weight > 0.0 else None,
-            pool_cell_features=cell_features if pool_consistency_weight > 0.0 else None,
+            pool_visual_features=visual_features[valid] if pool_consistency_weight > 0.0 else None,
+            pool_cell_features=cell_features[valid] if pool_consistency_weight > 0.0 else None,
             pool_consistency_weight=pool_consistency_weight,
             pool_confidence_quantile=pool_confidence_quantile,
         )

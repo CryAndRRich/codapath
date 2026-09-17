@@ -5,7 +5,9 @@ which differed only in whether they averaged. One seed plots the curve straight
 from each archive; several plot the mean with +-1 std bands.
 
 Both read the extracted archives under
-`data_upload/{baselines,PACT}/<dataset>/seed<N>/<run>/*_results.pt`. Reading the
+`data_upload/selected/{baselines,PACT}/<dataset>/seed<N>/<run>/*_results.pt`.
+Every `_results.pt` was moved out of the weights archives into `selected/` on
+2026-09-13 so the archives hold weights and nothing else. Reading the
 archives rather than `analysist/*.csv` is deliberate: the CSVs only ever held 8
 samplers, because refine and uncertainty_herding had run at seed 42 alone, and
 the archives pick up every sampler that exists with no regeneration step.
@@ -15,9 +17,10 @@ loader asserts `pool_consistency_weight == 5` rather than trusting the run name,
 because the plain and poolcons runs differ by about the size of the gap to the
 nearest baseline.
 
-Only the highlighted method gets a shaded band unless `--band-all`: overlapping
-bands from ten methods obscure the curves they annotate. The highlight is drawn
-at the same line width as everything else -- it stands out by position and
+Every method gets a +-1 std band. Ten overlapping bands are readable only
+because they are drawn faintly and all of them sit under all the curves; pass
+`--band-highlight-only` for the earlier PACT-only version. The highlight is
+drawn at the same line width as everything else -- it stands out by position and
 zorder, not by being thicker.
 
 Run:
@@ -34,7 +37,7 @@ import torch
 HERE = os.path.dirname(os.path.abspath(__file__))
 CODAPATH = os.path.dirname(os.path.dirname(HERE))
 PROJECT_ROOT = os.path.dirname(CODAPATH)
-DATA_UPLOAD = os.path.join(PROJECT_ROOT, "data_upload")
+DATA_UPLOAD = os.path.join(PROJECT_ROOT, "data_upload", "selected")
 ASSETS = os.path.join(CODAPATH, "assets", "img")
 
 import sys
@@ -80,7 +83,9 @@ def _results_path(run_dir):
 
 def _curve(path):
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    linear = payload["linear"]
+    # Budget keys are ints in the older archives and strings in the newer ones;
+    # normalise rather than assume, since guessing wrong is a KeyError per run.
+    linear = {int(b): m for b, m in payload["linear"].items()}
     return payload, [linear[b]["acc"] * 100.0 for b in BUDGETS]
 
 
@@ -113,8 +118,8 @@ def load_pact(dataset, seed):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=int, nargs="+", default=[42])
-    parser.add_argument("--band-all", action="store_true",
-                        help="shade every method, not only the highlight")
+    parser.add_argument("--band-highlight-only", action="store_true",
+                        help="shade only the highlighted method, not every one")
     parser.add_argument("--out", default=None)
     arguments = parser.parse_args()
     seeds = arguments.seeds
@@ -156,7 +161,7 @@ def main():
     if len(seeds) > 1:
         extra = {
             "std_data": stds_per_dataset,
-            "band_methods": None if arguments.band_all else [HIGHLIGHT_LABEL],
+            "band_methods": [HIGHLIGHT_LABEL] if arguments.band_highlight_only else None,
             "panel_size": PANEL_SIZE,
             "linewidth": 1.2,
             "markersize": 4.0,
@@ -169,7 +174,7 @@ def main():
         dataset_titles=DATASET_TITLES, save_path=out,
         **extra,
     )
-    band = "every method" if arguments.band_all else HIGHLIGHT_LABEL + " only"
+    band = HIGHLIGHT_LABEL + " only" if arguments.band_highlight_only else "every method"
     print(f"[fig] wrote {out}")
     print(f"[fig] seeds {seeds}" + (f"; band on {band}" if len(seeds) > 1 else ""))
 

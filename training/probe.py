@@ -225,6 +225,11 @@ def train_dual_probe(
     otherwise see, instead of the <=200 labeled ones. With only a few hundred
     labels, that pool is the largest unused resource in the round.
 
+    The caller decides WHICH pool rows are eligible: `sampling.pact` passes
+    only patches with a detected nucleus, because a patch with rho=0 carries an
+    imputed cell vector rather than a measured one. This function itself does
+    not filter -- it consumes whatever rows it is handed.
+
     A labeled-slice version (`consistency_weight`) existed here and was
     removed: it coupled the heads on the very rows they were already fitting,
     measured as doing almost nothing below weight ~5, and unlike the pool term
